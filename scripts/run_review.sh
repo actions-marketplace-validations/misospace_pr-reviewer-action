@@ -34,6 +34,8 @@ AI_FALLBACK_MODEL="${AI_FALLBACK_MODEL:-}"
 AI_FALLBACK_API_KEY="${AI_FALLBACK_API_KEY:-}"
 AI_PRIMARY_RETRIES="${AI_PRIMARY_RETRIES:-8}"
 AI_PRIMARY_RETRY_DELAY_SEC="${AI_PRIMARY_RETRY_DELAY_SEC:-15}"
+AI_STREAM="${AI_STREAM:-true}"
+AI_FALLBACK_STREAM="${AI_FALLBACK_STREAM:-$AI_STREAM}"
 ALLOWED_SOURCE_HOSTS="${ALLOWED_SOURCE_HOSTS:-github.com,api.github.com,gitlab.com,registry.terraform.io,artifacthub.io}"
 GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
@@ -173,6 +175,7 @@ curl_model() {
   local api_format="$3"
   local payload_file="$4"
   local output_file="$5"
+  local stream="${6:-false}"
 
   local endpoint
   local auth_header=()
@@ -199,6 +202,13 @@ curl_model() {
 
   args+=( "${auth_header[@]}" )
 
+  if [[ "$stream" == "true" ]]; then
+    args+=( --no-buffer )
+    if [[ "$api_format" == "anthropic" ]]; then
+      args+=( -H "Accept: text/event-stream" )
+    fi
+  fi
+
   curl "${args[@]}" > "$output_file"
 }
 
@@ -209,6 +219,7 @@ build_model_request() {
   local user="$4"
   local corpus_file="$5"
   local output_file="$6"
+  local stream="${7:-false}"
 
   if [[ "$api_format" == "anthropic" ]]; then
     jq -n \
@@ -216,15 +227,154 @@ build_model_request() {
       --arg system "$system" \
       --arg user "$user" \
       --argjson max_tokens "$AI_MAX_TOKENS" \
+      --argjson stream "$stream" \
       --rawfile corpus "$corpus_file" \
-      '{model:$model,max_tokens:$max_tokens,system:$system,messages:[{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > "$output_file"
+      '{model:$model,max_tokens:$max_tokens,stream:$stream,system:$system,messages:[{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > "$output_file"
   else
     jq -n \
       --arg model "$model" \
       --arg system "$system" \
       --arg user "$user" \
+      --argjson stream "$stream" \
       --rawfile corpus "$corpus_file" \
-      '{model:$model,messages:[{role:"system",content:$system},{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > "$output_file"
+      '{model:$model,stream:$stream,messages:[{role:"system",content:$system},{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > "$output_file"
+  fi
+}
+
+reassemble_sse_response() {
+  local response_file="$1"
+  local api_format="$2"
+
+  if [[ "$api_format" == "anthropic" ]]; then
+    python3 - "$response_file" <<'PY'
+import sys
+from pathlib import Path
+
+response_file = sys.argv[1]
+lines = Path(response_file).read_text(encoding="utf-8", errors="replace").splitlines()
+
+content_parts = []
+stop_reason = None
+stop_sequence = None
+model = None
+message_id = None
+input_tokens = 0
+output_tokens = 0
+
+for line in lines:
+    line = line.strip()
+    if not line.startswith("data:"):
+        continue
+    data = line[5:].strip()
+    if not data or data == "[DONE]":
+        continue
+    try:
+        import json
+        event = json.loads(data)
+    except json.JSONDecodeError:
+        continue
+
+    etype = event.get("type", "")
+    if etype == "message_start":
+        message_id = event.get("message", {}).get("id")
+        model = event.get("message", {}).get("model")
+        input_tokens = event.get("message", {}).get("usage", {}).get("input_tokens", 0)
+        output_tokens = event.get("message", {}).get("usage", {}).get("output_tokens", 0)
+    elif etype == "content_block_delta":
+        delta = event.get("delta", {})
+        if delta.get("type") == "text":
+            content_parts.append(delta.get("text", ""))
+    elif etype == "message_delta":
+        delta = event.get("delta", {})
+        stop_reason = delta.get("stop_reason")
+        stop_sequence = delta.get("stop_sequence")
+        usage = delta.get("usage", {})
+        if usage:
+            output_tokens += usage.get("output_tokens", 0)
+
+content_text = "".join(content_parts)
+result = {
+    "id": message_id or "",
+    "object": "chat.completion",
+    "model": model or "",
+    "choices": [{
+        "index": 0,
+        "message": {"role": "assistant", "content": content_text},
+        "finish_reason": stop_reason or "stop"
+    }],
+    "usage": {
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens
+    }
+}
+
+Path(response_file).write_text(json.dumps(result, ensure_ascii=False) + "\n", encoding="utf-8")
+PY
+  else
+    python3 - "$response_file" <<'PY'
+import sys
+from pathlib import Path
+
+response_file = sys.argv[1]
+lines = Path(response_file).read_text(encoding="utf-8", errors="replace").splitlines()
+
+content_parts = []
+finish_reason = None
+model = None
+usage_prompt_tokens = 0
+usage_completion_tokens = 0
+id_val = ""
+
+for line in lines:
+    line = line.strip()
+    if not line.startswith("data:"):
+        continue
+    data = line[5:].strip()
+    if not data or data == "[DONE]":
+        continue
+    try:
+        import json
+        chunk = json.loads(data)
+    except json.JSONDecodeError:
+        continue
+
+    id_val = chunk.get("id", id_val)
+    model = chunk.get("model", model)
+    choices = chunk.get("choices", [])
+    for choice in choices:
+        delta = choice.get("delta", {})
+        if isinstance(delta, dict):
+            c = delta.get("content")
+            if isinstance(c, str):
+                content_parts.append(c)
+        fr = choice.get("finish_reason")
+        if fr is not None:
+            finish_reason = fr
+    usage = chunk.get("usage")
+    if isinstance(usage, dict):
+        usage_prompt_tokens += usage.get("prompt_tokens", 0)
+        usage_completion_tokens += usage.get("completion_tokens", 0)
+
+content_text = "".join(content_parts)
+result = {
+    "id": id_val,
+    "object": "chat.completion",
+    "model": model or "",
+    "choices": [{
+        "index": 0,
+        "message": {"role": "assistant", "content": content_text},
+        "finish_reason": finish_reason or "stop"
+    }],
+    "usage": {
+        "prompt_tokens": usage_prompt_tokens,
+        "completion_tokens": usage_completion_tokens,
+        "total_tokens": usage_prompt_tokens + usage_completion_tokens
+    }
+}
+
+Path(response_file).write_text(json.dumps(result, ensure_ascii=False) + "\n", encoding="utf-8")
+PY
   fi
 }
 
@@ -849,19 +999,26 @@ fi
 
 log "Analyzing with $AI_MODEL using $AI_API_FORMAT API format..."
 
+STREAM_BOOL="false"
+if [[ "$(printf '%s' "$AI_STREAM" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
+  STREAM_BOOL="true"
+fi
+
 build_model_request \
   "$AI_API_FORMAT" \
   "$AI_MODEL" \
   "$SYSTEM_PROMPT" \
   "Analyze this pull request corpus and return STRICT JSON." \
   review-corpus.truncated.md \
-  ai-request.primary.json
+  ai-request.primary.json \
+  "$STREAM_BOOL"
 
 PRIMARY_OK=0
 ATTEMPT=1
 while [ "$ATTEMPT" -le "$AI_PRIMARY_RETRIES" ]; do
   echo "Primary model attempt ${ATTEMPT}/${AI_PRIMARY_RETRIES}: $AI_MODEL @ $AI_BASE_URL ($AI_API_FORMAT)"
-  if curl_model "$AI_BASE_URL" "$AI_API_KEY" "$AI_API_FORMAT" ai-request.primary.json ai-response.primary.json && \
+  if curl_model "$AI_BASE_URL" "$AI_API_KEY" "$AI_API_FORMAT" ai-request.primary.json ai-response.primary.json "$STREAM_BOOL" && \
+    [[ "$STREAM_BOOL" == "true" ]] && reassemble_sse_response ai-response.primary.json "$AI_API_FORMAT" && \
     parse_and_validate ai-response.primary.json; then
     PRIMARY_OK=1
     break
@@ -883,15 +1040,23 @@ else
 
   echo "Primary model unavailable after retries; trying fallback: $AI_FALLBACK_MODEL @ $AI_FALLBACK_BASE_URL ($AI_FALLBACK_API_FORMAT)" >&2
   head -c 120000 review-corpus.md > review-corpus.fallback.truncated.md
+
+  FALLBACK_STREAM_BOOL="false"
+  if [[ "$(printf '%s' "$AI_FALLBACK_STREAM" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
+    FALLBACK_STREAM_BOOL="true"
+  fi
+
   build_model_request \
     "$AI_FALLBACK_API_FORMAT" \
     "$AI_FALLBACK_MODEL" \
     "$SYSTEM_PROMPT" \
     "Analyze this pull request corpus and return STRICT JSON." \
     review-corpus.fallback.truncated.md \
-    ai-request.fallback.json
+    ai-request.fallback.json \
+    "$FALLBACK_STREAM_BOOL"
 
-  if curl_model "$AI_FALLBACK_BASE_URL" "$AI_FALLBACK_API_KEY" "$AI_FALLBACK_API_FORMAT" ai-request.fallback.json ai-response.fallback.json && \
+  if curl_model "$AI_FALLBACK_BASE_URL" "$AI_FALLBACK_API_KEY" "$AI_FALLBACK_API_FORMAT" ai-request.fallback.json ai-response.fallback.json "$FALLBACK_STREAM_BOOL" && \
+    [[ "$FALLBACK_STREAM_BOOL" == "true" ]] && reassemble_sse_response ai-response.fallback.json "$AI_FALLBACK_API_FORMAT" && \
     parse_and_validate ai-response.fallback.json; then
     ANALYSIS_ENGINE="$AI_FALLBACK_MODEL@$AI_FALLBACK_BASE_URL ($AI_FALLBACK_API_FORMAT)"
     echo "Fallback model succeeded" >&2
