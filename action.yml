@@ -59,6 +59,14 @@ inputs:
     description: Delay between primary retries in seconds
     required: false
     default: "15"
+  ai_stream:
+    description: If true, use streaming responses to avoid timeouts behind proxies with short read timeouts (e.g. Cloudflare 100s edge timer)
+    required: false
+    default: "true"
+  ai_fallback_stream:
+    description: If set, overrides ai_stream for the fallback model; defaults to ai_stream value when blank
+    required: false
+    default: ""
   allowed_source_hosts:
     description: Comma-separated list of hosts allowed for linked source fetching
     required: false
@@ -224,6 +232,8 @@ runs:
         AI_FALLBACK_API_KEY: ${{ inputs.ai_fallback_api_key }}
         AI_PRIMARY_RETRIES: ${{ inputs.ai_primary_retries }}
         AI_PRIMARY_RETRY_DELAY_SEC: ${{ inputs.ai_primary_retry_delay_sec }}
+        AI_STREAM: ${{ inputs.ai_stream }}
+        AI_FALLBACK_STREAM: ${{ inputs.ai_fallback_stream }}
         ALLOWED_SOURCE_HOSTS: ${{ inputs.allowed_source_hosts }}
         SYSTEM_PROMPT: ${{ inputs.system_prompt }}
         SYSTEM_PROMPT_FILE: ${{ inputs.system_prompt_file }}
