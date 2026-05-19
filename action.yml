@@ -40,7 +40,7 @@ inputs:
     required: false
     default: ""
   ai_fallback_api_format:
-    description: API request/response format for the fallback AI endpoint; defaults to ai_api_format when blank
+    description: API request/response format for the fallback endpoint; defaults to ai_api_format when blank
     required: false
     default: ""
   ai_fallback_model:
@@ -89,6 +89,27 @@ inputs:
     default: AGENTS.md,agents.md,CLAUDE.md,claude.md,.github/ai-review-rules.md,.github/ai-review-rules.txt
   publish_review_comment:
     description: If true, publish or update a PR comment with the generated review
+    required: false
+    default: "false"
+  publish_mode:
+    description: >-
+      Publish mode for the review verdict. 'comment' publishes a sticky PR comment (default).
+      'review_verdict' uses GitHub's native PR review API to submit approve/request_changes.
+      Requires permissions: pull-requests: write.
+    required: false
+    default: "comment"
+  allow_approve:
+    description: >-
+      If true and publish_mode=review_verdict, the model's approve verdict can be submitted as a
+      native approval. Defaults to false — approval is blocked unless explicitly enabled. WARNING:
+      native approvals can affect branch protection rules and automerge pipelines.
+    required: false
+    default: "false"
+  approve_forks:
+    description: >-
+      If true and publish_mode=review_verdict with allow_approve=true, native approvals are also
+      allowed for cross-repository (fork) PRs. Defaults to false — fork PRs are blocked from
+      approval even when allow_approve is set.
     required: false
     default: "false"
   context_limit_mode:
@@ -166,7 +187,7 @@ inputs:
   comment_marker:
     description: HTML comment marker used to identify the managed PR comment
     required: false
-    default: <!-- ai-pr-reviewer -->
+    default: "<!-- ai-pr-reviewer -->"
 
 outputs:
   verdict:
@@ -259,7 +280,7 @@ runs:
       run: bash "${{ github.action_path }}/scripts/run_review.sh"
 
     - name: Publish review comment
-      if: inputs.publish_review_comment == 'true' && steps.precheck.outputs.should_review == 'true'
+      if: inputs.publish_review_comment == 'true' && steps.precheck.outputs.should_review == 'true' && inputs.publish_mode == 'comment'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
@@ -301,3 +322,71 @@ runs:
         } > review-comment.md
 
         gh pr comment "$PR_NUMBER" --repo "$REPO" --edit-last --create-if-none --body-file review-comment.md
+
+    - name: Publish review verdict (native PR review)
+      if: inputs.publish_mode == 'review_verdict' && steps.precheck.outputs.should_review == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        REPO: ${{ inputs.repo || github.repository }}
+        PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        VERDICT: ${{ steps.review.outputs.verdict }}
+        REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
+        ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
+        ALLOW_APPROVE: ${{ inputs.allow_approve }}
+        APPROVE_FORKS: ${{ inputs.approve_forks }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${PR_NUMBER:-}" ]; then
+          echo "publish_mode=review_verdict requires a pull_request event or explicit pr_number" >&2
+          exit 1
+        fi
+
+        # Determine if the PR is from a fork
+        IS_FORK_PR="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' 2>/dev/null || echo false)"
+
+        # Evaluate approval guardrails
+        ALLOW_APPROVE_BOOL="$(printf '%s' "$ALLOW_APPROVE" | tr '[:upper:]' '[:lower:]')"
+        APPROVE_FORKS_BOOL="$(printf '%s' "$APPROVE_FORKS" | tr '[:upper:]' '[:lower:]')"
+
+        CAN_APPROVE=false
+
+        if [ "$VERDICT" = "approve" ] && [ "$ALLOW_APPROVE_BOOL" = "true" ]; then
+          # Check fork gate
+          if [ "$IS_FORK_PR" != "true" ]; then
+            CAN_APPROVE=true
+          elif [ "$APPROVE_FORKS_BOOL" = "true" ]; then
+            CAN_APPROVE=true
+          fi
+        fi
+
+        # Build the review body
+        BODY_FILE="review-verdict-body.md"
+        {
+          echo "# AI Automated Review"
+          echo
+          echo "_Analysis engine: ${ANALYSIS_ENGINE}_"
+          echo
+          printf '%s\n' "$REVIEW_MARKDOWN"
+        } > "$BODY_FILE"
+
+        if [ "$CAN_APPROVE" = true ]; then
+          echo "Submitting native approval for #$PR_NUMBER"
+          gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body-file "$BODY_FILE"
+        else
+          # Block approval: submit request_changes with explanation
+          echo "Blocking native approval for #$PR_NUMBER (allow_approve=${ALLOW_APPROVE_BOOL}, approve_forks=${APPROVE_FORKS_BOOL}, is_fork=${IS_FORK_PR})"
+
+          if [ "$VERDICT" = "request_changes" ]; then
+            gh pr review "$PR_NUMBER" --repo "$REPO" --request-changes --body-file "$BODY_FILE"
+          else
+            # Model approved but guardrails blocked it
+            {
+              echo ""
+              echo "> **Approval blocked by policy**: This workflow requires `allow_approve: true` to submit native approvals. Set that input to enable automatic approval."
+            } >> "$BODY_FILE"
+
+            gh pr review "$PR_NUMBER" --repo "$REPO" --request-changes --body-file "$BODY_FILE"
+          fi
+        fi
