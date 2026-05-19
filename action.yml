@@ -324,7 +324,7 @@ runs:
         # might have generated, preventing fake markers from interfering with precheck.
         printf '%s\n' "$REVIEW_MARKDOWN" > review-markdown.raw.md
         python3 "${{ github.action_path }}/scripts/strip_metadata_markers.py" review-markdown.raw.md
-        
+
 
         if [ -z "${PR_NUMBER:-}" ]; then
           echo "publish_review_comment=true requires a pull_request event or explicit pr_number" >&2
@@ -372,7 +372,7 @@ runs:
         # might have generated, preventing fake markers from interfering with precheck.
         printf '%s\n' "$REVIEW_MARKDOWN" > review-verdict-markdown.raw.md
         python3 "${{ github.action_path }}/scripts/strip_metadata_markers.py" review-verdict-markdown.raw.md
-        
+
 
         if [ -z "${PR_NUMBER:-}" ]; then
           echo "publish_mode=review_verdict requires a pull_request event or explicit pr_number" >&2
