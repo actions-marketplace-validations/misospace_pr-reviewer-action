@@ -210,7 +210,42 @@ Example provider config (`.github/pr-review-providers.json`):
 
 Provider commands can print plain text, or JSON with fields such as `severity` and `findings`. If `evidence_blocker_enforcement` is `true`, any provider output with blocker severity forces a `request_changes` verdict.
 
+### Native PR review verdicts
+
+When `publish_mode=review_verdict` is set, the action submits a native GitHub PR review
+(`approve` or `request_changes`) instead of posting a comment. This integrates with branch
+protection rules and status checks.
+
+**Approval guardrails:**
+
+- `allow_approve` defaults to `false`. The model's approve verdict will be blocked unless
+  this input is explicitly set to `true`.
+- `approve_forks` defaults to `false`. Even when `allow_approve=true`, native approvals are
+  blocked for cross-repository (fork) PRs unless this is also set to `true`.
+- If evidence provider enforcement or tool harness failure enforcement modified the verdict
+  to `request_changes`, approval is automatically blocked.
+- The review body must be non-empty for an approval to be submitted.
+
+⚠️ **WARNING**: Native approvals can affect branch protection rules and automerge pipelines.
+Enable `allow_approve` only when you understand the implications for your repository's
+merge policy.
+
+```yaml
+- uses: joryirving/pr-reviewer-action@v1
+  with:
+    github_token: ${{ secrets.GITHUB_TOKEN }}
+    ai_base_url: https://api.openai.com/v1
+    ai_model: gpt-4.1
+    ai_api_key: ${{ secrets.OPENAI_API_KEY }}
+    publish_mode: review_verdict
+    allow_approve: "true"
+```
+
+This configuration allows the AI to submit native approvals when its verdict is `approve`.
+Fork PRs are still blocked from approval unless `approve_forks` is also set to `"true"`.
+
 ### With tool harness planning
+
 
 ```yaml
 - uses: joryirving/pr-reviewer-action@v1
