@@ -92,15 +92,24 @@ inputs:
     required: false
     default: "false"
   publish_mode:
-    description: Publish mode for the review verdict. "comment" publishes a sticky PR comment (default). "review_verdict" uses GitHub's native PR review API to submit approve/request_changes. Requires permissions: pull-requests: write.
+    description: >-
+      Publish mode for the review verdict. 'comment' publishes a sticky PR comment (default).
+      'review_verdict' uses GitHub's native PR review API to submit approve/request_changes.
+      Requires permissions: pull-requests: write.
     required: false
     default: "comment"
   allow_approve:
-    description: If true and publish_mode=review_verdict, the model's approve verdict can be submitted as a native approval. Defaults to false — approval is blocked unless explicitly enabled. WARNING: native approvals can affect branch protection rules and automerge pipelines.
+    description: >-
+      If true and publish_mode=review_verdict, the model's approve verdict can be submitted as a
+      native approval. Defaults to false — approval is blocked unless explicitly enabled. WARNING:
+      native approvals can affect branch protection rules and automerge pipelines.
     required: false
     default: "false"
   approve_forks:
-    description: If true and publish_mode=review_verdict with allow_approve=true, native approvals are also allowed for cross-repository (fork) PRs. Defaults to false — fork PRs are blocked from approval even when allow_approve is set.
+    description: >-
+      If true and publish_mode=review_verdict with allow_approve=true, native approvals are also
+      allowed for cross-repository (fork) PRs. Defaults to false — fork PRs are blocked from
+      approval even when allow_approve is set.
     required: false
     default: "false"
   context_limit_mode:
