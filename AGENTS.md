@@ -14,7 +14,7 @@ The action collects rich PR context (diff, files, linked issues, version hints, 
 - **`scripts/default_system_prompt.txt`** - Bundled system prompt used when no override is provided
 - **`scripts/run_evidence_providers.py`** - Runs user-defined evidence provider commands from a JSON config, parses severity/findings output
 - **`scripts/run_tool_harness.py`** - Tool harness in `plan_execute_once` mode: model plans read-only tool requests (gh_api, read_file, web_fetch, git_grep), action executes them, appends results to corpus
-- **`scripts/strip_metadata_markers.py`** - Strips internal metadata markers from model output before publishing (issue #33)
+- **`scripts/strip_metadata_markers.py`** - Strips internal metadata markers from model output before publishing (fixed in PR #47 / issue #33)
 - **`scripts/image_digest_analysis.py`** - Analyzes image digests from the diff for provenance context
 - **`tests/smoke_test.sh`** - Local smoke test against a real PR with mock OpenAI server
 - **`tests/mock_openai_server.py`** - Mock API server used by the smoke test
