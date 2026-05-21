@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
-"""Tests for scripts/run_evidence_providers.py — evidence-provider wrapper."""
+"""Tests for scripts/run_evidence_providers.py — core functions and wrapper integration."""
 
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
-# Ensure the scripts directory is on sys.path before any imports.
 _SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import pytest
 
+from run_evidence_providers import (  # noqa: E402
+    normalize_severity,
+    parse_findings,
+    severity_rank,
+    env_int,
+)
 
 EVIDENCE_SCRIPT = _SCRIPTS_DIR / "run_evidence_providers.py"
 
-# Helper scripts written into tmp dirs by tests.
 HELPER_JSON_FINDINGS = """\
 #!/usr/bin/env python3
 import json, sys
@@ -55,13 +60,10 @@ sys.stderr.write("token=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij\\n")
 
 
 def _run_with_config(config_data, tmp_path: Path) -> subprocess.CompletedProcess:
-    """Helper: write config, run the script, return CompletedProcess."""
     config_file = tmp_path / "providers.json"
     config_file.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
-
     env = os.environ.copy()
     env["EVIDENCE_PROVIDERS_FILE"] = str(config_file)
-
     result = subprocess.run(
         [sys.executable, str(EVIDENCE_SCRIPT)],
         cwd=str(tmp_path),
@@ -78,18 +80,208 @@ def _load_json_output(tmp_path: Path) -> dict:
     return json.loads(out)
 
 
-# ---------------------------------------------------------------------------
-# No providers configured
-# ---------------------------------------------------------------------------
+# ── Core function tests: normalize_severity ─────────────────────────
 
+def test_normalize_severity_info():
+    assert normalize_severity("info") == "info"
+
+
+def test_normalize_severity_warning():
+    assert normalize_severity("warning") == "warning"
+
+
+def test_normalize_severity_blocker():
+    assert normalize_severity("blocker") == "blocker"
+
+
+def test_normalize_severity_uppercase():
+    assert normalize_severity("BLOCKER") == "blocker"
+
+
+def test_normalize_severity_title_case():
+    assert normalize_severity("Info") == "info"
+    assert normalize_severity("Warning") == "warning"
+    assert normalize_severity("Blocker") == "blocker"
+
+
+def test_normalize_severity_none():
+    assert normalize_severity(None) == "info"
+
+
+def test_normalize_severity_invalid():
+    assert normalize_severity("critical") == "info"
+    assert normalize_severity("error") == "info"
+    assert normalize_severity("") == "info"
+
+
+def test_normalize_severity_whitespace():
+    assert normalize_severity("  blocker  ") == "blocker"
+
+
+# ── Core function tests: severity_rank ──────────────────────────────
+
+def test_severity_rank_blocker():
+    assert severity_rank("blocker") == 3
+
+
+def test_severity_rank_warning():
+    assert severity_rank("warning") == 2
+
+
+def test_severity_rank_info():
+    assert severity_rank("info") == 1
+
+
+# ── Core function tests: parse_findings ─────────────────────────────
+
+def test_parse_findings_empty_dict():
+    severity, findings = parse_findings({})
+    assert severity == "info"
+    assert findings == []
+
+
+def test_parse_findings_non_dict():
+    severity, findings = parse_findings("not a dict")
+    assert severity == "info"
+    assert findings == []
+
+
+def test_parse_findings_list_of_strings():
+    payload = {"severity": "warning", "findings": ["issue one", "issue two"]}
+    severity, findings = parse_findings(payload)
+    assert severity == "warning"
+    assert len(findings) == 2
+    assert findings[0]["message"] == "issue one"
+    assert findings[0]["severity"] == "info"
+
+
+def test_parse_findings_list_of_dicts_with_message():
+    payload = {
+        "severity": "blocker",
+        "findings": [{"message": "critical bug", "severity": "blocker"}],
+    }
+    severity, findings = parse_findings(payload)
+    assert severity == "blocker"
+    assert len(findings) == 1
+    assert findings[0]["message"] == "critical bug"
+    assert findings[0]["severity"] == "blocker"
+
+
+def test_parse_findings_list_of_dicts_with_summary():
+    payload = {"findings": [{"summary": "fallback summary"}]}
+    severity, findings = parse_findings(payload)
+    assert len(findings) == 1
+    assert findings[0]["message"] == "fallback summary"
+
+
+def test_parse_findings_list_of_dicts_with_title():
+    payload = {"findings": [{"title": "title field"}]}
+    severity, findings = parse_findings(payload)
+    assert len(findings) == 1
+    assert findings[0]["message"] == "title field"
+
+
+def test_parse_findings_skips_items_without_message():
+    payload = {"findings": [{"severity": "blocker"}, {"summary": "has summary"}]}
+    severity, findings = parse_findings(payload)
+    assert len(findings) == 1
+    assert findings[0]["message"] == "has summary"
+
+
+def test_parse_findings_strings_become_findings():
+    payload = {"findings": ["item one", {"message": "item two"}]}
+    severity, findings = parse_findings(payload)
+    assert len(findings) == 2
+    assert findings[0]["message"] == "item one"
+    assert findings[1]["message"] == "item two"
+
+
+def test_parse_findings_highest_severity_from_findings():
+    payload = {
+        "severity": "info",
+        "findings": [
+            {"message": "low", "severity": "info"},
+            {"message": "high", "severity": "blocker"},
+        ],
+    }
+    severity, findings = parse_findings(payload)
+    assert severity == "blocker"
+
+
+def test_parse_findings_fallback_message():
+    payload = {"message": "no findings array, use message field"}
+    severity, findings = parse_findings(payload)
+    assert len(findings) == 1
+    assert findings[0]["message"] == "no findings array, use message field"
+
+
+def test_parse_findings_fallback_summary():
+    payload = {"summary": "fallback summary text"}
+    severity, findings = parse_findings(payload)
+    assert len(findings) == 1
+    assert findings[0]["message"] == "fallback summary text"
+
+
+def test_parse_findings_truncates_to_40():
+    findings_list = [{"message": f"item {i}"} for i in range(50)]
+    payload = {"findings": findings_list}
+    severity, findings = parse_findings(payload)
+    assert len(findings) == 40
+
+
+def test_parse_findings_source_from_field():
+    payload = {"findings": [{"message": "x", "source": "file.py"}]}
+    severity, findings = parse_findings(payload)
+    assert findings[0]["source"] == "file.py"
+
+
+def test_parse_findings_source_from_sources_list():
+    payload = {"findings": [{"message": "x", "sources": ["a.py", "b.py"]}]}
+    severity, findings = parse_findings(payload)
+    assert findings[0]["source"] == "a.py, b.py"
+
+
+def test_parse_findings_empty_sources_becomes_empty_string():
+    payload = {"findings": [{"message": "x", "sources": []}]}
+    severity, findings = parse_findings(payload)
+    assert findings[0]["source"] == ""
+
+
+# ── Core function tests: env_int ────────────────────────────────────
+
+def test_env_int_valid():
+    with mock.patch.dict(os.environ, {"TEST_ENV_INT": "42"}):
+        assert env_int("TEST_ENV_INT", 10) == 42
+
+
+def test_env_int_default():
+    with mock.patch.dict(os.environ, {}, clear=False):
+        key = f"TEST_ENV_INT_{os.getpid()}"
+        assert env_int(key, 7) == 7
+
+
+def test_env_int_non_numeric_returns_default():
+    with mock.patch.dict(os.environ, {"TEST_ENV_INT": "abc"}):
+        assert env_int("TEST_ENV_INT", 5) == 5
+
+
+def test_env_int_negative_clamped_to_1():
+    with mock.patch.dict(os.environ, {"TEST_ENV_INT": "-10"}):
+        assert env_int("TEST_ENV_INT", 5) == 1
+
+
+def test_env_int_zero_clamped_to_1():
+    with mock.patch.dict(os.environ, {"TEST_ENV_INT": "0"}):
+        assert env_int("TEST_ENV_INT", 5) == 1
+
+
+# ── Integration tests: no providers configured ─────────────────────
 
 class TestNoConfig:
     def test_empty_env(self, tmp_path: Path):
-        """When config is empty dict, the script still parses it and sets configured=True."""
         result = _run_with_config({}, tmp_path)
         assert result.returncode == 0
         data = _load_json_output(tmp_path)
-        # An empty config dict is still a valid config; providers list is just empty.
         assert data["configured"] is True
         assert data["provider_count"] == 0
 
@@ -110,23 +302,13 @@ class TestNoConfig:
         assert "not found" in data["error"]
 
 
-# ---------------------------------------------------------------------------
-# stdout capture — bytes → string decode fix
-# ---------------------------------------------------------------------------
-
+# ── Integration tests: stdout capture ──────────────────────────────
 
 class TestStdoutCapture:
-    """Verify that provider stdout is decoded from bytes to str before redaction."""
-
     def test_json_stdout_with_findings(self, tmp_path: Path):
         helper = tmp_path / "json_provider.py"
         helper.write_text(HELPER_JSON_FINDINGS)
-
-        config = {
-            "providers": [
-                {"id": "test-json", "command": f"{sys.executable} {helper}"}
-            ]
-        }
+        config = {"providers": [{"id": "test-json", "command": f"{sys.executable} {helper}"}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0, f"stderr: {result.stderr}"
         data = _load_json_output(tmp_path)
@@ -139,11 +321,7 @@ class TestStdoutCapture:
         assert p["findings"][0]["message"] == "test finding"
 
     def test_text_stdout_no_findings(self, tmp_path: Path):
-        config = {
-            "providers": [
-                {"id": "test-text", "command": "echo 'just some text output'"}
-            ]
-        }
+        config = {"providers": [{"id": "test-text", "command": "echo 'just some text output'"}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0
         data = _load_json_output(tmp_path)
@@ -153,16 +331,12 @@ class TestStdoutCapture:
         assert "just some text output" in p["stdout"]
 
 
-# ---------------------------------------------------------------------------
-# stderr capture
-# ---------------------------------------------------------------------------
-
+# ── Integration tests: stderr capture ───────────────────────────────
 
 class TestStderrCapture:
     def test_stderr_is_captured(self, tmp_path: Path):
         helper = tmp_path / "stderr_provider.py"
         helper.write_text(HELPER_SECRET_STDERR)
-
         config = {"providers": [{"id": "test-stderr", "command": f"{sys.executable} {helper}"}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0
@@ -172,11 +346,7 @@ class TestStderrCapture:
         assert "[REDACTED]" in p["stderr"]
 
     def test_stderr_only_provider(self, tmp_path: Path):
-        config = {
-            "providers": [
-                {"id": "test-stderr-only", "command": 'echo "no stdout, only stderr" >&2; exit 0'}
-            ]
-        }
+        config = {"providers": [{"id": "test-stderr-only", "command": 'echo "no stdout, only stderr" >&2; exit 0'}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0
         data = _load_json_output(tmp_path)
@@ -184,19 +354,11 @@ class TestStderrCapture:
         assert p["stderr"].strip() == "no stdout, only stderr"
 
 
-# ---------------------------------------------------------------------------
-# Silent provider — no output at all (verifies UnboundLocalError fix)
-# ---------------------------------------------------------------------------
-
+# ── Integration tests: silent provider (no output) ─────────────────
 
 class TestSilentProvider:
     def test_silent_provider_no_crash(self, tmp_path: Path):
-        """A provider that produces no stdout or stderr must not raise UnboundLocalError."""
-        config = {
-            "providers": [
-                {"id": "test-silent", "command": "true"}  # does nothing, exits 0
-            ]
-        }
+        config = {"providers": [{"id": "test-silent", "command": "true"}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0, f"stderr: {result.stderr}"
         data = _load_json_output(tmp_path)
@@ -206,13 +368,7 @@ class TestSilentProvider:
         assert p["stderr"].strip() == ""
 
     def test_silent_providers_list(self, tmp_path: Path):
-        """Multiple silent providers should all complete without error."""
-        config = {
-            "providers": [
-                {"id": "s1", "command": "true"},
-                {"id": "s2", "command": "echo -n ''"},
-            ]
-        }
+        config = {"providers": [{"id": "s1", "command": "true"}, {"id": "s2", "command": "echo -n ''"}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0
         data = _load_json_output(tmp_path)
@@ -221,31 +377,20 @@ class TestSilentProvider:
             assert p["status"] == "ok"
 
 
-# ---------------------------------------------------------------------------
-# Nonzero exit code
-# ---------------------------------------------------------------------------
-
+# ── Integration tests: nonzero exit code ───────────────────────────
 
 class TestNonzeroExit:
     def test_nonzero_exit_status(self, tmp_path: Path):
-        config = {
-            "providers": [
-                {"id": "test-fail", "command": "exit 42"}
-            ]
-        }
+        config = {"providers": [{"id": "test-fail", "command": "exit 42"}]}
         result = _run_with_config(config, tmp_path)
-        assert result.returncode == 0  # wrapper itself should succeed
+        assert result.returncode == 0
         data = _load_json_output(tmp_path)
         p = data["providers"][0]
         assert p["status"] == "error"
         assert p["exit_code"] == 42
 
     def test_command_that_exits_nonzero(self, tmp_path: Path):
-        config = {
-            "providers": [
-                {"id": "test-fail-echo", "command": 'echo "failed"; exit 1'}
-            ]
-        }
+        config = {"providers": [{"id": "test-fail-echo", "command": 'echo "failed"; exit 1'}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0
         data = _load_json_output(tmp_path)
@@ -254,21 +399,13 @@ class TestNonzeroExit:
         assert p["exit_code"] == 1
 
 
-# ---------------------------------------------------------------------------
-# Blocker provider
-# ---------------------------------------------------------------------------
-
+# ── Integration tests: blocker severity ────────────────────────────
 
 class TestBlockerProvider:
     def test_blocker_severity_sets_flag(self, tmp_path: Path):
         helper = tmp_path / "blocker_provider.py"
         helper.write_text(HELPER_BLOCKER)
-
-        config = {
-            "providers": [
-                {"id": "test-blocker", "command": f"{sys.executable} {helper}"}
-            ]
-        }
+        config = {"providers": [{"id": "test-blocker", "command": f"{sys.executable} {helper}"}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0
         data = _load_json_output(tmp_path)
@@ -279,12 +416,7 @@ class TestBlockerProvider:
     def test_mixed_severities_uses_highest(self, tmp_path: Path):
         helper = tmp_path / "mixed_provider.py"
         helper.write_text(HELPER_MIXED)
-
-        config = {
-            "providers": [
-                {"id": "test-mixed", "command": f"{sys.executable} {helper}"}
-            ]
-        }
+        config = {"providers": [{"id": "test-mixed", "command": f"{sys.executable} {helper}"}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0
         data = _load_json_output(tmp_path)
@@ -292,21 +424,13 @@ class TestBlockerProvider:
         assert p["provider_severity"] == "blocker"
 
 
-# ---------------------------------------------------------------------------
-# Secret redaction on provider output
-# ---------------------------------------------------------------------------
-
+# ── Integration tests: secret redaction ─────────────────────────────
 
 class TestSecretRedaction:
     def test_stdout_secrets_redacted(self, tmp_path: Path):
         helper = tmp_path / "secret_stdout.py"
         helper.write_text(HELPER_SECRET_STDOUT)
-
-        config = {
-            "providers": [
-                {"id": "test-redact", "command": f"{sys.executable} {helper}"}
-            ]
-        }
+        config = {"providers": [{"id": "test-redact", "command": f"{sys.executable} {helper}"}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0
         data = _load_json_output(tmp_path)
@@ -317,12 +441,7 @@ class TestSecretRedaction:
     def test_stderr_secrets_redacted(self, tmp_path: Path):
         helper = tmp_path / "secret_stderr.py"
         helper.write_text(HELPER_SECRET_STDERR)
-
-        config = {
-            "providers": [
-                {"id": "test-stderr-redact", "command": f"{sys.executable} {helper}"}
-            ]
-        }
+        config = {"providers": [{"id": "test-stderr-redact", "command": f"{sys.executable} {helper}"}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0
         data = _load_json_output(tmp_path)
@@ -331,18 +450,11 @@ class TestSecretRedaction:
         assert "[REDACTED]" in p["stderr"]
 
 
-# ---------------------------------------------------------------------------
-# Markdown output file is generated
-# ---------------------------------------------------------------------------
-
+# ── Integration tests: markdown output ─────────────────────────────
 
 class TestMarkdownOutput:
     def test_markdown_file_created(self, tmp_path: Path):
-        config = {
-            "providers": [
-                {"id": "test-md", "command": "echo 'hello'"}
-            ]
-        }
+        config = {"providers": [{"id": "test-md", "command": "echo 'hello'"}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0
         md_file = tmp_path / "evidence-providers.md"
@@ -353,17 +465,12 @@ class TestMarkdownOutput:
     def test_markdown_redacted(self, tmp_path: Path):
         helper = tmp_path / "secret_md.py"
         helper.write_text(HELPER_SECRET_STDOUT)
-
-        config = {
-            "providers": [
-                {"id": "test-md-redact", "command": f"{sys.executable} {helper}"}
-            ]
-        }
+        config = {"providers": [{"id": "test-md-redact", "command": f"{sys.executable} {helper}"}]}
         result = _run_with_config(config, tmp_path)
         assert result.returncode == 0
         md_file = tmp_path / "evidence-providers.md"
         content = md_file.read_text(encoding="utf-8")
-        assert "super_secret_value_xyz123" not in content  # helper doesn't output this
+        assert "super_secret_value_xyz123" not in content
         assert "[REDACTED]" in content
 
 
