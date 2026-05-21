@@ -220,11 +220,13 @@ def main() -> int:
             entry["status"] = "ok" if completed.returncode == 0 else "error"
 
             # --- Secret redaction on stdout/stderr before capturing output ---
+            stdout_text = completed.stdout.decode("utf-8", errors="replace") if completed.stdout else ""
+            stderr_text = completed.stderr.decode("utf-8", errors="replace") if completed.stderr else ""
             entry["stdout"], entry["stdout_truncated"] = mask_and_truncate(
-                completed.stdout, max_output
+                stdout_text, max_output
             )
             entry["stderr"], entry["stderr_truncated"] = mask_and_truncate(
-                completed.stderr, max_output
+                stderr_text, max_output
             )
         except subprocess.TimeoutExpired as exc:
             entry["duration_sec"] = round(time.monotonic() - start, 3)
@@ -302,7 +304,8 @@ def main() -> int:
 
             md_lines.append("")
 
-    # Redact the entire generated markdown output as a safety net.
+    # Join md_lines into the markdown string, then redact it.
+    markdown = "\n".join(md_lines)
     markdown = mask_secrets(markdown)
 
     write_outputs(summary, markdown)
