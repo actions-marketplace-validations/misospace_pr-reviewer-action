@@ -59,6 +59,10 @@ TOOL_ALLOWED_GH_API_REPOS="${TOOL_ALLOWED_GH_API_REPOS:-}"
 TOOL_FAILURE_ENFORCEMENT="${TOOL_FAILURE_ENFORCEMENT:-false}"
 TOOL_MIN_SUCCESSFUL_REQUESTS="${TOOL_MIN_SUCCESSFUL_REQUESTS:-0}"
 TOOL_ENABLE_FOR_FORKS="${TOOL_ENABLE_FOR_FORKS:-false}"
+AI_REQUEST_TIMEOUT_SEC="${AI_REQUEST_TIMEOUT_SEC:-300}"
+AI_CONNECT_TIMEOUT_SEC="${AI_CONNECT_TIMEOUT_SEC:-30}"
+AI_FALLBACK_REQUEST_TIMEOUT_SEC="${AI_FALLBACK_REQUEST_TIMEOUT_SEC:-${AI_REQUEST_TIMEOUT_SEC}}"
+AI_FALLBACK_CONNECT_TIMEOUT_SEC="${AI_FALLBACK_CONNECT_TIMEOUT_SEC:-${AI_CONNECT_TIMEOUT_SEC}}"
 OUTPUT_FILE="${GITHUB_OUTPUT:-/dev/null}"
 
 apply_context_limits() {
@@ -176,6 +180,8 @@ curl_model() {
   local payload_file="$4"
   local output_file="$5"
   local stream="${6:-false}"
+  local request_timeout_sec="${7:-300}"
+  local connect_timeout_sec="${8:-30}"
 
   local endpoint
   local auth_header=()
@@ -198,6 +204,8 @@ curl_model() {
     "$endpoint"
     -H "Content-Type: application/json"
     --data "@$payload_file"
+    --max-time "$request_timeout_sec"
+    --connect-timeout "$connect_timeout_sec"
   )
 
   args+=( "${auth_header[@]}" )
@@ -789,7 +797,7 @@ PRIMARY_OK=0
 ATTEMPT=1
 while [ "$ATTEMPT" -le "$AI_PRIMARY_RETRIES" ]; do
   echo "Primary model attempt ${ATTEMPT}/${AI_PRIMARY_RETRIES}: $AI_MODEL @ $AI_BASE_URL ($AI_API_FORMAT)"
-  if curl_model "$AI_BASE_URL" "$AI_API_KEY" "$AI_API_FORMAT" ai-request.primary.json ai-response.primary.json "$STREAM_BOOL" && \
+  if curl_model "$AI_BASE_URL" "$AI_API_KEY" "$AI_API_FORMAT" ai-request.primary.json ai-response.primary.json "$STREAM_BOOL" "$AI_REQUEST_TIMEOUT_SEC" "$AI_CONNECT_TIMEOUT_SEC" && \
     { [[ "$STREAM_BOOL" != "true" ]] || reassemble_sse_response ai-response.primary.json "$AI_API_FORMAT"; } && \
     parse_and_validate ai-response.primary.json; then
     PRIMARY_OK=1
@@ -827,7 +835,7 @@ else
     ai-request.fallback.json \
     "$FALLBACK_STREAM_BOOL"
 
-  if curl_model "$AI_FALLBACK_BASE_URL" "$AI_FALLBACK_API_KEY" "$AI_FALLBACK_API_FORMAT" ai-request.fallback.json ai-response.fallback.json "$FALLBACK_STREAM_BOOL" && \
+  if curl_model "$AI_FALLBACK_BASE_URL" "$AI_FALLBACK_API_KEY" "$AI_FALLBACK_API_FORMAT" ai-request.fallback.json ai-response.fallback.json "$FALLBACK_STREAM_BOOL" "$AI_FALLBACK_REQUEST_TIMEOUT_SEC" "$AI_FALLBACK_CONNECT_TIMEOUT_SEC" && \
     { [[ "$FALLBACK_STREAM_BOOL" != "true" ]] || reassemble_sse_response ai-response.fallback.json "$AI_FALLBACK_API_FORMAT"; } && \
     parse_and_validate ai-response.fallback.json; then
     ANALYSIS_ENGINE="$AI_FALLBACK_MODEL@$AI_FALLBACK_BASE_URL ($AI_FALLBACK_API_FORMAT)"

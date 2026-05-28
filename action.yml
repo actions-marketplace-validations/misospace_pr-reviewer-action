@@ -181,6 +181,22 @@ inputs:
     description: If true, allow the tool harness to run on cross-repository pull requests
     required: false
     default: "false"
+  ai_request_timeout_sec:
+    description: Timeout in seconds for the primary model API request (curl --max-time)
+    required: false
+    default: "300"
+  ai_connect_timeout_sec:
+    description: Timeout in seconds for the primary model API connection (curl --connect-timeout)
+    required: false
+    default: "30"
+  ai_fallback_request_timeout_sec:
+    description: Timeout in seconds for the fallback model API request (curl --max-time). Defaults to ai_request_timeout_sec when blank.
+    required: false
+    default: ""
+  ai_fallback_connect_timeout_sec:
+    description: Timeout in seconds for the fallback model API connection (curl --connect-timeout). Defaults to ai_connect_timeout_sec when blank.
+    required: false
+    default: ""
   skip_if_diff_unchanged:
     description: If true, skip the LLM review when the effective PR diff matches the last managed review comment fingerprint
     required: false
@@ -258,6 +274,10 @@ runs:
         TOOL_FAILURE_ENFORCEMENT: ${{ inputs.tool_failure_enforcement }}
         TOOL_MIN_SUCCESSFUL_REQUESTS: ${{ inputs.tool_min_successful_requests }}
         TOOL_ENABLE_FOR_FORKS: ${{ inputs.tool_enable_for_forks }}
+        AI_REQUEST_TIMEOUT_SEC: ${{ inputs.ai_request_timeout_sec }}
+        AI_CONNECT_TIMEOUT_SEC: ${{ inputs.ai_connect_timeout_sec }}
+        AI_FALLBACK_REQUEST_TIMEOUT_SEC: ${{ inputs.ai_fallback_request_timeout_sec }}
+        AI_FALLBACK_CONNECT_TIMEOUT_SEC: ${{ inputs.ai_fallback_connect_timeout_sec }}
       run: bash "${{ github.action_path }}/scripts/check_review_needed.sh"
 
     - name: Run AI review
@@ -304,6 +324,10 @@ runs:
         TOOL_FAILURE_ENFORCEMENT: ${{ inputs.tool_failure_enforcement }}
         TOOL_MIN_SUCCESSFUL_REQUESTS: ${{ inputs.tool_min_successful_requests }}
         TOOL_ENABLE_FOR_FORKS: ${{ inputs.tool_enable_for_forks }}
+        AI_REQUEST_TIMEOUT_SEC: ${{ inputs.ai_request_timeout_sec }}
+        AI_CONNECT_TIMEOUT_SEC: ${{ inputs.ai_connect_timeout_sec }}
+        AI_FALLBACK_REQUEST_TIMEOUT_SEC: ${{ inputs.ai_fallback_request_timeout_sec }}
+        AI_FALLBACK_CONNECT_TIMEOUT_SEC: ${{ inputs.ai_fallback_connect_timeout_sec }}
       run: bash "${{ github.action_path }}/scripts/run_review.sh"
 
     - name: Publish review comment
