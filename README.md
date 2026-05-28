@@ -70,6 +70,11 @@ The action gathers PR metadata, diff context, linked issue context from PR-closi
 | `tool_failure_enforcement` | Force `request_changes` when tool harness planning fails | No | `false` |
 | `tool_min_successful_requests` | Minimum successful tool requests required when `tool_failure_enforcement=true` | No | `0` |
 | `tool_enable_for_forks` | Allow tool harness on cross-repository PRs | No | `false` |
+| `ai_request_timeout_sec` | Timeout in seconds for the primary model API request (`curl --max-time`) | No | `300` |
+| `ai_connect_timeout_sec` | Timeout in seconds for the primary model API connection (`curl --connect-timeout`) | No | `30` |
+| `ai_fallback_request_timeout_sec` | Timeout in seconds for the fallback model API request (`curl --max-time`). Defaults to `ai_request_timeout_sec` when blank. | No | `""` |
+| `ai_fallback_connect_timeout_sec` | Timeout in seconds for the fallback model API connection (`curl --connect-timeout`). Defaults to `ai_connect_timeout_sec` when blank. | No | `""` |
+
 | `skip_if_diff_unchanged` | Skip the LLM review when the current PR patch matches the last managed review fingerprint | No | `true` |
 | `comment_marker` | HTML marker for the managed PR comment | No | `<!-- ai-pr-reviewer -->` |
 
@@ -255,6 +260,87 @@ merge policy.
 
 This configuration allows the AI to submit native approvals when its verdict is `approve`.
 Fork PRs are still blocked from approval unless `approve_forks` is also set to `"true"`.
+
+### Permissions per publish mode
+
+Each publish mode requires different GitHub token permissions:
+
+| Mode | Required permissions |
+|------|---------------------|
+| `comment` | `contents: read` (for repo metadata) |
+| `review_comment` | `contents: read`, `pull-requests: write` |
+| `review_verdict` | `contents: read`, `pull-requests: write` |
+
+The following copy-paste workflow example shows the full configuration for `publish_mode=review_verdict`:
+
+```yaml
+name: AI PR Review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: misospace/pr-reviewer-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          ai_base_url: https://api.openai.com/v1
+          ai_model: gpt-4.1
+          ai_api_key: ${{ secrets.OPENAI_API_KEY }}
+          publish_mode: review_verdict
+          allow_approve: "false"
+```
+
+### Why approvals may fail even with `pull-requests: write`
+
+Having the `pull-requests: write` permission in your workflow is necessary but not sufficient for native PR reviews to succeed. GitHub also enforces a repository or organization-level setting called **Allow GitHub Actions to create and approve pull requests**. If this setting is disabled, the `GITHUB_TOKEN` cannot submit native review verdicts (approve or request_changes), even when the workflow declares `pull-requests: write`.
+
+When this setting is not enabled, the action will fail with an error message from the GitHub API such as:
+
+```
+REST API v3 does not have a permission preview for pull_requests.
+You must use the Permissions API to manage permissions.
+```
+
+Or more commonly:
+
+```
+Resource not accessible by integration
+```
+
+To enable this setting:
+
+1. Go to **Settings** → **Actions** → **General** in your repository or organization.
+2. Under **Workflow permissions**, select **Allow GitHub Actions to create and approve pull requests**.
+3. Save the change.
+
+If you cannot enable this setting at the organization level, you can enable it per-repository through the same settings page.
+
+When native review publishing fails, the action logs a clear error message:
+
+```
+Native review publishing failed: unable to submit review verdict via GitHub API.
+Check that your workflow has pull-requests: write permission and that
+"Allow GitHub Actions to create and approve pull requests" is enabled in Settings → Actions → General.
+Consider using publish_mode=comment as a fallback.
+```
+
+This message appears in the workflow run logs and helps users diagnose the issue without needing to inspect the GitHub API response directly.
+
+### Non-blocking review comments
 
 ### Non-blocking review comments
 
