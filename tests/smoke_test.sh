@@ -408,7 +408,11 @@ ${REVIEW_MARKDOWN}
 EOF
 
 COMMAND_REVIEW_COMMENT="gh pr review 123 --repo owner/repo --comment --body-file $TMPDIR/review-comment-body.md"
-check "review_comment mode uses --comment flag" "$COMMAND_REVIEW_COMMENT" "$(echo "$COMMAND_REVIEW_COMMENT" | grep -q '\-\-comment' && echo "$COMMAND_REVIEW_COMMENT" || echo "missing --comment")"
+if echo "$COMMAND_REVIEW_COMMENT" | grep -q '\-\-comment'; then
+  check "review_comment mode uses --comment flag" "PASS" "PASS"
+else
+  check "review_comment mode uses --comment flag" "FAIL" "PASS"
+fi
 
 echo ""
 echo "=== Publish mode: review_verdict command construction ==="
@@ -444,7 +448,11 @@ else
   COMMAND_REVIEW_VERDICT="gh pr review 123 --repo owner/repo --request-changes --body-file $TMPDIR/review-verdict-body.md"
 fi
 
-check "review_verdict approve with allow_approve uses --approve" "$COMMAND_REVIEW_VERDICT" "$(echo "$COMMAND_REVIEW_VERDICT" | grep -q '\-\-approve' && echo "$COMMAND_REVIEW_VERDICT" || echo "missing --approve")"
+if echo "$COMMAND_REVIEW_VERDICT" | grep -q '\-\-approve'; then
+  check "review_verdict approve with allow_approve uses --approve" "PASS" "PASS"
+else
+  check "review_verdict approve with allow_approve uses --approve" "FAIL" "PASS"
+fi
 
 echo ""
 echo "=== Publish mode: review_verdict request_changes command ==="
@@ -468,7 +476,11 @@ else
   COMMAND_RC="gh pr review 123 --repo owner/repo --request-changes --body-file $TMPDIR/review-verdict-body.md"
 fi
 
-check "review_verdict request_changes uses --request-changes" "$COMMAND_RC" "$(echo "$COMMAND_RC" | grep -q '\-\-request-changes' && echo "$COMMAND_RC" || echo "missing --request-changes")"
+if echo "$COMMAND_RC" | grep -q '\-\-request-changes'; then
+  check "review_verdict request_changes uses --request-changes" "PASS" "PASS"
+else
+  check "review_verdict request_changes uses --request-changes" "FAIL" "PASS"
+fi
 
 echo ""
 echo "=== Publish mode: review_verdict approve blocked by allow_approve=false ==="
@@ -492,7 +504,11 @@ else
   COMMAND_BLOCKED="gh pr review 123 --repo owner/repo --request-changes --body-file $TMPDIR/review-verdict-body.md"
 fi
 
-check "approve blocked when allow_approve=false uses --request-changes" "$COMMAND_BLOCKED" "$(echo "$COMMAND_BLOCKED" | grep -q '\-\-request-changes' && echo "$COMMAND_BLOCKED" || echo "missing --request-changes")"
+if echo "$COMMAND_BLOCKED" | grep -q '\-\-request-changes'; then
+  check "approve blocked when allow_approve=false uses --request-changes" "PASS" "PASS"
+else
+  check "approve blocked when allow_approve=false uses --request-changes" "FAIL" "PASS"
+fi
 
 echo ""
 echo "=== Publish mode: review_verdict fork approval blocked by approve_forks=false ==="
@@ -517,7 +533,11 @@ else
   COMMAND_FORK_BLOCKED="gh pr review 123 --repo owner/repo --request-changes --body-file $TMPDIR/review-verdict-body.md"
 fi
 
-check "fork approval blocked when approve_forks=false uses --request-changes" "$COMMAND_FORK_BLOCKED" "$(echo "$COMMAND_FORK_BLOCKED" | grep -q '\-\-request-changes' && echo "$COMMAND_FORK_BLOCKED" || echo "missing --request-changes")"
+if echo "$COMMAND_FORK_BLOCKED" | grep -q '\-\-request-changes'; then
+  check "fork approval blocked when approve_forks=false uses --request-changes" "PASS" "PASS"
+else
+  check "fork approval blocked when approve_forks=false uses --request-changes" "FAIL" "PASS"
+fi
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
