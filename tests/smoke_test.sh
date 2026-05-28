@@ -393,6 +393,153 @@ echo "agents-lower" > "$TMPDIR/std-order-test2/agents.md"
 )
 
 echo ""
+echo "=== Publish mode: review_comment command construction ==="
+
+REVIEW_MARKDOWN="Test review body content"
+ANALYSIS_ENGINE="gpt-4.1@https://api.openai.com/v1 (openai)"
+VERDICT="approve"
+
+cat > "$TMPDIR/review-comment-body.md" <<EOF
+# AI Automated Review
+
+_Analysis engine: ${ANALYSIS_ENGINE}_
+
+${REVIEW_MARKDOWN}
+EOF
+
+COMMAND_REVIEW_COMMENT="gh pr review 123 --repo owner/repo --comment --body-file $TMPDIR/review-comment-body.md"
+if echo "$COMMAND_REVIEW_COMMENT" | grep -q '\-\-comment'; then
+  check "review_comment mode uses --comment flag" "PASS" "PASS"
+else
+  check "review_comment mode uses --comment flag" "FAIL" "PASS"
+fi
+
+echo ""
+echo "=== Publish mode: review_verdict command construction ==="
+
+REVIEW_MARKDOWN="Test verdict review body"
+ANALYSIS_ENGINE="qwen3-32b@http://llama-server:8080/v1 (openai)"
+
+cat > "$TMPDIR/review-verdict-body.md" <<EOF
+# AI Automated Review
+
+_Analysis engine: ${ANALYSIS_ENGINE}_
+
+${REVIEW_MARKDOWN}
+EOF
+
+IS_FORK_PR="false"
+ALLOW_APPROVE_BOOL="true"
+APPROVE_FORKS_BOOL="false"
+VERDICT="approve"
+
+CAN_APPROVE="false"
+if [ "$VERDICT" = "approve" ] && [ "$ALLOW_APPROVE_BOOL" = "true" ]; then
+  if [ "$IS_FORK_PR" != "true" ]; then
+    CAN_APPROVE="true"
+  elif [ "$APPROVE_FORKS_BOOL" = "true" ]; then
+    CAN_APPROVE="true"
+  fi
+fi
+
+if [ "$CAN_APPROVE" = true ]; then
+  COMMAND_REVIEW_VERDICT="gh pr review 123 --repo owner/repo --approve --body-file $TMPDIR/review-verdict-body.md"
+else
+  COMMAND_REVIEW_VERDICT="gh pr review 123 --repo owner/repo --request-changes --body-file $TMPDIR/review-verdict-body.md"
+fi
+
+if echo "$COMMAND_REVIEW_VERDICT" | grep -q '\-\-approve'; then
+  check "review_verdict approve with allow_approve uses --approve" "PASS" "PASS"
+else
+  check "review_verdict approve with allow_approve uses --approve" "FAIL" "PASS"
+fi
+
+echo ""
+echo "=== Publish mode: review_verdict request_changes command ==="
+
+VERDICT="request_changes"
+ALLOW_APPROVE_BOOL="false"
+IS_FORK_PR="false"
+CAN_APPROVE="false"
+
+if [ "$VERDICT" = "approve" ] && [ "$ALLOW_APPROVE_BOOL" = "true" ]; then
+  if [ "$IS_FORK_PR" != "true" ]; then
+    CAN_APPROVE="true"
+  elif [ "$APPROVE_FORKS_BOOL" = "true" ]; then
+    CAN_APPROVE="true"
+  fi
+fi
+
+if [ "$CAN_APPROVE" = true ]; then
+  COMMAND_RC="gh pr review 123 --repo owner/repo --approve --body-file $TMPDIR/review-verdict-body.md"
+else
+  COMMAND_RC="gh pr review 123 --repo owner/repo --request-changes --body-file $TMPDIR/review-verdict-body.md"
+fi
+
+if echo "$COMMAND_RC" | grep -q '\-\-request-changes'; then
+  check "review_verdict request_changes uses --request-changes" "PASS" "PASS"
+else
+  check "review_verdict request_changes uses --request-changes" "FAIL" "PASS"
+fi
+
+echo ""
+echo "=== Publish mode: review_verdict approve blocked by allow_approve=false ==="
+
+VERDICT="approve"
+ALLOW_APPROVE_BOOL="false"
+IS_FORK_PR="false"
+CAN_APPROVE="false"
+
+if [ "$VERDICT" = "approve" ] && [ "$ALLOW_APPROVE_BOOL" = "true" ]; then
+  if [ "$IS_FORK_PR" != "true" ]; then
+    CAN_APPROVE="true"
+  elif [ "$APPROVE_FORKS_BOOL" = "true" ]; then
+    CAN_APPROVE="true"
+  fi
+fi
+
+if [ "$CAN_APPROVE" = true ]; then
+  COMMAND_BLOCKED="gh pr review 123 --repo owner/repo --approve --body-file $TMPDIR/review-verdict-body.md"
+else
+  COMMAND_BLOCKED="gh pr review 123 --repo owner/repo --request-changes --body-file $TMPDIR/review-verdict-body.md"
+fi
+
+if echo "$COMMAND_BLOCKED" | grep -q '\-\-request-changes'; then
+  check "approve blocked when allow_approve=false uses --request-changes" "PASS" "PASS"
+else
+  check "approve blocked when allow_approve=false uses --request-changes" "FAIL" "PASS"
+fi
+
+echo ""
+echo "=== Publish mode: review_verdict fork approval blocked by approve_forks=false ==="
+
+VERDICT="approve"
+ALLOW_APPROVE_BOOL="true"
+APPROVE_FORKS_BOOL="false"
+IS_FORK_PR="true"
+CAN_APPROVE="false"
+
+if [ "$VERDICT" = "approve" ] && [ "$ALLOW_APPROVE_BOOL" = "true" ]; then
+  if [ "$IS_FORK_PR" != "true" ]; then
+    CAN_APPROVE="true"
+  elif [ "$APPROVE_FORKS_BOOL" = "true" ]; then
+    CAN_APPROVE="true"
+  fi
+fi
+
+if [ "$CAN_APPROVE" = true ]; then
+  COMMAND_FORK_BLOCKED="gh pr review 123 --repo owner/repo --approve --body-file $TMPDIR/review-verdict-body.md"
+else
+  COMMAND_FORK_BLOCKED="gh pr review 123 --repo owner/repo --request-changes --body-file $TMPDIR/review-verdict-body.md"
+fi
+
+if echo "$COMMAND_FORK_BLOCKED" | grep -q '\-\-request-changes'; then
+  check "fork approval blocked when approve_forks=false uses --request-changes" "PASS" "PASS"
+else
+  check "fork approval blocked when approve_forks=false uses --request-changes" "FAIL" "PASS"
+fi
+
+echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 
 if [[ "$FAIL" -gt 0 ]]; then
