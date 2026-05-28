@@ -74,6 +74,8 @@ The action gathers PR metadata, diff context, linked issue context from PR-closi
 | `ai_connect_timeout_sec` | Timeout in seconds for the primary model API connection (`curl --connect-timeout`) | No | `30` |
 | `ai_fallback_request_timeout_sec` | Timeout in seconds for the fallback model API request (`curl --max-time`). Defaults to `ai_request_timeout_sec` when blank. | No | `""` |
 | `ai_fallback_connect_timeout_sec` | Timeout in seconds for the fallback model API connection (`curl --connect-timeout`). Defaults to `ai_connect_timeout_sec` when blank. | No | `""` |
+| `ai_stream` | If true, use streaming responses to avoid timeouts behind proxies with short read timeouts (e.g. Cloudflare 100s edge timer) | No | `"true"` |
+| `ai_fallback_stream` | If set, overrides ai_stream for the fallback model; defaults to ai_stream value when blank | No | `""` |
 
 | `skip_if_diff_unchanged` | Skip the LLM review when the current PR patch matches the last managed review fingerprint | No | `true` |
 | `comment_marker` | HTML marker for the managed PR comment | No | `<!-- ai-pr-reviewer -->` |
