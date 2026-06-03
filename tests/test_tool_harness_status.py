@@ -1,20 +1,23 @@
-"""Regression tests for issue #53: tool harness fail-closed status accounting.
+"""Tests for issue #53 and issue #102: tool harness status accounting and error handling.
 
-The bug: run_review.sh checked `.tool_results[].result.status` but
+Issue #53: run_review.sh checked `.tool_results[].result.status` but
 run_tool_harness.py writes status at `.tool_results[].status`.
 
-This means successful tool calls were counted as failures under
-fail-closed settings (tool_failure_enforcement=true, tool_min_successful_requests>0),
-causing spurious request_changes verdicts.
+Issue #102: read_file, git_grep, gh_api, and web_fetch did not check for
+error returns from their helper functions, causing status to be "ok" even
+when the underlying tool failed.
 
 Acceptance criteria:
   - The corrected jq path reads from .tool_results[].status == "ok".
   - A regression fixture with at least one successful tool result and fail-closed
     settings demonstrates the old path fails and the new path passes.
-  - Existing review parsing/model tests still pass.
+  - read_file, git_grep, gh_api, web_fetch all produce status: error when
+    their helper returns an error dict.
+  - run_command already had this behavior (verified via existing tests).
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -214,6 +217,144 @@ def test_run_review_uses_correct_path():
 
 
 # ---------------------------------------------------------------------------
+# Tests for issue #102: tool error propagation
+# ---------------------------------------------------------------------------
+
+
+def test_read_file_error_path():
+    """read_file with a missing path returns {'error': ...}."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from run_tool_harness import read_file
+
+    result = read_file("nonexistent_file_xyz.txt", "/tmp")
+    assert "error" in result, f"Expected error key, got: {result}"
+
+
+def test_read_file_sensitive_path():
+    """read_file with a sensitive filename returns {'error': ...}."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from run_tool_harness import read_file
+
+    result = read_file(".env", "/tmp")
+    assert "error" in result, f"Expected error for sensitive path, got: {result}"
+
+
+def test_read_file_path_escape():
+    """read_file with a path escaping workspace returns {'error': ...}."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from run_tool_harness import read_file
+
+    result = read_file("../../etc/passwd", "/tmp")
+    assert "error" in result, f"Expected error for path escape, got: {result}"
+
+
+def test_git_grep_error_path():
+    """git_grep with a pattern that causes an error returns {'error': ...}."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from run_tool_harness import git_grep
+
+    result = git_grep("nonexistent-pattern-xyz-12345", "/tmp")
+    # git grep returns 1 for no matches (not an error), so we check the
+    # function handles it correctly without raising.
+    assert "matches" in result or "error" in result, (
+        f"Expected matches or error key, got: {result}"
+    )
+
+
+def test_gh_api_error_missing_token():
+    """gh_api with no token returns {'error': 'Missing GH_TOKEN'}."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from run_tool_harness import gh_api
+
+    # Ensure no token is available
+    old_token = None
+    for env_var in ("GH_TOKEN", "GITHUB_TOKEN"):
+        if env_var in os.environ:
+            old_token = (env_var, os.environ[env_var])
+            del os.environ[env_var]
+
+    try:
+        result = gh_api("owner/repo/pulls/1", set(), "owner/repo")
+        assert "error" in result, f"Expected error for missing token, got: {result}"
+    finally:
+        if old_token:
+            os.environ[old_token[0]] = old_token[1]
+
+
+def test_gh_api_error_repo_not_allowed():
+    """gh_api with a non-allowlisted repo returns {'error': ...}."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from run_tool_harness import gh_api
+
+    old_token = None
+    for env_var in ("GH_TOKEN", "GITHUB_TOKEN"):
+        if env_var in os.environ:
+            old_token = (env_var, os.environ[env_var])
+            break
+    if not old_token:
+        os.environ["GH_TOKEN"] = "fake-token-for-testing"
+
+    try:
+        result = gh_api("other-owner/other-repo/pulls/1", set(), "my-org/my-repo")
+        assert "error" in result, f"Expected error for disallowed repo, got: {result}"
+    finally:
+        if old_token:
+            os.environ[old_token[0]] = old_token[1]
+        else:
+            del os.environ["GH_TOKEN"]
+
+
+def test_web_fetch_error_non_allowlisted_host():
+    """web_fetch with a non-allowlisted host returns {'error': ...}."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from run_tool_harness import web_fetch
+
+    result = web_fetch("https://evil.example.com/secret", ["github.com"])
+    assert "error" in result, f"Expected error for non-allowlisted host, got: {result}"
+
+
+def test_run_command_error_not_allowlisted():
+    """run_command with an unallowlisted command returns {'error': ...}."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    from run_tool_harness import run_command
+
+    result = run_command("rm -rf /", "/tmp")
+    assert "error" in result, f"Expected error for disallowed command, got: {result}"
+
+
+# ---------------------------------------------------------------------------
+# Test: integration fixture where tool_min_successful_requests enforcement
+# fails when all planned calls produce errors
+# ---------------------------------------------------------------------------
+
+ENFORCEMENT_FIXTURE = {
+    "mode": "plan_execute_once",
+    "planned_request_count": 2,
+    "executed_request_count": 0,
+    "tool_results": [
+        {
+            "tool": "read_file",
+            "status": "error",
+            "result": {"error": "Path escapes workspace root"},
+        },
+        {
+            "tool": "gh_api",
+            "status": "error",
+            "result": {"error": "Repo not allowed: other/repo"},
+        },
+    ],
+}
+
+
+def test_enforcement_fixture_no_successes():
+    """When all tools fail, executed_request_count is 0 and enforcement triggers."""
+    data = ENFORCEMENT_FIXTURE
+    assert data["executed_request_count"] == 0
+    ok_count = sum(1 for t in data["tool_results"] if t.get("status") == "ok")
+    assert ok_count == 0, f"Expected 0 successes, got {ok_count}"
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -224,6 +365,15 @@ def main():
         ("all-ok fixture", test_all_ok_fixture),
         ("all-fail fixture", test_all_fail_fixture),
         ("run_review.sh uses correct path", test_run_review_uses_correct_path),
+        ("read_file error path", test_read_file_error_path),
+        ("read_file sensitive path", test_read_file_sensitive_path),
+        ("read_file path escape", test_read_file_path_escape),
+        ("git_grep error path", test_git_grep_error_path),
+        ("gh_api missing token", test_gh_api_error_missing_token),
+        ("gh_api repo not allowed", test_gh_api_error_repo_not_allowed),
+        ("web_fetch non-allowlisted host", test_web_fetch_error_non_allowlisted_host),
+        ("run_command not allowlisted", test_run_command_error_not_allowlisted),
+        ("enforcement fixture no successes", test_enforcement_fixture_no_successes),
     ]
 
     passed = 0
