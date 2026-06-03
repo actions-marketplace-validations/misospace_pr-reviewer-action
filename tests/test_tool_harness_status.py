@@ -20,7 +20,24 @@ import json
 import os
 import subprocess
 import sys
+from unittest import mock
 from pathlib import Path
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+
+
+def _import_tool(name):
+    """Import a tool function from run_tool_harness, ensuring scripts is on sys.path."""
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    from run_tool_harness import (  # noqa: F401
+        gh_api,
+        git_grep,
+        read_file,
+        run_command,
+        web_fetch,
+    )
+    return locals()[name]
 
 
 def _jq(expr, json_str):
@@ -223,48 +240,51 @@ def test_run_review_uses_correct_path():
 
 def test_read_file_error_path():
     """read_file with a missing path returns {'error': ...}."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from run_tool_harness import read_file
-
+    read_file = _import_tool("read_file")
     result = read_file("nonexistent_file_xyz.txt", "/tmp")
     assert "error" in result, f"Expected error key, got: {result}"
 
 
 def test_read_file_sensitive_path():
     """read_file with a sensitive filename returns {'error': ...}."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from run_tool_harness import read_file
-
+    read_file = _import_tool("read_file")
     result = read_file(".env", "/tmp")
     assert "error" in result, f"Expected error for sensitive path, got: {result}"
 
 
 def test_read_file_path_escape():
     """read_file with a path escaping workspace returns {'error': ...}."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from run_tool_harness import read_file
-
+    read_file = _import_tool("read_file")
     result = read_file("../../etc/passwd", "/tmp")
     assert "error" in result, f"Expected error for path escape, got: {result}"
 
 
 def test_git_grep_error_path():
-    """git_grep with a pattern that causes an error returns {'error': ...}."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from run_tool_harness import git_grep
+    """git_grep returns {'error': ...} when subprocess raises TimeoutExpired."""
+    git_grep = _import_tool("git_grep")
+    with mock.patch(
+        "subprocess.run", side_effect=subprocess.TimeoutExpired("git", 15)
+    ):
+        result = git_grep("some-pattern", "/tmp")
+    assert result == {"error": "git grep timed out after 15s"}, (
+        f"Expected error dict for timeout, got: {result}"
+    )
 
-    result = git_grep("nonexistent-pattern-xyz-12345", "/tmp")
-    # git grep returns 1 for no matches (not an error), so we check the
-    # function handles it correctly without raising.
-    assert "matches" in result or "error" in result, (
-        f"Expected matches or error key, got: {result}"
+
+def test_git_grep_error_returncode():
+    """git_grep returns {'error': ...} when git grep exits with non-0/1 code."""
+    git_grep = _import_tool("git_grep")
+    mock_result = mock.Mock(returncode=2, stderr="fatal: some error", stdout="")
+    with mock.patch("subprocess.run", return_value=mock_result):
+        result = git_grep("some-pattern", "/tmp")
+    assert "error" in result and "git grep failed" in result["error"], (
+        f"Expected error dict for non-zero exit, got: {result}"
     )
 
 
 def test_gh_api_error_missing_token():
     """gh_api with no token returns {'error': 'Missing GH_TOKEN'}."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from run_tool_harness import gh_api
+    gh_api = _import_tool("gh_api")
 
     # Ensure no token is available
     old_token = None
@@ -283,8 +303,7 @@ def test_gh_api_error_missing_token():
 
 def test_gh_api_error_repo_not_allowed():
     """gh_api with a non-allowlisted repo returns {'error': ...}."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from run_tool_harness import gh_api
+    gh_api = _import_tool("gh_api")
 
     old_token = None
     for env_var in ("GH_TOKEN", "GITHUB_TOKEN"):
@@ -306,8 +325,7 @@ def test_gh_api_error_repo_not_allowed():
 
 def test_web_fetch_error_non_allowlisted_host():
     """web_fetch with a non-allowlisted host returns {'error': ...}."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from run_tool_harness import web_fetch
+    web_fetch = _import_tool("web_fetch")
 
     result = web_fetch("https://evil.example.com/secret", ["github.com"])
     assert "error" in result, f"Expected error for non-allowlisted host, got: {result}"
@@ -315,8 +333,7 @@ def test_web_fetch_error_non_allowlisted_host():
 
 def test_run_command_error_not_allowlisted():
     """run_command with an unallowlisted command returns {'error': ...}."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    from run_tool_harness import run_command
+    run_command = _import_tool("run_command")
 
     result = run_command("rm -rf /", "/tmp")
     assert "error" in result, f"Expected error for disallowed command, got: {result}"
@@ -369,6 +386,7 @@ def main():
         ("read_file sensitive path", test_read_file_sensitive_path),
         ("read_file path escape", test_read_file_path_escape),
         ("git_grep error path", test_git_grep_error_path),
+        ("git_grep error returncode", test_git_grep_error_returncode),
         ("gh_api missing token", test_gh_api_error_missing_token),
         ("gh_api repo not allowed", test_gh_api_error_repo_not_allowed),
         ("web_fetch non-allowlisted host", test_web_fetch_error_non_allowlisted_host),

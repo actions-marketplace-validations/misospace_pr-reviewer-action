@@ -716,6 +716,10 @@ def main():
                 result["executed_request_count"] += 1
 
             except Exception as exc:
+                # Error messages from raised ValueError (from res["error"] checks
+                # above) are masked by mask_secrets() in write_outputs(), which
+                # processes the markdown output. This is consistent with how
+                # run_command error messages are redacted.
                 tool_result["result"] = {"error": str(exc)}
 
             result["tool_results"].append(tool_result)
@@ -856,6 +860,10 @@ def main():
             result["executed_request_count"] += 1
 
         except Exception as exc:
+            # Error messages from raised ValueError (from res["error"] checks
+            # above) are masked by mask_secrets() in write_outputs(), which
+            # processes the markdown output. This is consistent with how
+            # run_command error messages are redacted.
             tool_result["result"] = {"error": str(exc)}
 
         result["tool_results"].append(tool_result)
