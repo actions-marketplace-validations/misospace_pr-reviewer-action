@@ -180,9 +180,6 @@ def apply_tool_min_successful_enforcement(
     bool
         True if enforcement was applied, False otherwise.
     """
-    if not _harness_requested_tools(tool_harness_path):
-        return False, ""
-
     successful = _count_successful_requests(tool_harness_path)
     if successful >= min_required:
         return False, ""

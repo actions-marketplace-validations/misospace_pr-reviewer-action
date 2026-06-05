@@ -225,7 +225,7 @@ class TestApplyToolMinSuccessfulEnforcement:
         result = apply_tool_min_successful_enforcement(2, str(harness_path), str(output_path))
         assert result == (False, "")
 
-    def test_no_op_when_no_tools_requested(self, tmp_path):
+    def test_enforces_when_zero_tools_requested_and_min_gt_zero(self, tmp_path):
         harness = {"planned_request_count": 0, "executed_request_count": 0}
         output = {"verdict": "approve", "review_markdown": "OK"}
 
@@ -235,6 +235,22 @@ class TestApplyToolMinSuccessfulEnforcement:
         output_path.write_text(json.dumps(output))
 
         result = apply_tool_min_successful_enforcement(2, str(harness_path), str(output_path))
+        assert result[0] is True
+        assert "insufficient evidence" in result[1]
+        updated = json.loads(output_path.read_text())
+        assert updated["verdict"] == "request_changes"
+        assert "only 0 succeeded" in updated["review_markdown"]
+
+    def test_no_op_when_zero_tools_and_min_is_zero(self, tmp_path):
+        harness = {"planned_request_count": 0, "executed_request_count": 0}
+        output = {"verdict": "approve", "review_markdown": "OK"}
+
+        harness_path = tmp_path / "tool-harness.json"
+        output_path = tmp_path / "ai-output.json"
+        harness_path.write_text(json.dumps(harness))
+        output_path.write_text(json.dumps(output))
+
+        result = apply_tool_min_successful_enforcement(0, str(harness_path), str(output_path))
         assert result == (False, "")
 
 
