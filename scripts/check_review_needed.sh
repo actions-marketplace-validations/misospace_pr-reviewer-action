@@ -217,6 +217,7 @@ resolve_review_scope() {
   local last_base_sha="$3"
   local current_head_sha="$4"
   local current_base_sha="$5"
+  local last_review_result="${6:-}"
 
   case "$(printf '%s' "$user_scope" | tr '[:upper:]' '[:lower:]')" in
     full)
@@ -312,7 +313,7 @@ CURRENT_BASE_SHA="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.sha' 2>/de
 
 # Resolve effective review scope
 resolve_review_scope "$REVIEW_SCOPE" "$LAST_HEAD_SHA" "$LAST_BASE_SHA" \
-  "$CURRENT_HEAD_SHA" "$CURRENT_BASE_SHA"
+  "$CURRENT_HEAD_SHA" "$CURRENT_BASE_SHA" "$LAST_REVIEW_RESULT"
 
 # Output review scope results
 echo "effective_review_scope=$EFFECTIVE_SCOPE" >> "$OUTPUT_FILE"
