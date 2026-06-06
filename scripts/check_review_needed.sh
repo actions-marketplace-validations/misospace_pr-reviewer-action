@@ -6,6 +6,7 @@ PR_NUMBER="${PR_NUMBER:-}"
 COMMENT_MARKER="${COMMENT_MARKER:-<!-- ai-pr-reviewer -->}"
 SKIP_IF_DIFF_UNCHANGED="${SKIP_IF_DIFF_UNCHANGED:-true}"
 OUTPUT_FILE="${GITHUB_OUTPUT:-/dev/null}"
+REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
 
 if [[ -z "$REPO" || -z "$PR_NUMBER" ]]; then
   echo "Missing REPO or PR_NUMBER for review precheck" >&2
@@ -136,6 +137,11 @@ compute_config_hash() {
     parts+=("tool_forks:${TOOL_ENABLE_FOR_FORKS}")
   fi
 
+  # Review scope
+  if [[ -n "${REVIEW_SCOPE:-}" ]]; then
+    parts+=("review_scope:${REVIEW_SCOPE}")
+  fi
+
   # Combine all parts into a single hash
   if [[ ${#parts[@]} -gt 0 ]]; then
     printf '%s\n' "${parts[@]}" | sha256sum | awk '{print $1}'
@@ -172,6 +178,143 @@ if [[ "$SKIP_IF_DIFF_UNCHANGED" == "true" && -n "$last_broad_fingerprint" && "$l
   should_review=false
   skip_reason="diff-unchanged"
 fi
+
+# ── Review scope resolution ───────────────────────────────────────────
+# Global variables for review scope resolution
+EFFECTIVE_SCOPE=""
+PREVIOUS_HEAD_SHA=""
+BASELINE_CLEAN=false
+
+extract_review_metadata() {
+  local comment_body="$1"
+  
+  LAST_HEAD_SHA=""
+  LAST_BASE_SHA=""
+  LAST_REVIEW_SCOPE=""
+  LAST_REVIEW_RESULT=""
+  
+  # Use Python to parse the JSON marker reliably (handles embedded quotes)
+  eval "$(printf '%s' "$comment_body" | python3 -c "
+import sys
+sys.path.insert(0, '.')
+from pr_reviewer.metadata import parse_metadata
+data = parse_metadata(sys.stdin.read())
+if data:
+    print(f'LAST_HEAD_SHA={data.get(\"head_sha\", \"\")}')
+    print(f'LAST_BASE_SHA={data.get(\"base_sha\", \"\")}')
+    print(f'LAST_REVIEW_SCOPE={data.get(\"review_scope\", \"\")}')
+    print(f'LAST_REVIEW_RESULT={data.get(\"review_result\", \"\")}')
+" 2>/dev/null || true)"
+}
+
+resolve_review_scope() {
+  local user_scope="$1"
+  local last_head_sha="$2"
+  local last_base_sha="$3"
+  local current_head_sha="$4"
+  local current_base_sha="$5"
+  local last_review_result="${6:-}"
+
+  case "$(printf '%s' "$user_scope" | tr '[:upper:]' '[:lower:]')" in
+    full)
+      EFFECTIVE_SCOPE="full"
+      PREVIOUS_HEAD_SHA=""
+      BASELINE_CLEAN=false
+      return ;;
+    incremental|"")
+      # Incremental or empty without prior metadata is unsafe — fall back to full
+      if [[ -z "$last_head_sha" || -z "$last_base_sha" ]]; then
+        EFFECTIVE_SCOPE="full"
+        PREVIOUS_HEAD_SHA=""
+        BASELINE_CLEAN=false
+        return
+      fi
+      ;;
+    auto)
+      # Auto: full on first run, incremental on later runs with metadata
+      if [[ -z "$last_head_sha" || -z "$last_base_sha" ]]; then
+        EFFECTIVE_SCOPE="full"
+        PREVIOUS_HEAD_SHA=""
+        BASELINE_CLEAN=false
+        return
+      fi
+      ;;
+    *)
+      echo "WARN: Invalid REVIEW_SCOPE '$user_scope'; defaulting to auto" >&2
+      user_scope="auto"
+      if [[ -z "$last_head_sha" || -z "$last_base_sha" ]]; then
+        EFFECTIVE_SCOPE="full"
+        PREVIOUS_HEAD_SHA=""
+        BASELINE_CLEAN=false
+        return
+      fi
+      ;;
+  esac
+
+  # From here, we're attempting incremental — validate safety
+
+  # Check: current base SHA differs from previous base SHA
+  if [[ -n "$current_base_sha" && -n "$last_base_sha" && "$current_base_sha" != "$last_base_sha" ]]; then
+    echo "Review scope fallback: base SHA changed from $last_base_sha to $current_base_sha" >&2
+    EFFECTIVE_SCOPE="full"
+    PREVIOUS_HEAD_SHA=""
+    BASELINE_CLEAN=false
+    return
+  fi
+
+  # Check: previous head SHA is an ancestor of current head SHA (local validation)
+  if [[ -n "$current_head_sha" && -n "$last_head_sha" ]]; then
+    if ! git merge-base --is-ancestor "$last_head_sha" "$current_head_sha" 2>/dev/null; then
+      echo "Review scope fallback: previous head $last_head_sha is not an ancestor of current head $current_head_sha (possible force-push/rebase)" >&2
+      EFFECTIVE_SCOPE="full"
+      PREVIOUS_HEAD_SHA=""
+      BASELINE_CLEAN=false
+      return
+    fi
+  fi
+
+  # Check: compare API still works for this range
+  if ! gh api "repos/$REPO/compare/${last_head_sha}...${current_head_sha}" >/dev/null 2>&1; then
+    echo "Review scope fallback: compare API failed for $last_head_sha...$current_head_sha" >&2
+    EFFECTIVE_SCOPE="full"
+    PREVIOUS_HEAD_SHA=""
+    BASELINE_CLEAN=false
+    return
+  fi
+
+  # All checks passed — incremental is safe
+  EFFECTIVE_SCOPE="incremental"
+  PREVIOUS_HEAD_SHA="$last_head_sha"
+
+  # Track whether the baseline was clean for verdict safety
+  if [[ "$last_review_result" == "clean" || -z "$last_review_result" ]]; then
+    BASELINE_CLEAN=true
+  else
+    BASELINE_CLEAN=false
+  fi
+}
+
+LAST_HEAD_SHA=""
+LAST_BASE_SHA=""
+LAST_REVIEW_SCOPE=""
+LAST_REVIEW_RESULT=""
+
+if [[ -n "$last_comment_body" ]]; then
+  extract_review_metadata "$last_comment_body"
+fi
+
+# Get current PR head/base SHAs
+CURRENT_HEAD_SHA="$(jq -r '.headRefOid' pr.json 2>/dev/null || echo "")"
+CURRENT_BASE_SHA="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.sha' 2>/dev/null || echo "")"
+
+# Resolve effective review scope
+resolve_review_scope "$REVIEW_SCOPE" "$LAST_HEAD_SHA" "$LAST_BASE_SHA" \
+  "$CURRENT_HEAD_SHA" "$CURRENT_BASE_SHA" "$LAST_REVIEW_RESULT"
+
+# Output review scope results
+echo "effective_review_scope=$EFFECTIVE_SCOPE" >> "$OUTPUT_FILE"
+echo "previous_head_sha=$PREVIOUS_HEAD_SHA" >> "$OUTPUT_FILE"
+echo "baseline_clean=$BASELINE_CLEAN" >> "$OUTPUT_FILE"
 
 echo "diff_fingerprint=$broad_fingerprint" >> "$OUTPUT_FILE"
 echo "should_review=$should_review" >> "$OUTPUT_FILE"

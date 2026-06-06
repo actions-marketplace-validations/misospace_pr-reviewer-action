@@ -85,6 +85,7 @@ Before publishing, the action runs `scripts/sanitize_review_markdown.py` on the 
 | `ai_fallback_stream` | If set, overrides ai_stream for the fallback model; defaults to ai_stream value when blank | No | `""` |
 
 | `skip_if_diff_unchanged` | Skip the LLM review when the current PR patch matches the last managed review fingerprint | No | `true` |
+| `review_scope` | Controls whether the action reviews the full PR or only changes since the last managed review. Accepted values: `auto` (default, full on first run, incremental on later safe updates), `full` (always full review), `incremental` (delta review, falls back to full if prior metadata unavailable) | No | `auto` |
 | `comment_marker` | HTML marker for the managed PR comment | No | `<!-- ai-pr-reviewer -->` |
 
 ## Outputs
@@ -448,6 +449,29 @@ If a repo wants more than policy context and needs to fully control the reviewer
     ai_model: gpt-4.1
     ai_api_key: ${{ secrets.OPENAI_API_KEY }}
     system_prompt_file: .github/pr-review-prompt.md
+```
+
+### Token-saving with incremental reviews
+
+When `review_scope: auto` (the default), the action performs a full PR review on the first run. On subsequent pushes to the same PR, it attempts an **incremental review** that only analyzes the delta since the last managed review. This can significantly reduce token usage for large PRs with multiple commits.
+
+Key behaviors:
+- **First run**: Full PR review (same as before).
+- **Later pushes**: Incremental review of only new changes.
+- **Fallback**: Automatically falls back to full review when incremental comparison is unsafe (force-push, rebase, base branch change, missing metadata, etc.).
+- **Verdict safety**: With `publish_mode: review_verdict`, approvals based on incremental reviews require a trusted clean full-review baseline.
+
+You can force specific behavior:
+```yaml
+# Always do full reviews (original behavior)
+- uses: misospace/pr-reviewer-action@vX.Y.Z
+  with:
+    review_scope: full
+
+# Always attempt incremental (falls back safely)
+- uses: misospace/pr-reviewer-action@vX.Y.Z
+  with:
+    review_scope: incremental
 ```
 
 ## Notes
