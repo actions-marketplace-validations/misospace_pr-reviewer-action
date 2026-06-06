@@ -431,8 +431,14 @@ runs:
         # Resolve effective scope from precheck
         EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"
 
+        # Determine review result for metadata marker
+        REVIEW_RESULT="clean"
+        if [ "$VERDICT" = "request_changes" ]; then
+          REVIEW_RESULT="issues"
+        fi
+
         # Build metadata marker
-        METADATA_MARKER="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${{ github.event.pull_request.base.sha || '' }}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"clean\"}"
+        METADATA_MARKER="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${{ github.event.pull_request.base.sha || '' }}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"${REVIEW_RESULT}\"}"
         if [ "$EFFECTIVE_SCOPE" = "incremental" ] && [ -n "${{ steps.precheck.outputs.previous_head_sha:-}}" ]; then
           METADATA_MARKER="${METADATA_MARKER%,*},\"previous_head_sha\":\"${{ steps.precheck.outputs.previous_head_sha }}\"}"
         fi
@@ -536,8 +542,14 @@ runs:
         # Resolve effective scope from precheck
         EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"
 
+        # Determine review result for metadata marker
+        REVIEW_RESULT="clean"
+        if [ "$VERDICT" = "request_changes" ]; then
+          REVIEW_RESULT="issues"
+        fi
+
         # Build metadata marker
-        METADATA_MARKER="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${{ github.event.pull_request.base.sha || '' }}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"clean\"}"
+        METADATA_MARKER="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${{ github.event.pull_request.base.sha || '' }}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"${REVIEW_RESULT}\"}"
 
         # Build the review body with managed marker
         BODY_FILE="review-comment-body.md"
@@ -636,8 +648,14 @@ runs:
         PREVIOUS_HEAD_SHA="${{ steps.precheck.outputs.previous_head_sha:-}}"
         BASELINE_CLEAN="${{ steps.precheck.outputs.baseline_clean:-false }}"
 
+        # Determine review result for metadata marker
+        REVIEW_RESULT="clean"
+        if [ "$VERDICT" = "request_changes" ]; then
+          REVIEW_RESULT="issues"
+        fi
+
         # Build metadata marker with verdict safety for incremental
-        METADATA_MARKER="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${{ github.event.pull_request.base.sha || '' }}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"clean\"}"
+        METADATA_MARKER="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${{ github.event.pull_request.base.sha || '' }}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"${REVIEW_RESULT}\"}"
         if [ "$EFFECTIVE_SCOPE" = "incremental" ] && [ -n "$PREVIOUS_HEAD_SHA" ]; then
           METADATA_MARKER="${METADATA_MARKER%,*},\"previous_head_sha\":\"${PREVIOUS_HEAD_SHA}\"}"
         fi
