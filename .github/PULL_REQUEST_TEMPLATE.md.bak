@@ -1,0 +1,30 @@
+Fixes #125
+
+## Problem
+
+`resolve_standards_file` checks each candidate with `[[ -f "$candidate" ]]`, which does not expand glob patterns. A candidate like `.agents/*` is checked as a literal filename and never matches.
+
+## Fix
+
+Enable `nullglob` before the candidate loop so bash expands glob patterns to matching files. Non-matching globs expand to nothing (skipped silently). First-match-wins behavior is preserved.
+
+- Added `shopt -s nullglob` before the loop
+- Expand each candidate with `matches=( $candidate )` and iterate matches
+- Restore `nullglob` off on all exit paths (`shopt -u nullglob`)
+
+## Tests
+
+Added `tests/test_standards_file_resolution.sh` with 8 test cases:
+
+1. Plain file candidate resolves correctly
+2. Glob matches multiple files — first match wins
+3. Non-matching glob silently skipped, falls through to next candidate
+4. Only non-matching globs — STANDARDS_FILE remains empty
+5. Explicit `standards_file` input takes priority over candidates
+6. Mixed plain and glob candidates — plain found first wins
+7. Mixed plain and glob — plain missing, glob found
+8. Whitespace around candidates is trimmed
+
+## Documentation
+
+Updated `AGENTS.md` to document glob pattern support in `standards_file_candidates`.
