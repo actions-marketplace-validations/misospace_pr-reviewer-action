@@ -717,7 +717,11 @@ if [ -f "$STANDARDS_FILE" ]; then
   echo >> standards-context.md
   cat "$STANDARDS_FILE" >> standards-context.md
 else
-  echo "($STANDARDS_FILE not found; standards context unavailable.)" >> standards-context.md
+  if [[ -n "$STANDARDS_FILE" ]]; then
+    echo "($STANDARDS_FILE not found; standards context unavailable.)" >> standards-context.md
+  else
+    echo "(no standards file matched any candidate; standards context unavailable.)" >> standards-context.md
+  fi
 fi
 
 if [ ! -f tool-harness.md ]; then
