@@ -235,52 +235,9 @@ if [[ ! "$TOOL_MIN_SUCCESSFUL_REQUESTS" =~ ^[0-9]+$ ]]; then
   TOOL_MIN_SUCCESSFUL_REQUESTS=0
 fi
 
-curl_model() {
-  local base_url="$1"
-  local api_key="$2"
-  local api_format="$3"
-  local payload_file="$4"
-  local output_file="$5"
-  local stream="${6:-false}"
-  local request_timeout_sec="${7:-300}"
-  local connect_timeout_sec="${8:-30}"
-
-  local endpoint
-  local auth_header=()
-  if [[ "$api_format" == "anthropic" ]]; then
-    endpoint="$base_url/messages"
-    auth_header=( -H "anthropic-version: $ANTHROPIC_VERSION" )
-    if [[ -n "$api_key" ]]; then
-      auth_header+=( -H "x-api-key: $api_key" )
-    fi
-  else
-    endpoint="$base_url/chat/completions"
-    if [[ -n "$api_key" ]]; then
-      auth_header=( -H "Authorization: Bearer $api_key" )
-    fi
-  fi
-
-  local args=(
-    -q
-    -fsSL
-    "$endpoint"
-    -H "Content-Type: application/json"
-    --data "@$payload_file"
-    --max-time "$request_timeout_sec"
-    --connect-timeout "$connect_timeout_sec"
-  )
-
-  args+=( "${auth_header[@]}" )
-
-  if [[ "$stream" == "true" ]]; then
-    args+=( --no-buffer )
-    if [[ "$api_format" == "anthropic" ]]; then
-      args+=( -H "Accept: text/event-stream" )
-    fi
-  fi
-
-  curl "${args[@]}" > "$output_file"
-}
+# curl_model is defined in scripts/model_call.sh so its HTTP-status handling
+# can be unit-tested independently of the main driver.
+source "${SCRIPT_DIR}/model_call.sh"
 
 build_model_request() {
   local api_format="$1"
@@ -973,18 +930,43 @@ build_model_request \
 
 PRIMARY_OK=0
 ATTEMPT=1
+PARSE_FAILS=0
+# A response that arrives but won't parse/validate is usually deterministic at
+# temperature 0.1 — re-sending the same corpus rarely helps. Cap those attempts
+# low and fall through to the fallback model instead of burning the full
+# transport-retry budget. Transport/HTTP failures keep the full budget.
+PARSE_FAIL_CAP=2
+RETRY_DELAY="$AI_PRIMARY_RETRY_DELAY_SEC"
 while [ "$ATTEMPT" -le "$AI_PRIMARY_RETRIES" ]; do
   echo "Primary model attempt ${ATTEMPT}/${AI_PRIMARY_RETRIES}: $AI_MODEL @ $AI_BASE_URL ($AI_API_FORMAT)"
-  if curl_model "$AI_BASE_URL" "$AI_API_KEY" "$AI_API_FORMAT" ai-request.primary.json ai-response.primary.json "$STREAM_BOOL" "$AI_REQUEST_TIMEOUT_SEC" "$AI_CONNECT_TIMEOUT_SEC" && \
-    { [[ "$STREAM_BOOL" != "true" ]] || reassemble_sse_response ai-response.primary.json "$AI_API_FORMAT"; } && \
-    parse_and_validate ai-response.primary.json; then
-    PRIMARY_OK=1
-    break
-  fi
+  if curl_model "$AI_BASE_URL" "$AI_API_KEY" "$AI_API_FORMAT" ai-request.primary.json ai-response.primary.json "$STREAM_BOOL" "$AI_REQUEST_TIMEOUT_SEC" "$AI_CONNECT_TIMEOUT_SEC"; then
+    if { [[ "$STREAM_BOOL" != "true" ]] || reassemble_sse_response ai-response.primary.json "$AI_API_FORMAT"; } && \
+      parse_and_validate ai-response.primary.json; then
+      PRIMARY_OK=1
+      break
+    fi
 
-  echo "Primary model attempt $ATTEMPT failed; waiting ${AI_PRIMARY_RETRY_DELAY_SEC}s" >&2
-  ATTEMPT=$((ATTEMPT + 1))
-  sleep "$AI_PRIMARY_RETRY_DELAY_SEC"
+    PARSE_FAILS=$((PARSE_FAILS + 1))
+    echo "Primary attempt $ATTEMPT: response received but parse/validate failed (parse failure ${PARSE_FAILS}/${PARSE_FAIL_CAP})" >&2
+    if [ -s ai-response.primary.json ]; then
+      printf '  response head (first 400 bytes): ' >&2
+      head -c 400 ai-response.primary.json >&2 || true
+      echo >&2
+    fi
+    if [ "$PARSE_FAILS" -ge "$PARSE_FAIL_CAP" ]; then
+      echo "Reached parse-failure cap; not retrying primary further" >&2
+      break
+    fi
+    ATTEMPT=$((ATTEMPT + 1))
+    sleep "$RETRY_DELAY"
+  else
+    # Transport or HTTP error (curl_model already logged the details/body).
+    echo "Primary attempt $ATTEMPT failed (connection/HTTP); waiting ${RETRY_DELAY}s" >&2
+    ATTEMPT=$((ATTEMPT + 1))
+    sleep "$RETRY_DELAY"
+    RETRY_DELAY=$((RETRY_DELAY * 2))
+    [ "$RETRY_DELAY" -gt 120 ] && RETRY_DELAY=120
+  fi
 done
 
 if [ "$PRIMARY_OK" -eq 1 ]; then
