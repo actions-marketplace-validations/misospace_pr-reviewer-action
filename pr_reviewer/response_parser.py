@@ -109,6 +109,67 @@ def _try_decode_json(text: str) -> Any | None:
 
 
 # ---------------------------------------------------------------------------
+# Verdict normalisation, truncation, and stream-error detection
+# ---------------------------------------------------------------------------
+
+# finish_reason / stop_reason values that indicate the model hit the token cap.
+_TRUNCATION_REASONS = {"length", "max_tokens", "max_output_tokens"}
+
+_APPROVE_VERDICTS = {"approve", "approved", "approval", "lgtm"}
+_REQUEST_CHANGES_VERDICTS = {
+    "request_changes", "request_change", "requestchanges",
+    "changes_requested", "change_requested", "needs_changes",
+    "needs_change", "reject", "rejected",
+}
+
+
+def _normalize_verdict(value: Any) -> str | None:
+    """Map common local-model verdict spellings to the canonical value.
+
+    Weaker models frequently return ``"Approve"``, ``"approved"``,
+    ``"request changes"``, ``"REQUEST_CHANGES"`` and similar. Returns
+    ``"approve"``, ``"request_changes"``, or ``None`` if unrecognised.
+    """
+    if not isinstance(value, str):
+        return None
+    collapsed = "_".join(value.strip().lower().split()).replace("-", "_")
+    if collapsed in _APPROVE_VERDICTS:
+        return "approve"
+    if collapsed in _REQUEST_CHANGES_VERDICTS:
+        return "request_changes"
+    return None
+
+
+def _finish_reason(response: dict[str, Any]) -> str | None:
+    """Best-effort extraction of the model's stop/finish reason."""
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        fr = choices[0].get("finish_reason")
+        if isinstance(fr, str):
+            return fr
+    sr = response.get("stop_reason")
+    if isinstance(sr, str):
+        return sr
+    return None
+
+
+def _surface_stream_error(response: dict[str, Any]) -> None:
+    """Raise SystemExit if the response carries a transport/stream error.
+
+    The SSE reassembler records provider error events under an ``error`` key so
+    a mid-stream error is reported instead of looking like empty output.
+    """
+    err = response.get("error")
+    if not err:
+        return
+    if isinstance(err, dict):
+        msg = err.get("message") or json.dumps(err)
+    else:
+        msg = str(err)
+    raise SystemExit(f"Model endpoint returned an error: {msg}")
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -131,6 +192,8 @@ def parse_response(response: dict[str, Any]) -> dict[str, Any]:
         If no JSON can be extracted, or the result is not a dict with the
         expected fields.
     """
+    _surface_stream_error(response)
+
     raw = _extract_content(response)
     if isinstance(raw, list):
         text = "".join(raw).strip()
@@ -147,26 +210,40 @@ def parse_response(response: dict[str, Any]) -> dict[str, Any]:
     if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
         parsed = parsed[0]
 
+    # A truncated generation is the most common cause of parse/validation
+    # failure on small local models. Surface it explicitly so the operator
+    # knows to raise ai_max_tokens rather than chasing a generic parse error.
+    finish = _finish_reason(response)
+    trunc = (
+        " (model output appears truncated at the token limit; increase ai_max_tokens)"
+        if finish in _TRUNCATION_REASONS
+        else ""
+    )
+
     if not isinstance(parsed, dict):
         raise SystemExit(
-            f"Expected JSON object but got {type(parsed).__name__}"
+            f"Expected JSON object but got {type(parsed).__name__}{trunc}"
         )
 
     # Validate required keys
     if "verdict" not in parsed:
-        raise SystemExit("Parsed JSON missing required key 'verdict'")
+        raise SystemExit(f"Parsed JSON missing required key 'verdict'{trunc}")
     if "review_markdown" not in parsed:
-        raise SystemExit("Parsed JSON missing required key 'review_markdown'")
+        raise SystemExit(f"Parsed JSON missing required key 'review_markdown'{trunc}")
 
-    verdict = parsed.get("verdict")
-    if verdict not in ("approve", "request_changes"):
+    raw_verdict = parsed.get("verdict")
+    verdict = _normalize_verdict(raw_verdict)
+    if verdict is None:
         raise SystemExit(
-            f"Expected verdict to be 'approve' or 'request_changes', got '{verdict}'"
+            f"Expected verdict to be 'approve' or 'request_changes', got '{raw_verdict}'"
         )
+    # Write back the canonical value so downstream consumers (jq -r '.verdict')
+    # always see 'approve' or 'request_changes'.
+    parsed["verdict"] = verdict
 
     markdown = parsed.get("review_markdown")
     if not isinstance(markdown, str) or not markdown.strip():
-        raise SystemExit("Parsed JSON has empty or missing 'review_markdown'")
+        raise SystemExit(f"Parsed JSON has empty or missing 'review_markdown'{trunc}")
 
     return parsed
 

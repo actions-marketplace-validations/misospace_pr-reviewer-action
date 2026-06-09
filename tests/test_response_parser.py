@@ -259,5 +259,70 @@ class TestParseResponseFile:
         assert "typo" in result["review_markdown"]
 
 
+# ---------------------------------------------------------------------------
+# Verdict normalisation, truncation, and stream-error handling
+# ---------------------------------------------------------------------------
+
+def _exit_msg(resp: dict) -> str:
+    """Call parse_response expecting SystemExit; return the message."""
+    try:
+        parse_response(resp)
+    except SystemExit as exc:
+        return str(exc)
+    raise AssertionError("expected SystemExit but parse_response returned")
+
+
+class TestVerdictNormalization:
+    @staticmethod
+    def _resp(verdict: str, finish_reason: str = "stop") -> dict:
+        return {
+            "choices": [{
+                "message": {"content": json.dumps(
+                    {"verdict": verdict, "review_markdown": "# ok"}
+                )},
+                "finish_reason": finish_reason,
+            }],
+        }
+
+    def test_capitalized_approve(self):
+        assert parse_response(self._resp("Approve"))["verdict"] == "approve"
+
+    def test_approved_synonym(self):
+        assert parse_response(self._resp("APPROVED"))["verdict"] == "approve"
+
+    def test_spaced_request_changes(self):
+        assert parse_response(self._resp("Request Changes"))["verdict"] == "request_changes"
+
+    def test_changes_requested_synonym(self):
+        assert parse_response(self._resp("changes_requested"))["verdict"] == "request_changes"
+
+    def test_unknown_verdict_still_rejected(self):
+        assert "Expected verdict" in _exit_msg(self._resp("maybe"))
+
+
+class TestTruncationAndStreamError:
+    def test_truncation_hint_openai_length(self):
+        # Unparseable (truncated) content with finish_reason=length.
+        resp = {"choices": [{"message": {"content": '{"verdict": "approve"'},
+                             "finish_reason": "length"}]}
+        assert "truncated" in _exit_msg(resp)
+
+    def test_truncation_hint_anthropic_max_tokens(self):
+        resp = {"content": [{"type": "text", "text": '{"verdict":'}],
+                "stop_reason": "max_tokens"}
+        assert "truncated" in _exit_msg(resp)
+
+    def test_no_truncation_hint_when_finished_normally(self):
+        resp = {"choices": [{"message": {"content": "no json here"},
+                             "finish_reason": "stop"}]}
+        assert "truncated" not in _exit_msg(resp)
+
+    def test_stream_error_surfaced(self):
+        resp = {"error": {"message": "context length exceeded"},
+                "choices": [{"message": {"content": ""}}]}
+        msg = _exit_msg(resp)
+        assert "context length exceeded" in msg
+
+
 if __name__ == "__main__":
     unittest_main()
