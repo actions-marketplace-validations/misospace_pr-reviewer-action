@@ -49,7 +49,9 @@ case "$1" in
     esac
     ;;
   "api")
-    if echo "$*" | grep -q 'comments'; then
+    if echo "$*" | grep -q 'reviews'; then
+      [ -f /tmp/testfp_reviews.json ] && cat /tmp/testfp_reviews.json
+    elif echo "$*" | grep -q 'comments'; then
       cat /tmp/testfp_comments.json
     fi
     ;;
@@ -94,9 +96,19 @@ run_precheck() {
     TOOL_ENABLE_FOR_FORKS="${TOOL_ENABLE_FOR_FORKS:-false}" \
     SKIP_IF_DIFF_UNCHANGED="${SKIP_IF_DIFF_UNCHANGED:-true}" \
     COMMENT_MARKER="${COMMENT_MARKER:-<!-- ai-pr-reviewer -->}" \
+    PUBLISH_MODE="${PUBLISH_MODE:-comment}" \
     bash "$PRECHECK_SCRIPT"
   )
   cat "$output_file"
+}
+
+set_reviews() {
+  local body="$1"
+  python3 <<PYEOF > /tmp/testfp_reviews.json
+import json
+body = """${body}"""
+print(json.dumps([{"body": body, "submitted_at": "2024-01-01T00:00:00Z"}]))
+PYEOF
 }
 
 set_comments() {
@@ -221,6 +233,32 @@ unset ACTION_REF
 RESULT="$(run_precheck)"
 
 check "should_review=false when everything matches" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "false"
+
+# ── Test 11: review_verdict mode reads prior state from PR reviews ────
+echo ""
+echo "=== Test 11: review_verdict mode finds the fingerprint in a PR review → skip ==="
+unset ACTION_REF
+rm -f /tmp/testfp_reviews.json
+set_empty_comments
+OUTPUT_FP_RV="$(PUBLISH_MODE=review_verdict run_precheck)"
+BROAD_FP_RV="$(echo "$OUTPUT_FP_RV" | grep '^diff_fingerprint=' | head -1 | cut -d= -f2)"
+set_reviews "<!-- ai-pr-reviewer -->
+<!-- ai-pr-review-fingerprint:${BROAD_FP_RV} -->
+APPROVE"
+RESULT="$(PUBLISH_MODE=review_verdict run_precheck)"
+check "should_review=false when a PR review fingerprint matches (review_verdict)" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "false"
+
+# ── Test 12: review_verdict ignores issue comments for prior state ───
+echo ""
+echo "=== Test 12: review_verdict does not read issue comments for prior state ==="
+rm -f /tmp/testfp_reviews.json
+# The matching fingerprint is only in an issue comment now; with no PR review
+# carrying it, review_verdict mode must fall back to a fresh review.
+set_comments "<!-- ai-pr-reviewer -->
+<!-- ai-pr-review-fingerprint:${BROAD_FP_RV} -->
+APPROVE"
+RESULT="$(PUBLISH_MODE=review_verdict run_precheck)"
+check "should_review=true when only an issue comment matches (review_verdict)" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

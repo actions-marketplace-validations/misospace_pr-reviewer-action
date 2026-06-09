@@ -131,6 +131,22 @@ STICKY_COMMENT_BODY=$(awk '/Publish review comment$/,/^    - name: Publish revie
 check_contains "sticky comment mode uses COMMENT_MARKER variable" \
   "$STICKY_COMMENT_BODY" "COMMENT_MARKER"
 
+# Every published body must carry the bare COMMENT_MARKER and the fingerprint
+# marker, otherwise the precheck cannot find prior state and skip-if-unchanged /
+# incremental scope silently never trigger (regression guard).
+check_contains "sticky comment body emits the bare COMMENT_MARKER" \
+  "$STICKY_COMMENT_BODY" 'echo "$COMMENT_MARKER"'
+check_contains "sticky comment body emits the fingerprint marker" \
+  "$STICKY_COMMENT_BODY" "ai-pr-review-fingerprint"
+check_contains "review_comment body emits the bare COMMENT_MARKER" \
+  "$BODY_CONTENT_REVIEW_COMMENT" 'echo "$COMMENT_MARKER"'
+check_contains "review_comment body emits the fingerprint marker" \
+  "$BODY_CONTENT_REVIEW_COMMENT" "ai-pr-review-fingerprint"
+check_contains "review_verdict body emits the bare COMMENT_MARKER" \
+  "$BODY_CONTENT_REVIEW_VERDICT" 'echo "$COMMENT_MARKER"'
+check_contains "review_verdict body emits the fingerprint marker" \
+  "$BODY_CONTENT_REVIEW_VERDICT" "ai-pr-review-fingerprint"
+
 echo ""
 echo "=== Helper script validation ==="
 
