@@ -168,5 +168,33 @@ class TestReassembleSSEToFile:
         assert result["choices"][0]["message"]["content"] == "Written"
 
 
+class TestStreamErrorDetection:
+    def test_openai_error_event(self):
+        result = reassemble_sse(_make_sse_line({"error": {"message": "boom"}}), "openai")
+        assert result.get("error") == {"message": "boom"}
+        assert result["choices"][0]["message"]["content"] == ""
+
+    def test_anthropic_error_event(self):
+        result = reassemble_sse(
+            _make_sse_line({"type": "error", "error": {"message": "overloaded"}}),
+            "anthropic",
+        )
+        assert result.get("error") == {"message": "overloaded"}
+
+    def test_non_sse_json_error_body(self):
+        # No 'data:' lines at all — a plain JSON error body (sometimes HTTP 200).
+        body = json.dumps({"error": {"message": "model not found"}})
+        result = reassemble_sse(body, "openai")
+        assert result.get("error") == {"message": "model not found"}
+
+    def test_no_false_error_on_valid_stream(self):
+        lines = [
+            _make_sse_line({"id": "c", "choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}),
+        ]
+        result = reassemble_sse("\n".join(lines), "openai")
+        assert "error" not in result
+        assert result["choices"][0]["message"]["content"] == "hi"
+
+
 if __name__ == "__main__":
     unittest_main()

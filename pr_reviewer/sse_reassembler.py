@@ -31,8 +31,27 @@ def reassemble_sse(response_text: str, api_format: str) -> dict:
     content_parts: list[str] = []
 
     if api_format == "anthropic":
-        return _reassemble_anthropic(lines, content_parts)
-    return _reassemble_openai(lines, content_parts)
+        result = _reassemble_anthropic(lines, content_parts)
+    else:
+        result = _reassemble_openai(lines, content_parts)
+
+    # Some local servers (llama.cpp/vLLM/ollama under load, or a proxy) return a
+    # plain JSON error body — sometimes with HTTP 200 — instead of an SSE stream.
+    # Without this, the reassembler yields empty content that looks like a
+    # successful-but-blank completion, masking the real failure and burning the
+    # whole retry budget. If we recovered no content and no error, try parsing
+    # the whole body as a JSON error.
+    if not result["choices"][0]["message"]["content"] and "error" not in result:
+        stripped = response_text.strip()
+        if stripped:
+            try:
+                whole = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                whole = None
+            if isinstance(whole, dict) and whole.get("error"):
+                result["error"] = whole["error"]
+
+    return result
 
 
 def _reassemble_anthropic(lines: list[str], content_parts: list[str]) -> dict:
@@ -42,6 +61,7 @@ def _reassemble_anthropic(lines: list[str], content_parts: list[str]) -> dict:
     model: str | None = None
     input_tokens = 0
     output_tokens = 0
+    error_payload = None
 
     for line in lines:
         line = line.strip()
@@ -56,6 +76,9 @@ def _reassemble_anthropic(lines: list[str], content_parts: list[str]) -> dict:
             continue
 
         etype = event.get("type", "")
+        if etype == "error":
+            error_payload = event.get("error") or event
+            continue
         if etype == "message_start":
             message_id = event.get("message", {}).get("id")
             model = event.get("message", {}).get("model")
@@ -76,7 +99,7 @@ def _reassemble_anthropic(lines: list[str], content_parts: list[str]) -> dict:
                 output_tokens += usage.get("output_tokens", 0)
 
     content_text = "".join(content_parts)
-    return {
+    result = {
         "id": message_id or "",
         "object": "chat.completion",
         "model": model or "",
@@ -91,6 +114,9 @@ def _reassemble_anthropic(lines: list[str], content_parts: list[str]) -> dict:
             "total_tokens": input_tokens + output_tokens,
         },
     }
+    if error_payload is not None:
+        result["error"] = error_payload
+    return result
 
 
 def _reassemble_openai(lines: list[str], content_parts: list[str]) -> dict:
@@ -99,6 +125,7 @@ def _reassemble_openai(lines: list[str], content_parts: list[str]) -> dict:
     usage_prompt_tokens = 0
     usage_completion_tokens = 0
     id_val = ""
+    error_payload = None
 
     for line in lines:
         line = line.strip()
@@ -110,6 +137,10 @@ def _reassemble_openai(lines: list[str], content_parts: list[str]) -> dict:
         try:
             chunk = json.loads(data)
         except json.JSONDecodeError:
+            continue
+
+        if isinstance(chunk, dict) and chunk.get("error"):
+            error_payload = chunk["error"]
             continue
 
         id_val = chunk.get("id", id_val)
@@ -130,7 +161,7 @@ def _reassemble_openai(lines: list[str], content_parts: list[str]) -> dict:
             usage_completion_tokens += usage.get("completion_tokens", 0)
 
     content_text = "".join(content_parts)
-    return {
+    result = {
         "id": id_val,
         "object": "chat.completion",
         "model": model or "",
@@ -145,6 +176,9 @@ def _reassemble_openai(lines: list[str], content_parts: list[str]) -> dict:
             "total_tokens": usage_prompt_tokens + usage_completion_tokens,
         },
     }
+    if error_payload is not None:
+        result["error"] = error_payload
+    return result
 
 
 def reassemble_sse_file(response_path: str, api_format: str) -> dict:
