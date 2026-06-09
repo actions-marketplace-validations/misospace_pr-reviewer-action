@@ -7,6 +7,7 @@ COMMENT_MARKER="${COMMENT_MARKER:-<!-- ai-pr-reviewer -->}"
 SKIP_IF_DIFF_UNCHANGED="${SKIP_IF_DIFF_UNCHANGED:-true}"
 OUTPUT_FILE="${GITHUB_OUTPUT:-/dev/null}"
 REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
+PUBLISH_MODE="${PUBLISH_MODE:-comment}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}/..${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -16,7 +17,9 @@ if [[ -z "$REPO" || -z "$PR_NUMBER" ]]; then
 fi
 
 # ── Diff fingerprint (unchanged) ──────────────────────────────────────
-current_fingerprint="$(gh pr diff "$PR_NUMBER" --repo "$REPO" | git patch-id --stable | awk 'NR == 1 { print $1 }')"
+# Tolerate a failing `gh pr diff` (network/auth blip) under `set -o pipefail`
+# so the precheck degrades to a fresh review instead of aborting the action.
+current_fingerprint="$( { gh pr diff "$PR_NUMBER" --repo "$REPO" || true; } | git patch-id --stable | awk 'NR == 1 { print $1 }' || true)"
 if [[ -z "$current_fingerprint" ]]; then
   current_fingerprint="empty-diff"
 fi
@@ -157,16 +160,39 @@ config_hash="$(compute_config_hash)"
 # Broader fingerprint = patch_id + config_hash (pipe-delimited)
 broad_fingerprint="${current_fingerprint}|cfg:${config_hash}"
 
-# ── Last review comment lookup ────────────────────────────────────────
-last_comment_body="$({
-  gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" | \
+# ── Last managed review body lookup ───────────────────────────────────
+# The managed body lives in a different place depending on publish mode:
+# `comment` and `review_comment` write an issue comment; `review_verdict`
+# submits a native PR review. Look in the right place so skip-if-unchanged
+# and incremental scope can find prior state in every mode.
+last_managed_comment_body() {
+  gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" 2>/dev/null | \
     jq -r --arg marker "$COMMENT_MARKER" '
       [ .[] | select((.body // "") | contains($marker)) ]
       | sort_by(.updated_at // .created_at)
       | last
       | .body // empty
     '
-} || true)"
+}
+
+last_managed_review_body() {
+  gh api "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" 2>/dev/null | \
+    jq -r --arg marker "$COMMENT_MARKER" '
+      [ .[] | select((.body // "") | contains($marker)) ]
+      | sort_by(.submitted_at // "")
+      | last
+      | .body // empty
+    '
+}
+
+case "$(printf '%s' "$PUBLISH_MODE" | tr '[:upper:]' '[:lower:]')" in
+  review_verdict)
+    last_comment_body="$(last_managed_review_body || true)"
+    ;;
+  *)
+    last_comment_body="$(last_managed_comment_body || true)"
+    ;;
+esac
 
 # Extract the PR head SHA and broad fingerprint from the last published comment.
 # ai-pr-review-sha: stored for future out-of-date detection (not yet used in skip logic).
@@ -314,9 +340,14 @@ if [[ -n "$last_comment_body" ]]; then
   extract_review_metadata "$last_comment_body"
 fi
 
-# Get current PR head/base SHAs
-CURRENT_HEAD_SHA="$(jq -r '.headRefOid' pr.json 2>/dev/null || echo "")"
-CURRENT_BASE_SHA="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.sha' 2>/dev/null || echo "")"
+# Get current PR head/base SHAs. pr.json is not created until run_review.sh
+# runs (a later step), so reading it here always yielded an empty head SHA and
+# the force-push ancestor guard below never ran. Fetch both from the API in a
+# single call instead.
+pr_head_base_json="$(gh api "repos/$REPO/pulls/$PR_NUMBER" 2>/dev/null || true)"
+[[ -n "$pr_head_base_json" ]] || pr_head_base_json='{}'
+CURRENT_HEAD_SHA="$(printf '%s' "$pr_head_base_json" | jq -r '.head.sha // ""' 2>/dev/null || echo "")"
+CURRENT_BASE_SHA="$(printf '%s' "$pr_head_base_json" | jq -r '.base.sha // ""' 2>/dev/null || echo "")"
 
 # Resolve effective review scope
 resolve_review_scope "$REVIEW_SCOPE" "$LAST_HEAD_SHA" "$LAST_BASE_SHA" \
