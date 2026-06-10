@@ -39,8 +39,18 @@ resolve_cleanup_flag() {
 }
 
 # Cleanup previous managed native reviews.
-# Requires env: GH_TOKEN, REPO, PR_NUMBER
+# Requires env: GH_TOKEN, REPO, PR_NUMBER; optional COMMENT_MARKER.
 # Args: $1 = resolved cleanup flag ("true"/"false")
+#
+# Managed reviews are matched by the marker their bodies START with, never by
+# author. Author matching via `gh api user` was structurally broken: /user
+# returns 403 for installation tokens (both the default GITHUB_TOKEN and
+# GitHub App tokens), and on HTTP errors gh prints the JSON error body to
+# stdout — so the "actor" became a JSON blob that matched no review and
+# cleanup silently did nothing on every run (#190). Marker matching is safe
+# because cleanup runs before the new review is posted, so it can never touch
+# the review the current run is about to create, and it keeps working when
+# the workflow's token identity changes (e.g. default token → app token).
 cleanup_native_reviews() {
   local should_cleanup="$1"
   if [ "$should_cleanup" != "true" ]; then
@@ -48,51 +58,46 @@ cleanup_native_reviews() {
   fi
 
   echo "Cleaning up previous managed native reviews for #$PR_NUMBER"
-  CURRENT_ACTOR="$(gh api user --jq .login 2>/dev/null || echo "")"
-  if [ -z "$CURRENT_ACTOR" ]; then
-    # The default GITHUB_TOKEN is an installation token and cannot call /user
-    # (403 Resource not accessible by integration). Reviews created with it
-    # are authored by github-actions[bot], so fall back to that identity
-    # instead of silently skipping cleanup.
-    CURRENT_ACTOR="github-actions[bot]"
-    echo "  Could not resolve current actor from /user; assuming $CURRENT_ACTOR (default GITHUB_TOKEN)"
+  local reviews_json
+  if ! reviews_json="$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --paginate 2>/dev/null)"; then
+    echo "  WARN: Could not list reviews for #$PR_NUMBER; skipping cleanup" >&2
+    return 0
   fi
-  if [ -n "$CURRENT_ACTOR" ]; then
-    # Managed bodies start with the configured marker (or, for reviews created
-    # by older action versions, the bare/JSON "<!-- ai-pr-reviewer" prefix).
-    # Matching both fixes cleanup misses when comment_marker is customized or
-    # when v1.1.x-era reviews carried only the JSON metadata marker (#162).
-    # The list query carries id and state together so no per-review GET is
-    # needed afterwards.
-    PREV_REVIEWS="$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --paginate 2>/dev/null \
-      | jq -r --arg actor "$CURRENT_ACTOR" \
-          --arg marker "${COMMENT_MARKER:-<!-- ai-pr-reviewer -->}" \
-          '.[] | select(.user.login == $actor
-                and (((.body // "") | contains($marker))
-                     or ((.body // "") | startswith("<!-- ai-pr-reviewer"))))
-              | "\(.id)\t\(.state // "")"' 2>/dev/null || echo "")"
-    if [ -n "$PREV_REVIEWS" ]; then
-      while IFS=$'\t' read -r REVIEW_ID REVIEW_STATE; do
-        if [ -z "$REVIEW_ID" ]; then continue; fi
-        # Dismiss approval/request-changes reviews to stop stale verdicts from counting
-        if [ "$REVIEW_STATE" = "APPROVED" ] || [ "$REVIEW_STATE" = "CHANGES_REQUESTED" ]; then
-          if gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/dismissals" --method PUT -f message="Superseded by a newer automated review for this pull request." --jq '.id' >/dev/null 2>&1; then
-            echo "  Dismissed outdated managed review #$REVIEW_ID ($REVIEW_STATE)"
-          else
-            echo "  WARN: Could not dismiss review #$REVIEW_ID (may require additional permissions)" >&2
-          fi
-        fi
-        # Update body to compact outdated stub (best-effort)
-        OUTDATED_BODY="$(printf '<!-- ai-pr-reviewer -->\n_Outdated: superseded by a newer automated review._')"
-        if ! gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --method PATCH -f body="$OUTDATED_BODY" >/dev/null 2>&1; then
-          echo "  WARN: Could not update review #$REVIEW_ID body (submitted reviews may be read-only)" >&2
+
+  # Managed bodies start with the configured marker (or, for reviews created
+  # by older action versions, the bare/JSON "<!-- ai-pr-reviewer" prefix).
+  # Reviews already stubbed as outdated are skipped unless they still carry a
+  # live verdict (a previous run may have patched the body but failed the
+  # dismissal). The list query carries id and state together so no per-review
+  # GET is needed afterwards.
+  PREV_REVIEWS="$(printf '%s' "$reviews_json" \
+    | jq -r --arg marker "${COMMENT_MARKER:-<!-- ai-pr-reviewer -->}" \
+        '.[] | select(((.body // "") | startswith($marker))
+                   or ((.body // "") | startswith("<!-- ai-pr-reviewer")))
+             | select(((.state // "") == "APPROVED" or (.state // "") == "CHANGES_REQUESTED")
+                   or (((.body // "") | contains("_Outdated: superseded")) | not))
+             | "\(.id)\t\(.state // "")"' 2>/dev/null || echo "")"
+  if [ -n "$PREV_REVIEWS" ]; then
+    while IFS=$'\t' read -r REVIEW_ID REVIEW_STATE; do
+      if [ -z "$REVIEW_ID" ]; then continue; fi
+      # Dismiss approval/request-changes reviews to stop stale verdicts from counting
+      if [ "$REVIEW_STATE" = "APPROVED" ] || [ "$REVIEW_STATE" = "CHANGES_REQUESTED" ]; then
+        if gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/dismissals" --method PUT -f message="Superseded by a newer automated review for this pull request." --jq '.id' >/dev/null 2>&1; then
+          echo "  Dismissed outdated managed review #$REVIEW_ID ($REVIEW_STATE)"
         else
-          echo "  Marked review #$REVIEW_ID as outdated/superseded"
+          echo "  WARN: Could not dismiss review #$REVIEW_ID (may require additional permissions)" >&2
         fi
-      done <<< "$PREV_REVIEWS"
-    else
-      echo "  No previous managed native reviews found for #$PR_NUMBER"
-    fi
+      fi
+      # Update body to compact outdated stub (best-effort)
+      OUTDATED_BODY="$(printf '<!-- ai-pr-reviewer -->\n_Outdated: superseded by a newer automated review._')"
+      if ! gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --method PATCH -f body="$OUTDATED_BODY" >/dev/null 2>&1; then
+        echo "  WARN: Could not update review #$REVIEW_ID body (submitted reviews may be read-only)" >&2
+      else
+        echo "  Marked review #$REVIEW_ID as outdated/superseded"
+      fi
+    done <<< "$PREV_REVIEWS"
+  else
+    echo "  No previous managed native reviews found for #$PR_NUMBER"
   fi
 }
 
