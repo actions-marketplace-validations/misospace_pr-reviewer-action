@@ -69,6 +69,7 @@ The classification is purely rule-based — no model calls are involved. It uses
 | `ai_fallback_model` | Optional fallback model name | No | `""` |
 | `ai_fallback_api_key` | Optional API key for the fallback AI endpoint | No | `""` |
 | `ai_primary_retries` | Number of retries for the primary model | No | `8` |
+| `on_model_failure` | Behavior when primary **and** fallback models fail: `fail` (fail the step) or `notice` (post a visible `request_changes` notice explaining the review could not run — never auto-approves) | No | `fail` |
 | `ai_primary_retry_delay_sec` | Delay between retries in seconds | No | `15` |
 | `allowed_source_hosts` | Comma-separated allowlist for linked URL fetching | No | `github.com,api.github.com,gitlab.com,registry.terraform.io,artifacthub.io` |
 | `system_prompt` | Optional system prompt override | No | bundled prompt |

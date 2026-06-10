@@ -79,6 +79,14 @@ inputs:
     description: Delay between primary retries in seconds
     required: false
     default: "15"
+  on_model_failure:
+    description: >-
+      Behavior when both primary and fallback models fail to return a usable review.
+      'fail' (default) fails the action step. 'notice' instead posts a visible
+      request_changes notice explaining the review could not run (never auto-approves),
+      so reviewers see an explanation instead of only a red check.
+    required: false
+    default: "fail"
   ai_stream:
     description: If true, use streaming responses to avoid timeouts behind proxies with short read timeouts (e.g. Cloudflare 100s edge timer)
     required: false
@@ -405,6 +413,7 @@ runs:
         AI_FALLBACK_API_KEY: ${{ inputs.ai_fallback_api_key }}
         AI_PRIMARY_RETRIES: ${{ inputs.ai_primary_retries }}
         AI_PRIMARY_RETRY_DELAY_SEC: ${{ inputs.ai_primary_retry_delay_sec }}
+        ON_MODEL_FAILURE: ${{ inputs.on_model_failure }}
         AI_STREAM: ${{ inputs.ai_stream }}
         AI_FALLBACK_STREAM: ${{ inputs.ai_fallback_stream }}
         ALLOWED_SOURCE_HOSTS: ${{ inputs.allowed_source_hosts }}
