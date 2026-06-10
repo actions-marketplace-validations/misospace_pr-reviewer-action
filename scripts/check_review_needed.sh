@@ -162,6 +162,20 @@ compute_config_hash() {
     parts+=("tool_forks:${TOOL_ENABLE_FOR_FORKS}")
   fi
 
+  # Model routing (#159): a routing change must force a fresh review
+  if [[ -n "${REVIEW_ROUTING_MODE:-}" ]]; then
+    parts+=("routing_mode:${REVIEW_ROUTING_MODE}")
+  fi
+  if [[ -n "${AI_FAST_MODEL:-}" ]]; then
+    parts+=("fast_model:${AI_FAST_MODEL}")
+  fi
+  if [[ -n "${AI_SMART_MODEL:-}" ]]; then
+    parts+=("smart_model:${AI_SMART_MODEL}")
+  fi
+  if [[ -n "${ESCALATE_ON_RISK_FLAGS:-}" ]]; then
+    parts+=("escalate_flags:${ESCALATE_ON_RISK_FLAGS}")
+  fi
+
   # Review scope
   if [[ -n "${REVIEW_SCOPE:-}" ]]; then
     parts+=("review_scope:${REVIEW_SCOPE}")
