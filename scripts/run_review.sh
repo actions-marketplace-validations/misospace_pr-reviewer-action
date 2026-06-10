@@ -98,6 +98,7 @@ AI_CONNECT_TIMEOUT_SEC="${AI_CONNECT_TIMEOUT_SEC:-30}"
 AI_FALLBACK_REQUEST_TIMEOUT_SEC="${AI_FALLBACK_REQUEST_TIMEOUT_SEC:-${AI_REQUEST_TIMEOUT_SEC}}"
 AI_FALLBACK_CONNECT_TIMEOUT_SEC="${AI_FALLBACK_CONNECT_TIMEOUT_SEC:-${AI_CONNECT_TIMEOUT_SEC}}"
 OUTPUT_FILE="${GITHUB_OUTPUT:-/dev/null}"
+ON_MODEL_FAILURE="${ON_MODEL_FAILURE:-fail}"
 REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
 EFFECTIVE_SCOPE="${EFFECTIVE_SCOPE:-full}"
 PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA:-}"
@@ -1033,15 +1034,44 @@ while [ "$ATTEMPT" -le "$AI_PRIMARY_RETRIES" ]; do
   fi
 done
 
+# On total model failure, either fail the step (default, preserves prior
+# behaviour) or — when on_model_failure=notice — emit a request_changes notice so
+# the publish step posts a visible explanation instead of leaving a red check
+# with nothing on the PR. request_changes is the safe default (never auto-approves).
+handle_model_failure() {
+  local reason="$1"
+  error "$reason"
+  if [[ "$(printf '%s' "$ON_MODEL_FAILURE" | tr '[:upper:]' '[:lower:]')" != "notice" ]]; then
+    exit 1
+  fi
+  log "on_model_failure=notice: emitting a request_changes notice instead of failing the check"
+  ANALYSIS_ENGINE="(model unavailable)"
+  REASON="$reason" python3 - > ai-output.json <<'PY'
+import json, os
+reason = os.environ.get("REASON", "model unavailable")
+md = (
+    "## AI review could not run\n\n"
+    "The configured model endpoint(s) did not return a usable review for this run "
+    f"(reason: {reason}).\n\n"
+    "This is an automated notice, not a substantive review. Re-run the workflow "
+    "once the endpoint is reachable; see the action logs for the underlying error.\n"
+)
+print(json.dumps({"verdict": "request_changes", "review_markdown": md}))
+PY
+}
+
 if [ "$PRIMARY_OK" -eq 1 ]; then
   ANALYSIS_ENGINE="$AI_MODEL@$AI_BASE_URL ($AI_API_FORMAT)"
   echo "Primary model succeeded"
 else
+  TRY_FALLBACK=1
   if [[ -z "$AI_FALLBACK_BASE_URL" || -z "$AI_FALLBACK_MODEL" ]]; then
-    error "Primary model unavailable and no fallback model configured"
-    exit 1
+    # In notice mode handle_model_failure returns; otherwise it exits.
+    handle_model_failure "Primary model unavailable and no fallback model configured"
+    TRY_FALLBACK=0
   fi
 
+  if [ "$TRY_FALLBACK" -eq 1 ]; then
   echo "Primary model unavailable after retries; trying fallback: $AI_FALLBACK_MODEL @ $AI_FALLBACK_BASE_URL ($AI_FALLBACK_API_FORMAT)" >&2
   head -c 120000 review-corpus.md > review-corpus.fallback.truncated.md
 
@@ -1065,8 +1095,8 @@ else
     ANALYSIS_ENGINE="$AI_FALLBACK_MODEL@$AI_FALLBACK_BASE_URL ($AI_FALLBACK_API_FORMAT)"
     echo "Fallback model succeeded" >&2
   else
-    error "Fallback model failed"
-    exit 1
+    handle_model_failure "Fallback model failed"
+  fi
   fi
 fi
 
@@ -1105,5 +1135,53 @@ echo "effective_review_scope=$EFFECTIVE_SCOPE" >> "$OUTPUT_FILE"
 if [[ -n "$PREVIOUS_HEAD_SHA" ]]; then
   echo "previous_head_sha=$PREVIOUS_HEAD_SHA" >> "$OUTPUT_FILE"
 fi
+
+# Observability: a step-summary table so a user debugging a slow/odd review can
+# see the engine, verdict, token usage, truncation, and the active budget
+# without digging through raw logs.
+write_step_summary() {
+  [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+
+  local verdict diff_bytes corpus_bytes prompt_tok comp_tok usage_file
+  verdict="$(jq -r '.verdict // "unknown"' ai-output.json 2>/dev/null || echo unknown)"
+  diff_bytes="$( [ -f pr.diff ] && wc -c < pr.diff | tr -d ' ' || echo 0 )"
+  corpus_bytes="$( [ -f review-corpus.md ] && wc -c < review-corpus.md | tr -d ' ' || echo 0 )"
+
+  usage_file=""
+  [ -f ai-response.primary.json ] && usage_file="ai-response.primary.json"
+  [[ "$ANALYSIS_ENGINE" == *fallback* || "$ANALYSIS_ENGINE" == "$AI_FALLBACK_MODEL"* ]] && [ -f ai-response.fallback.json ] && usage_file="ai-response.fallback.json"
+  prompt_tok="-"; comp_tok="-"
+  if [ -n "$usage_file" ]; then
+    prompt_tok="$(jq -r '.usage.prompt_tokens // "-"' "$usage_file" 2>/dev/null || echo -)"
+    comp_tok="$(jq -r '.usage.completion_tokens // "-"' "$usage_file" 2>/dev/null || echo -)"
+  fi
+
+  local diff_trunc="no" corpus_trunc="no"
+  [ "$diff_bytes" -gt "$MAX_DIFF" ] 2>/dev/null && diff_trunc="yes (cap ${MAX_DIFF})"
+  [ "$corpus_bytes" -gt "$MAX_CORPUS" ] 2>/dev/null && corpus_trunc="yes (cap ${MAX_CORPUS})"
+
+  local budget_desc
+  if [[ "${MODEL_CONTEXT_TOKENS:-}" =~ ^[0-9]+$ ]]; then
+    budget_desc="model_context_tokens=${MODEL_CONTEXT_TOKENS}"
+  else
+    budget_desc="context_limit_mode=${CONTEXT_LIMIT_MODE:-normal}"
+  fi
+
+  {
+    echo "### AI PR Review"
+    echo ""
+    echo "| Field | Value |"
+    echo "| --- | --- |"
+    echo "| Engine | ${ANALYSIS_ENGINE} |"
+    echo "| Verdict | ${verdict} |"
+    echo "| Scope | ${EFFECTIVE_SCOPE} |"
+    echo "| Budget | ${budget_desc} |"
+    echo "| Diff bytes | ${diff_bytes} (truncated: ${diff_trunc}) |"
+    echo "| Corpus bytes | ${corpus_bytes} (truncated: ${corpus_trunc}) |"
+    echo "| Prompt tokens | ${prompt_tok} |"
+    echo "| Completion tokens | ${comp_tok} |"
+  } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+}
+write_step_summary
 
 log "Done."
