@@ -281,8 +281,11 @@ class TestActionWiring:
         assert "inline_findings:" in self.ACTION
         assert "inline_findings_max:" in self.ACTION
 
-    def test_native_steps_receive_findings(self):
-        assert self.ACTION.count("FINDINGS: ${{ steps.review.outputs.findings }}") == 2
+    def test_all_publish_steps_receive_findings(self):
+        # All three publish steps (comment, review_comment, review_verdict)
+        # must receive FINDINGS so build_metadata_marker persists
+        # open_findings — without it, carry-forward never engages.
+        assert self.ACTION.count("FINDINGS: ${{ steps.review.outputs.findings }}") == 3
         assert self.ACTION.count("INLINE_FINDINGS: ${{ inputs.inline_findings }}") == 2
 
     def test_review_verdict_falls_back_on_failure(self):

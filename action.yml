@@ -638,6 +638,7 @@ runs:
         REVIEW_ROUTE: ${{ steps.review.outputs.review_route }}
         ESCALATION_REASON: ${{ steps.review.outputs.escalation_reason }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
+        FINDINGS: ${{ steps.review.outputs.findings }}
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
         COMMENT_MARKER: ${{ inputs.comment_marker }}
         GITHUB_ACTION_PATH: ${{ github.action_path }}
