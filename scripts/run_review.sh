@@ -100,6 +100,8 @@ AI_FALLBACK_CONNECT_TIMEOUT_SEC="${AI_FALLBACK_CONNECT_TIMEOUT_SEC:-${AI_CONNECT
 OUTPUT_FILE="${GITHUB_OUTPUT:-/dev/null}"
 ON_MODEL_FAILURE="${ON_MODEL_FAILURE:-fail}"
 VERDICT_POLICY="${VERDICT_POLICY:-model}"
+VALIDATE_REQUIRED_CHECKS="${VALIDATE_REQUIRED_CHECKS:-auto}"
+REQUIRED_CHECK_VALIDATION_MODE="${REQUIRED_CHECK_VALIDATION_MODE:-warn}"
 REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
 EFFECTIVE_SCOPE="${EFFECTIVE_SCOPE:-full}"
 PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA:-}"
@@ -259,6 +261,22 @@ case "$VERDICT_POLICY" in
     ;;
 esac
 
+case "$(printf '%s' "$VALIDATE_REQUIRED_CHECKS" | tr '[:upper:]' '[:lower:]')" in
+  auto|true|false) VALIDATE_REQUIRED_CHECKS="$(printf '%s' "$VALIDATE_REQUIRED_CHECKS" | tr '[:upper:]' '[:lower:]')" ;;
+  *)
+    error "Invalid VALIDATE_REQUIRED_CHECKS '$VALIDATE_REQUIRED_CHECKS'; defaulting to auto"
+    VALIDATE_REQUIRED_CHECKS=auto
+    ;;
+esac
+
+case "$(printf '%s' "$REQUIRED_CHECK_VALIDATION_MODE" | tr '[:upper:]' '[:lower:]')" in
+  warn|fail|metadata_only) REQUIRED_CHECK_VALIDATION_MODE="$(printf '%s' "$REQUIRED_CHECK_VALIDATION_MODE" | tr '[:upper:]' '[:lower:]')" ;;
+  *)
+    error "Invalid REQUIRED_CHECK_VALIDATION_MODE '$REQUIRED_CHECK_VALIDATION_MODE'; defaulting to warn"
+    REQUIRED_CHECK_VALIDATION_MODE=warn
+    ;;
+esac
+
 if [[ -n "$AI_FALLBACK_BASE_URL" && -z "$AI_FALLBACK_MODEL" ]]; then
   error "AI_FALLBACK_MODEL is required when AI_FALLBACK_BASE_URL is set"
   exit 1
@@ -358,11 +376,16 @@ apply_all_enforcement_wrapper() {
   local tool_failure_enabled="$2"
   local tool_min_successful="$3"
   local verdict_policy="$4"
+  local validate_checks="$5"
+  local validation_mode="$6"
   PYTHONPATH="${SCRIPT_DIR}/.." python3 -c "
+from pr_reviewer.completeness import apply_required_check_validation
 from pr_reviewer.enforcement import apply_all_enforcement, apply_verdict_policy
-# Verdict policy first (may derive the verdict from findings); enforcement
-# overlays run after and can still force request_changes.
+# Order: verdict policy (may derive the verdict from findings), then
+# completeness validation (may warn or fail on unaddressed required checks),
+# then enforcement overlays, which can still force request_changes.
 apply_verdict_policy('$verdict_policy')
+apply_required_check_validation('$validate_checks', '$validation_mode')
 apply_all_enforcement(
   evidence_blocker_enabled=('$evidence_blocker_enabled' == 'true'),
   tool_failure_enabled=('$tool_failure_enabled' == 'true'),
@@ -1242,11 +1265,12 @@ if [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" == "plan_execut
   TOOL_FAILURE_ENABLED="true"
 fi
 
-apply_all_enforcement_wrapper "$EVIDENCE_BLOCKER_ENABLED" "$TOOL_FAILURE_ENABLED" "$TOOL_MIN_SUCCESSFUL_REQUESTS" "$VERDICT_POLICY"
+apply_all_enforcement_wrapper "$EVIDENCE_BLOCKER_ENABLED" "$TOOL_FAILURE_ENABLED" "$TOOL_MIN_SUCCESSFUL_REQUESTS" "$VERDICT_POLICY" "$VALIDATE_REQUIRED_CHECKS" "$REQUIRED_CHECK_VALIDATION_MODE"
 
 echo "analysis_engine=$ANALYSIS_ENGINE" >> "$OUTPUT_FILE"
 echo "verdict=$(jq -r '.verdict' ai-output.json)" >> "$OUTPUT_FILE"
 echo "verdict_source=$(jq -r '.verdict_source // "model"' ai-output.json)" >> "$OUTPUT_FILE"
+echo "required_checks=$(jq -r '.required_checks // "none"' ai-output.json)" >> "$OUTPUT_FILE"
 
 # Use a random heredoc delimiter so model-controlled review text (which can be
 # influenced by prompt injection in the PR diff/title/body) cannot terminate the
@@ -1312,6 +1336,8 @@ write_step_summary() {
   findings_count="$(jq -r '.findings | length' ai-output.json 2>/dev/null || echo 0)"
   blockers_count="$(jq -r '[.findings[]? | select(.severity == "blocker")] | length' ai-output.json 2>/dev/null || echo 0)"
   verdict_source="$(jq -r '.verdict_source // "model"' ai-output.json 2>/dev/null || echo model)"
+  local required_checks_status
+  required_checks_status="$(jq -r '.required_checks // "none"' ai-output.json 2>/dev/null || echo none)"
 
   {
     echo "### AI PR Review"
@@ -1321,6 +1347,7 @@ write_step_summary() {
     echo "| Engine | ${ANALYSIS_ENGINE} |"
     echo "| Verdict | ${verdict} (source: ${verdict_source}) |"
     echo "| Findings | ${findings_count} (blockers: ${blockers_count}) |"
+    echo "| Required checks | ${required_checks_status} |"
     echo "| Scope | ${EFFECTIVE_SCOPE} |"
     echo "| Budget | ${budget_desc} |"
     echo "| Diff bytes | ${diff_bytes} (truncated: ${diff_trunc}) |"

@@ -325,45 +325,71 @@ def _detect_risk_flags(
     return flags
 
 
+# Checklist items per risk class. Keys are pr_kind values AND the file-based
+# risk flags (which share names), so a flag like auth_changes detected on an
+# app_code PR still pulls in the auth checklist (#157).
+KIND_CHECKS: dict[str, list[str]] = {
+    "renovate_digest_only": [
+        "verify no functional changes beyond lockfile hashes",
+    ],
+    "dependency_upgrade": [
+        "check for breaking API changes in updated dependencies",
+        "run full test suite after upgrade",
+    ],
+    "k8s_manifest": [
+        "validate manifest against target cluster version",
+        "check for resource quota / limit changes",
+    ],
+    "auth_changes": [
+        "review auth flow for regression",
+        "verify session token handling is correct",
+    ],
+    "public_route_changes": [
+        "verify route access controls are in place",
+        "check for unintended public endpoints",
+    ],
+    "file_serving_changes": [
+        "verify file path sanitization",
+        "check for directory traversal vulnerabilities",
+    ],
+    "path_handling_changes": [
+        "review for path traversal vulnerabilities",
+        "test with edge-case paths (null bytes, symlinks)",
+    ],
+    "secret_handling_changes": [
+        "verify secrets are not logged or exposed in diffs",
+        "check secret rotation impact",
+    ],
+    "db_or_migration_changes": [
+        "review migration for data loss risk",
+        "test migration on a copy of production schema",
+    ],
+}
+
+# Checklist items per linked-issue risk flag.
+FLAG_CHECKS: dict[str, list[str]] = {
+    "linked_security_issue": ["explicitly address the linked security issue"],
+    "linked_audit_issue": ["verify audit findings are addressed"],
+    "linked_priority_p0": ["treat as critical — verify all changes thoroughly"],
+    "linked_priority_p1": ["treat as high priority — verify correctness carefully"],
+}
+
+
 def _build_must_check(pr_kind: str, risk_flags: list[str]) -> list[str]:
-    """Generate explicit must-check items based on classification."""
+    """Generate explicit must-check items based on classification.
+
+    Checks come from the union of the pr_kind and every detected risk flag
+    (deduplicated, pr_kind first) — not the pr_kind alone, so secondary risk
+    signals still produce their checklists.
+    """
     checks: list[str] = []
+    seen: set[str] = set()
 
-    if pr_kind == "renovate_digest_only":
-        checks.append("verify no functional changes beyond lockfile hashes")
-    elif pr_kind == "dependency_upgrade":
-        checks.append("check for breaking API changes in updated dependencies")
-        checks.append("run full test suite after upgrade")
-    elif pr_kind == "k8s_manifest":
-        checks.append("validate manifest against target cluster version")
-        checks.append("check for resource quota / limit changes")
-    elif pr_kind == "auth_changes":
-        checks.append("review auth flow for regression")
-        checks.append("verify session token handling is correct")
-    elif pr_kind == "public_route_changes":
-        checks.append("verify route access controls are in place")
-        checks.append("check for unintended public endpoints")
-    elif pr_kind == "file_serving_changes":
-        checks.append("verify file path sanitization")
-        checks.append("check for directory traversal vulnerabilities")
-    elif pr_kind == "path_handling_changes":
-        checks.append("review for path traversal vulnerabilities")
-        checks.append("test with edge-case paths (null bytes, symlinks)")
-    elif pr_kind == "secret_handling_changes":
-        checks.append("verify secrets are not logged or exposed in diffs")
-        checks.append("check secret rotation impact")
-    elif pr_kind == "db_or_migration_changes":
-        checks.append("review migration for data loss risk")
-        checks.append("test migration on a copy of production schema")
-
-    if "linked_security_issue" in risk_flags:
-        checks.append("explicitly address the linked security issue")
-    if "linked_audit_issue" in risk_flags:
-        checks.append("verify audit findings are addressed")
-    if "linked_priority_p0" in risk_flags:
-        checks.append("treat as critical — verify all changes thoroughly")
-    if "linked_priority_p1" in risk_flags:
-        checks.append("treat as high priority — verify correctness carefully")
+    for key in [pr_kind, *risk_flags]:
+        for check in KIND_CHECKS.get(key, []) + FLAG_CHECKS.get(key, []):
+            if check not in seen:
+                seen.add(check)
+                checks.append(check)
 
     return checks
 

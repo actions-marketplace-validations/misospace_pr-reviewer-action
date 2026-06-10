@@ -104,11 +104,22 @@ build_metadata_marker() {
   local base_sha="$1"
   local previous_head_sha="${2:-}"
 
-  local marker="<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"${HEAD_SHA:-unknown}\",\"base_sha\":\"${base_sha}\",\"review_scope\":\"${EFFECTIVE_SCOPE}\",\"review_result\":\"${REVIEW_RESULT}\"} -->"
-  if [ "$EFFECTIVE_SCOPE" = "incremental" ] && [ -n "$previous_head_sha" ]; then
-    marker="${marker%,*},\"previous_head_sha\":\"${previous_head_sha}\"}"
-  fi
-  printf '%s' "$marker"
+  # Built with jq instead of string surgery: the old "${marker%,*}" trick for
+  # appending previous_head_sha cut at the LAST comma, silently dropping
+  # review_result and the closing " -->" — which made incremental markers
+  # unparseable and degraded the next run back to a full review.
+  local marker_json
+  marker_json="$(jq -nc \
+    --arg head "${HEAD_SHA:-unknown}" \
+    --arg base "$base_sha" \
+    --arg scope "${EFFECTIVE_SCOPE}" \
+    --arg result "${REVIEW_RESULT}" \
+    --arg checks "${REQUIRED_CHECKS:-}" \
+    --arg prev "$previous_head_sha" \
+    '{version: 1, head_sha: $head, base_sha: $base, review_scope: $scope, review_result: $result}
+     + (if $checks == "" or $checks == "none" then {} else {required_checks: $checks} end)
+     + (if $scope == "incremental" and $prev != "" then {previous_head_sha: $prev} else {} end)')"
+  printf '<!-- ai-pr-reviewer:%s -->' "$marker_json"
 }
 
 # Validate that PR_NUMBER is set.
