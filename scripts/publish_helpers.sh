@@ -64,21 +64,34 @@ cleanup_native_reviews() {
     return 0
   fi
 
+  # Minimized state lives only in GraphQL (the REST review list does not
+  # expose it); one query maps databaseId → isMinimized for skip logic. On
+  # failure the map is empty and minimization is simply retried (idempotent).
+  local minimized_ids
+  minimized_ids="$(gh api graphql \
+    -f query='query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $number) { reviews(first: 100) { nodes { databaseId isMinimized } } } } }' \
+    -f owner="${REPO%%/*}" -f name="${REPO#*/}" -F number="$PR_NUMBER" \
+    --jq '[.data.repository.pullRequest.reviews.nodes[] | select(.isMinimized) | .databaseId]' 2>/dev/null || echo '[]')"
+  printf '%s' "$minimized_ids" | jq -e 'type == "array"' >/dev/null 2>&1 || minimized_ids='[]'
+
   # Managed bodies start with the configured marker (or, for reviews created
   # by older action versions, the bare/JSON "<!-- ai-pr-reviewer" prefix).
-  # Reviews already stubbed as outdated are skipped unless they still carry a
-  # live verdict (a previous run may have patched the body but failed the
-  # dismissal). The list query carries id and state together so no per-review
-  # GET is needed afterwards.
+  # Review CONTENT is never modified — the review is hidden, not rewritten —
+  # so a human expanding an outdated review still sees what it said.
+  # Already-minimized reviews are skipped unless they still carry a live
+  # verdict (a previous run may have minimized but failed the dismissal).
+  # The list query carries id and state together so no per-review GET is
+  # needed afterwards.
   PREV_REVIEWS="$(printf '%s' "$reviews_json" \
     | jq -r --arg marker "${COMMENT_MARKER:-<!-- ai-pr-reviewer -->}" \
+        --argjson minimized "$minimized_ids" \
         '.[] | select(((.body // "") | startswith($marker))
                    or ((.body // "") | startswith("<!-- ai-pr-reviewer")))
              | select(((.state // "") == "APPROVED" or (.state // "") == "CHANGES_REQUESTED")
-                   or (((.body // "") | contains("_Outdated: superseded")) | not))
-             | "\(.id)\t\(.node_id // "")\t\(.state // "")"' 2>/dev/null || echo "")"
+                   or ((.id as $i | $minimized | index($i)) == null))
+             | "\(.id)\t\(.node_id // "")\t\(.state // "")\t\(if (.id as $i | $minimized | index($i)) != null then "minimized" else "" end)"' 2>/dev/null || echo "")"
   if [ -n "$PREV_REVIEWS" ]; then
-    while IFS=$'\t' read -r REVIEW_ID REVIEW_NODE_ID REVIEW_STATE; do
+    while IFS=$'\t' read -r REVIEW_ID REVIEW_NODE_ID REVIEW_STATE REVIEW_MINIMIZED; do
       if [ -z "$REVIEW_ID" ]; then continue; fi
       # Dismiss approval/request-changes reviews to stop stale verdicts from counting
       if [ "$REVIEW_STATE" = "APPROVED" ] || [ "$REVIEW_STATE" = "CHANGES_REQUESTED" ]; then
@@ -92,7 +105,7 @@ cleanup_native_reviews() {
       # the full review text stays expanded without this. PullRequestReview
       # implements GraphQL's Minimizable, the same mechanism as the UI's
       # "Hide" menu.
-      if [ -n "$REVIEW_NODE_ID" ]; then
+      if [ -n "$REVIEW_NODE_ID" ] && [ "$REVIEW_MINIMIZED" != "minimized" ]; then
         if gh api graphql \
             -f query='mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { minimizedComment { isMinimized } } }' \
             -f id="$REVIEW_NODE_ID" >/dev/null 2>&1; then
@@ -101,19 +114,9 @@ cleanup_native_reviews() {
           echo "  WARN: Could not minimize review #$REVIEW_ID (may require additional permissions)" >&2
         fi
       fi
-      # Collapse the body to a one-line stub so even an expanded review stays
-      # compact (and so already-processed reviews are skipped next run). The
-      # endpoint is PUT — the previous PATCH was a 404 that the old code
-      # misreported as "reviews may be read-only".
-      OUTDATED_BODY="$(printf '<!-- ai-pr-reviewer -->\n_Outdated: superseded by a newer automated review._')"
-      if ! gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" --method PUT -f body="$OUTDATED_BODY" >/dev/null 2>&1; then
-        echo "  WARN: Could not update review #$REVIEW_ID body" >&2
-      else
-        echo "  Marked review #$REVIEW_ID as outdated/superseded"
-      fi
     done <<< "$PREV_REVIEWS"
   else
-    echo "  No previous managed native reviews found for #$PR_NUMBER"
+    echo "  No previous managed native reviews to clean up for #$PR_NUMBER"
   fi
 }
 

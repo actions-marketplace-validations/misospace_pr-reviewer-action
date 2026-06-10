@@ -19,6 +19,14 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PASS=0
 FAIL=0
+check() {
+  local desc="$1" result="$2" expected="$3"
+  if [[ "$result" == "$expected" ]]; then
+    echo "  PASS: $desc"; PASS=$((PASS + 1))
+  else
+    echo "  FAIL: $desc (got '$result', expected '$expected')"; FAIL=$((FAIL + 1))
+  fi
+}
 check_contains() {
   local desc="$1" haystack="$2" needle="$3"
   if [[ "$haystack" == *"$needle"* ]]; then
@@ -52,8 +60,8 @@ fi
 case "$*" in
   *"/reviews --paginate"*) cat "$FIXTURE" ;;
   *"/dismissals --method PUT"*) echo '{"id": 1}' ;;
-  *"api graphql"*) echo '{"data":{"minimizeComment":{"minimizedComment":{"isMinimized":true}}}}' ;;
-  *"--method PUT"*) echo '{}' ;;
+  *"minimizeComment"*) echo '{"data":{"minimizeComment":{"minimizedComment":{"isMinimized":true}}}}' ;;
+  *"isMinimized"*) printf '%s\n' "${GH_MOCK_MINIMIZED:-[]}" ;;
   *) echo '{}' ;;
 esac
 MOCK
@@ -78,26 +86,27 @@ jq -n '[
   {id: 104, node_id: "PRR_node104", state: "COMMENTED", user: {login: "another-human"},
    body: "I noticed the bot marker <!-- ai-pr-reviewer --> appears mid-body here."},
   {id: 105, node_id: "PRR_node105", state: "DISMISSED", user: {login: "its-saffron[bot]"},
-   body: "<!-- ai-pr-reviewer -->\n_Outdated: superseded by a newer automated review._"},
+   body: "<!-- ai-pr-reviewer -->\nOld review, already minimized in a previous run."},
   {id: 106, node_id: "PRR_node106", state: "APPROVED", user: {login: "its-saffron[bot]"},
-   body: "<!-- ai-pr-reviewer -->\n_Outdated: superseded by a newer automated review._"}
+   body: "<!-- ai-pr-reviewer -->\nMinimized previously but the dismissal failed."}
 ]' > "$FIXTURE"
 
 echo "=== Managed reviews are dismissed and stubbed regardless of author ==="
 : > "$CALLS_LOG"
-OUT="$(cleanup_native_reviews "true" 2>&1)"
+OUT="$(GH_MOCK_MINIMIZED="[105,106]" cleanup_native_reviews "true" 2>&1)"
 CALLS="$(cat "$CALLS_LOG")"
 check_contains "app-bot APPROVED review 101 dismissed" "$CALLS" "reviews/101/dismissals --method PUT"
 check_contains "default-bot CHANGES_REQUESTED review 102 dismissed" "$CALLS" "reviews/102/dismissals --method PUT"
-check_contains "review 101 body stubbed via PUT" "$CALLS" "reviews/101 --method PUT"
 check_contains "review 101 minimized (hidden)" "$CALLS" "PRR_node101"
-check_contains "review 102 body stubbed via PUT" "$CALLS" "reviews/102 --method PUT"
 check_contains "review 102 minimized (hidden)" "$CALLS" "PRR_node102"
+PUT_BODY_CALLS="$(grep -cE 'reviews/[0-9]+ --method PUT' "$CALLS_LOG" || true)"
+check "review bodies are never rewritten" "$PUT_BODY_CALLS" "0"
 check_not_contains "human review 103 untouched" "$CALLS" "reviews/103"
 check_not_contains "mid-body marker mention 104 untouched" "$CALLS" "reviews/104"
-check_not_contains "already-dismissed stub 105 skipped" "$CALLS" "reviews/105"
-check_not_contains "already-dismissed stub 105 not re-minimized" "$CALLS" "PRR_node105"
-check_contains "stubbed-but-still-APPROVED 106 re-dismissed" "$CALLS" "reviews/106/dismissals --method PUT"
+check_not_contains "already-minimized dismissed review 105 fully skipped" "$CALLS" "reviews/105"
+check_not_contains "review 105 not re-minimized" "$CALLS" "PRR_node105"
+check_contains "minimized-but-still-APPROVED 106 re-dismissed" "$CALLS" "reviews/106/dismissals --method PUT"
+check_not_contains "review 106 not re-minimized" "$CALLS" "PRR_node106"
 check_contains "dismissals logged" "$OUT" "Dismissed outdated managed review #101"
 check_contains "minimize logged" "$OUT" "Minimized (hidden as outdated) review #101"
 check_not_contains "no actor lookup performed" "$CALLS" "api user"
