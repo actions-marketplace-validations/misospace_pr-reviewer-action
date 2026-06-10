@@ -99,6 +99,9 @@ compute_config_hash() {
   if [[ -n "${CONTEXT_LIMIT_MODE:-}" ]]; then
     parts+=("context_limit:${CONTEXT_LIMIT_MODE}")
   fi
+  if [[ -n "${MODEL_CONTEXT_TOKENS:-}" ]]; then
+    parts+=("model_context_tokens:${MODEL_CONTEXT_TOKENS}")
+  fi
 
   # Evidence provider config
   if [[ -n "${EVIDENCE_PROVIDERS_FILE:-}" && -f "${EVIDENCE_PROVIDERS_FILE:-}" ]]; then
