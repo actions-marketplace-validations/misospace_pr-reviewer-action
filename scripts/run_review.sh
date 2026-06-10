@@ -116,6 +116,10 @@ ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS="${ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS
 ESCALATE_ON_FAST_REQUEST_CHANGES="${ESCALATE_ON_FAST_REQUEST_CHANGES:-true}"
 ESCALATE_ON_FAST_LOW_CONFIDENCE="${ESCALATE_ON_FAST_LOW_CONFIDENCE:-true}"
 ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS="${ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS:-true}"
+ESCALATE_ON_DIRTY_BASELINE="${ESCALATE_ON_DIRTY_BASELINE:-true}"
+# Default true: only the precheck can assert a dirty baseline; standalone runs
+# (smoke test, manual) have no baseline signal and must not over-escalate.
+BASELINE_CLEAN="${BASELINE_CLEAN:-true}"
 REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
 EFFECTIVE_SCOPE="${EFFECTIVE_SCOPE:-full}"
 PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA:-}"
@@ -312,6 +316,8 @@ ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS="$(printf '%s' "$ESCALATE_ON_INCOMPLETE_R
 ESCALATE_ON_FAST_REQUEST_CHANGES="$(printf '%s' "$ESCALATE_ON_FAST_REQUEST_CHANGES" | tr '[:upper:]' '[:lower:]')"
 ESCALATE_ON_FAST_LOW_CONFIDENCE="$(printf '%s' "$ESCALATE_ON_FAST_LOW_CONFIDENCE" | tr '[:upper:]' '[:lower:]')"
 ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS="$(printf '%s' "$ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS" | tr '[:upper:]' '[:lower:]')"
+ESCALATE_ON_DIRTY_BASELINE="$(printf '%s' "$ESCALATE_ON_DIRTY_BASELINE" | tr '[:upper:]' '[:lower:]')"
+BASELINE_CLEAN="$(printf '%s' "$BASELINE_CLEAN" | tr '[:upper:]' '[:lower:]')"
 
 if [[ -n "$AI_FALLBACK_BASE_URL" && -z "$AI_FALLBACK_MODEL" ]]; then
   error "AI_FALLBACK_MODEL is required when AI_FALLBACK_BASE_URL is set"
@@ -414,12 +420,18 @@ apply_all_enforcement_wrapper() {
   local verdict_policy="$4"
   local validate_checks="$5"
   local validation_mode="$6"
+  local carry_forward="$7"
   PYTHONPATH="${SCRIPT_DIR}/.." python3 -c "
+from pr_reviewer.carry_forward import apply_carry_forward
 from pr_reviewer.completeness import apply_required_check_validation
 from pr_reviewer.enforcement import apply_all_enforcement, apply_verdict_policy
-# Order: verdict policy (may derive the verdict from findings), then
-# completeness validation (may warn or fail on unaddressed required checks),
-# then enforcement overlays, which can still force request_changes.
+# Order: carry-forward first (merges the previous review's unresolved
+# findings, so the verdict policy gates on the cumulative set and can itself
+# force request_changes on surviving blockers), then verdict policy, then
+# completeness validation, then enforcement overlays.
+if '$carry_forward' == 'true':
+    summary = apply_carry_forward()
+    print(f\"Carry-forward: carried={summary['carried']} resolved={summary['resolved']} open={summary['open']} forced_request_changes={summary['forced_request_changes']}\")
 apply_verdict_policy('$verdict_policy')
 apply_required_check_validation('$validate_checks', '$validation_mode')
 apply_all_enforcement(
@@ -1080,6 +1092,16 @@ build_review_corpus() {
       else
         echo "(No incremental diff available)"
       fi
+      echo
+      # Carried-forward open findings (#193): the previous review's unresolved
+      # findings, which the model must answer one-by-one. High in the corpus
+      # on purpose — it is the most important context an incremental review has.
+      if [ -s previous-findings.json ] && [ "$(jq 'length' previous-findings.json 2>/dev/null || echo 0)" -gt 0 ]; then
+        PYTHONPATH="${SCRIPT_DIR}/.." python3 -c "
+from pr_reviewer.carry_forward import load_carried_findings, render_carried_findings_section
+print(render_carried_findings_section(load_carried_findings()), end='')
+" 2>/dev/null || echo "(Previous review findings could not be loaded)"
+      fi
     else
       echo "# Linked Issue Context"
       cat linked-issues.md
@@ -1243,7 +1265,27 @@ if [[ "$(printf '%s' "$AI_STREAM" | tr '[:upper:]' '[:lower:]')" == "true" ]]; t
   STREAM_BOOL="true"
 fi
 
+# Carry-forward (#193) is active when this is an incremental review and the
+# precheck extracted open findings from the previous review's marker.
+CARRY_FORWARD_ACTIVE="false"
+if [[ "$EFFECTIVE_SCOPE" == "incremental" ]] && [ -s previous-findings.json ] \
+  && [ "$(jq 'length' previous-findings.json 2>/dev/null || echo 0)" -gt 0 ]; then
+  CARRY_FORWARD_ACTIVE="true"
+fi
+
+# Incremental review against a baseline the previous review flagged as having
+# issues. Used for the dirty-baseline escalation trigger.
+DIRTY_BASELINE="false"
+if [[ "$EFFECTIVE_SCOPE" == "incremental" && "$BASELINE_CLEAN" != "true" ]]; then
+  DIRTY_BASELINE="true"
+fi
+
 USER_MESSAGE="$(build_user_message classification.json)"
+if [[ "$CARRY_FORWARD_ACTIVE" == "true" ]]; then
+  USER_MESSAGE="$USER_MESSAGE
+The corpus lists Open Findings From the Previous Review. Answer EVERY one: include a finding with the same id and a resolution of resolved, still_open, or not_verifiable_from_delta. Claim resolved only when this delta demonstrably fixes it."
+  log "Carry-forward active: $(jq 'length' previous-findings.json) open finding(s) from the previous review"
+fi
 
 build_model_request \
   "$AI_API_FORMAT" \
@@ -1393,6 +1435,8 @@ escalate, reasons = should_escalate(
     on_request_changes=('$ESCALATE_ON_FAST_REQUEST_CHANGES' == 'true'),
     on_low_confidence=('$ESCALATE_ON_FAST_LOW_CONFIDENCE' == 'true'),
     on_blockers=('$ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS' == 'true'),
+    on_dirty_baseline=('$ESCALATE_ON_DIRTY_BASELINE' == 'true'),
+    dirty_baseline=('$DIRTY_BASELINE' == 'true'),
 )
 print('yes ' + ','.join(reasons) if escalate else 'no')
 " 2>/dev/null || echo no)"
@@ -1457,7 +1501,7 @@ if [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" == "plan_execut
   TOOL_FAILURE_ENABLED="true"
 fi
 
-apply_all_enforcement_wrapper "$EVIDENCE_BLOCKER_ENABLED" "$TOOL_FAILURE_ENABLED" "$TOOL_MIN_SUCCESSFUL_REQUESTS" "$VERDICT_POLICY" "$VALIDATE_REQUIRED_CHECKS" "$REQUIRED_CHECK_VALIDATION_MODE"
+apply_all_enforcement_wrapper "$EVIDENCE_BLOCKER_ENABLED" "$TOOL_FAILURE_ENABLED" "$TOOL_MIN_SUCCESSFUL_REQUESTS" "$VERDICT_POLICY" "$VALIDATE_REQUIRED_CHECKS" "$REQUIRED_CHECK_VALIDATION_MODE" "$CARRY_FORWARD_ACTIVE"
 
 echo "analysis_engine=$ANALYSIS_ENGINE" >> "$OUTPUT_FILE"
 echo "verdict=$(jq -r '.verdict' ai-output.json)" >> "$OUTPUT_FILE"

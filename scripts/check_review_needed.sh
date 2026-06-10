@@ -280,8 +280,12 @@ extract_review_metadata() {
   # every field is sanitized to a safe character set first: SHAs to hex, the
   # scope/result enums to lowercase letters and underscores. This prevents
   # shell-command injection through crafted metadata markers.
+  #
+  # open_findings (carried forward for incremental cumulative verdicts, #193)
+  # never touches the eval path: it is sanitized field-by-field in Python and
+  # written straight to previous-findings.json for the review step.
   eval "$(printf '%s' "$comment_body" | python3 -c "
-import re, sys
+import json, re, sys
 sys.path.insert(0, '.')
 from pr_reviewer.metadata import parse_metadata
 data = parse_metadata(sys.stdin.read())
@@ -294,6 +298,25 @@ if data:
     print(f'LAST_BASE_SHA={hexsan(data.get(\"base_sha\"))}')
     print(f'LAST_REVIEW_SCOPE={enumsan(data.get(\"review_scope\"))}')
     print(f'LAST_REVIEW_RESULT={enumsan(data.get(\"review_result\"))}')
+    raw = data.get('open_findings')
+    sanitized = []
+    if isinstance(raw, list):
+        for item in raw[:20]:
+            if not isinstance(item, dict):
+                continue
+            message = item.get('message')
+            if not isinstance(message, str) or not message.strip():
+                continue
+            line = item.get('line')
+            sanitized.append({
+                'severity': enumsan(item.get('severity')),
+                'category': enumsan(item.get('category')),
+                'file': str(item.get('file'))[:200] if isinstance(item.get('file'), str) else None,
+                'line': line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None,
+                'message': re.sub(r'[\\x00-\\x08\\x0b-\\x1f<>]', '', message)[:200],
+            })
+    with open('previous-findings.json', 'w', encoding='utf-8') as fh:
+        json.dump(sanitized, fh, ensure_ascii=False)
 " 2>/dev/null || true)"
 }
 

@@ -116,6 +116,7 @@ The result is exposed as the `required_checks` output (`complete` / `incomplete`
 | `escalate_on_fast_request_changes` | Escalate fast reviews whose verdict is `request_changes` (`auto` mode) | No | `true` |
 | `escalate_on_fast_low_confidence` | Escalate low-confidence fast reviews (very short, or populated Unknowns section) (`auto` mode) | No | `true` |
 | `escalate_on_tool_or_evidence_blockers` | Escalate when evidence blockers or tool-harness failures exist (`auto` mode) | No | `true` |
+| `escalate_on_dirty_baseline` | Escalate incremental reviews whose baseline review found issues (`auto` mode) | No | `true` |
 | `ai_primary_retry_delay_sec` | Delay between retries in seconds | No | `15` |
 | `allowed_source_hosts` | Comma-separated allowlist for linked URL fetching | No | `github.com,api.github.com,gitlab.com,registry.terraform.io,artifacthub.io` |
 | `system_prompt` | Optional system prompt override | No | bundled prompt |
@@ -661,6 +662,7 @@ In `auto` mode, a fast review can also be **escalated after the fact**: the acti
 - `escalate_on_incomplete_required_checks` — the fast review never discussed one of the classifier's required checks.
 - `escalate_on_fast_low_confidence` — the review is very short or carries a populated "Unknowns or Needs Verification" section.
 - `escalate_on_tool_or_evidence_blockers` — evidence providers reported a blocker or the tool harness failed.
+- `escalate_on_dirty_baseline` — this is an incremental review and the previous review found issues; judging whether the delta resolves them is run on the smart model.
 
 Only the **final** review is published. The fast result is kept on the runner as `ai-output.fast.json` for debugging; if the smart model fails, the fast review is published instead (never a failed run because of escalation). `review_route` reports `escalated` and `escalation_reason` lists the trigger names; both also land in the step summary and the managed metadata marker. Worst case is two model calls per review — the unchanged-diff skip and incremental scope keep that bounded.
 
@@ -673,6 +675,8 @@ Key behaviors:
 - **Later pushes**: Incremental review of only new changes.
 - **Fallback**: Automatically falls back to full review when incremental comparison is unsafe (force-push, rebase, base branch change, missing metadata, etc.).
 - **Verdict safety**: With `publish_mode: review_verdict`, approvals based on incremental reviews require a trusted clean full-review baseline.
+- **Carried-forward findings (cumulative verdict)**: when a review requests changes, its findings are persisted in the managed metadata marker (`open_findings`). The next incremental review receives them as a high-priority corpus section and must answer each with a `resolution`: `resolved`, `still_open`, or `not_verifiable_from_delta`. Findings the model does not convincingly resolve survive into the new review's `findings` output, and a surviving blocker forces `request_changes` (`verdict_source: carry_forward`) — fixing one of three blockers cannot rubber-stamp the other two. The published review lists what this push resolved and what is still open, so the latest review always reflects total PR state (useful since superseded reviews are dismissed and hidden).
+- **Header**: incremental reviews are titled `# AI Automated Review (incremental)`.
 
 You can force specific behavior:
 ```yaml

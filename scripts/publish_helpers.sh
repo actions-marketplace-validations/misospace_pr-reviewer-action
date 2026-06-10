@@ -118,12 +118,20 @@ cleanup_native_reviews() {
 }
 
 # Build metadata marker JSON string.
-# Requires env: HEAD_SHA, EFFECTIVE_SCOPE, REVIEW_RESULT
+# Requires env: HEAD_SHA, EFFECTIVE_SCOPE, REVIEW_RESULT; optional FINDINGS
+# (JSON array — persisted as open_findings when the review found issues, so
+# the next incremental review can carry them forward, #193).
 # Args: $1 = base_sha, $2 = previous_head_sha (optional, empty if not incremental)
 # Outputs: metadata marker string to stdout
 build_metadata_marker() {
   local base_sha="$1"
   local previous_head_sha="${2:-}"
+
+  # FINDINGS comes from the review step output; tolerate anything malformed.
+  local findings_json="${FINDINGS:-[]}"
+  if ! printf '%s' "$findings_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    findings_json="[]"
+  fi
 
   # Built with jq instead of string surgery: the old "${marker%,*}" trick for
   # appending previous_head_sha cut at the LAST comma, silently dropping
@@ -139,11 +147,18 @@ build_metadata_marker() {
     --arg route "${REVIEW_ROUTE:-}" \
     --arg esc "${ESCALATION_REASON:-}" \
     --arg prev "$previous_head_sha" \
+    --argjson findings "$findings_json" \
     '{version: 1, head_sha: $head, base_sha: $base, review_scope: $scope, review_result: $result}
      + (if $checks == "" or $checks == "none" then {} else {required_checks: $checks} end)
      + (if $route == "" or $route == "legacy" then {} else {review_route: $route} end)
      + (if $esc == "" then {} else {escalation_reason: ($esc | split(","))} end)
-     + (if $scope == "incremental" and $prev != "" then {previous_head_sha: $prev} else {} end)')"
+     + (if $scope == "incremental" and $prev != "" then {previous_head_sha: $prev} else {} end)
+     + (if $result == "issues" and ($findings | length) > 0
+        then {open_findings: ($findings
+          | map(select(type == "object" and (.resolution // "") != "resolved")
+              | {severity, category, file, line, message: ((.message // "") | tostring | .[0:200])})
+          | .[0:20])}
+        else {} end)')"
   printf '<!-- ai-pr-reviewer:%s -->' "$marker_json"
 }
 
