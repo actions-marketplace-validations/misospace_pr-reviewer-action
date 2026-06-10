@@ -140,6 +140,94 @@ def _normalize_verdict(value: Any) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Findings normalisation
+# ---------------------------------------------------------------------------
+
+_SEVERITY_ALIASES = {
+    "blocker": "blocker", "critical": "blocker",
+    "major": "major", "high": "major", "error": "major",
+    "minor": "minor", "medium": "minor", "low": "minor", "warning": "minor",
+    "info": "info", "note": "info", "nit": "info", "suggestion": "info",
+}
+
+_FINDING_CATEGORIES = {
+    "bug", "security", "performance", "style", "docs", "question", "other",
+}
+
+_MAX_FINDINGS = 50
+_MAX_FINDING_MESSAGE_CHARS = 2000
+
+
+def _normalize_findings(value: Any) -> list[dict[str, Any]]:
+    """Normalise an optional model-provided findings array.
+
+    Tolerant by design: weaker models may omit the array entirely, emit a
+    non-list, or produce partially-formed entries. Anything unusable is
+    dropped rather than failing the parse, so the action degrades to the
+    verdict/review_markdown contract.
+    """
+    if not isinstance(value, list):
+        return []
+
+    findings: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+
+        message = item.get("message") or item.get("summary") or item.get("title")
+        if not isinstance(message, str) or not message.strip():
+            continue
+        message = message.strip()[:_MAX_FINDING_MESSAGE_CHARS]
+
+        raw_severity = item.get("severity")
+        severity = "info"
+        if isinstance(raw_severity, str):
+            severity = _SEVERITY_ALIASES.get(raw_severity.strip().lower(), "info")
+
+        raw_category = item.get("category")
+        category = "other"
+        if isinstance(raw_category, str):
+            candidate = raw_category.strip().lower()
+            if candidate in _FINDING_CATEGORIES:
+                category = candidate
+
+        file_path = item.get("file") or item.get("path")
+        if isinstance(file_path, str):
+            file_path = file_path.strip()
+            while file_path.startswith("./"):
+                file_path = file_path[2:]
+            file_path = file_path or None
+        else:
+            file_path = None
+
+        raw_line = item.get("line")
+        line: int | None = None
+        if isinstance(raw_line, bool):
+            line = None
+        elif isinstance(raw_line, int):
+            line = raw_line if raw_line > 0 else None
+        elif isinstance(raw_line, float) and raw_line.is_integer():
+            line = int(raw_line) if raw_line > 0 else None
+        elif isinstance(raw_line, str) and raw_line.strip().isdigit():
+            parsed_line = int(raw_line.strip())
+            line = parsed_line if parsed_line > 0 else None
+
+        findings.append(
+            {
+                "severity": severity,
+                "category": category,
+                "file": file_path,
+                "line": line,
+                "message": message,
+            }
+        )
+        if len(findings) >= _MAX_FINDINGS:
+            break
+
+    return findings
+
+
 def _finish_reason(response: dict[str, Any]) -> str | None:
     """Best-effort extraction of the model's stop/finish reason."""
     choices = response.get("choices")
@@ -244,6 +332,10 @@ def parse_response(response: dict[str, Any]) -> dict[str, Any]:
     markdown = parsed.get("review_markdown")
     if not isinstance(markdown, str) or not markdown.strip():
         raise SystemExit(f"Parsed JSON has empty or missing 'review_markdown'{trunc}")
+
+    # Optional structured findings: normalised when present, empty when the
+    # model (typically a weaker local one) does not produce them.
+    parsed["findings"] = _normalize_findings(parsed.get("findings"))
 
     return parsed
 

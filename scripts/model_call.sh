@@ -151,7 +151,10 @@ build_model_request() {
       json_object)
         rf_json='{"type":"json_object"}' ;;
       json_schema)
-        rf_json='{"type":"json_schema","json_schema":{"name":"pr_review","strict":true,"schema":{"type":"object","properties":{"verdict":{"type":"string","enum":["approve","request_changes"]},"review_markdown":{"type":"string"}},"required":["verdict","review_markdown"],"additionalProperties":false}}}' ;;
+        # findings is nullable-but-required: OpenAI strict mode requires every
+        # property to be listed in required, so optionality is expressed via
+        # the null type. The parser tolerates null/absent/malformed findings.
+        rf_json='{"type":"json_schema","json_schema":{"name":"pr_review","strict":true,"schema":{"type":"object","properties":{"verdict":{"type":"string","enum":["approve","request_changes"]},"review_markdown":{"type":"string"},"findings":{"type":["array","null"],"items":{"type":"object","properties":{"severity":{"type":"string","enum":["blocker","major","minor","info"]},"category":{"type":["string","null"]},"file":{"type":["string","null"]},"line":{"type":["integer","null"]},"message":{"type":"string"}},"required":["severity","category","file","line","message"],"additionalProperties":false}}},"required":["verdict","review_markdown","findings"],"additionalProperties":false}}}' ;;
     esac
 
     jq -n \

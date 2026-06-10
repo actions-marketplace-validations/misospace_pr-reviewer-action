@@ -251,6 +251,56 @@ def normalize_enforced_review_markdown(
         Path(output_path).write_text(json.dumps(data, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def apply_verdict_policy(
+    policy: str = "model",
+    output_path: str = "ai-output.json",
+) -> str:
+    """Derive the verdict from structured findings when configured.
+
+    ``model`` (default) leaves the model's verdict untouched. With
+    ``findings_severity_gated`` the verdict is computed deterministically from
+    the findings array: ``request_changes`` iff any blocker-severity finding
+    exists, otherwise ``approve``. When the model produced no findings the
+    policy falls back to the model verdict, so weaker models degrade to
+    today's behaviour. Enforcement overlays (evidence blockers, tool-harness
+    failure) run after this and can still force ``request_changes``.
+
+    Returns the verdict source applied: ``"model"`` or ``"findings"``. The
+    source is also recorded in the output JSON as ``verdict_source``.
+    """
+    data = json.loads(Path(output_path).read_text(encoding="utf-8", errors="replace"))
+    findings = data.get("findings")
+    source = "model"
+
+    if (
+        policy == "findings_severity_gated"
+        and isinstance(findings, list)
+        and findings
+    ):
+        blockers = [
+            f
+            for f in findings
+            if isinstance(f, dict) and f.get("severity") == "blocker"
+        ]
+        derived = "request_changes" if blockers else "approve"
+        if derived != data.get("verdict"):
+            note = (
+                f"\n\n_Verdict derived from structured findings "
+                f"(verdict_policy=findings_severity_gated): "
+                f"{len(blockers)} blocker finding(s) out of {len(findings)}; "
+                f"model verdict was '{data.get('verdict')}'._"
+            )
+            data["review_markdown"] = str(data.get("review_markdown") or "") + note
+        data["verdict"] = derived
+        source = "findings"
+
+    data["verdict_source"] = source
+    Path(output_path).write_text(
+        json.dumps(data, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return source
+
+
 def apply_all_enforcement(
     evidence_blocker_enabled: bool = False,
     tool_failure_enabled: bool = False,

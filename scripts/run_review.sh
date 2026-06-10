@@ -99,6 +99,7 @@ AI_FALLBACK_REQUEST_TIMEOUT_SEC="${AI_FALLBACK_REQUEST_TIMEOUT_SEC:-${AI_REQUEST
 AI_FALLBACK_CONNECT_TIMEOUT_SEC="${AI_FALLBACK_CONNECT_TIMEOUT_SEC:-${AI_CONNECT_TIMEOUT_SEC}}"
 OUTPUT_FILE="${GITHUB_OUTPUT:-/dev/null}"
 ON_MODEL_FAILURE="${ON_MODEL_FAILURE:-fail}"
+VERDICT_POLICY="${VERDICT_POLICY:-model}"
 REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
 EFFECTIVE_SCOPE="${EFFECTIVE_SCOPE:-full}"
 PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA:-}"
@@ -242,6 +243,14 @@ case "$AI_TOKENS_PARAM" in
     ;;
 esac
 
+case "$VERDICT_POLICY" in
+  model|findings_severity_gated) ;;
+  *)
+    error "Invalid VERDICT_POLICY '$VERDICT_POLICY'; defaulting to model"
+    VERDICT_POLICY=model
+    ;;
+esac
+
 if [[ -n "$AI_FALLBACK_BASE_URL" && -z "$AI_FALLBACK_MODEL" ]]; then
   error "AI_FALLBACK_MODEL is required when AI_FALLBACK_BASE_URL is set"
   exit 1
@@ -340,8 +349,12 @@ apply_all_enforcement_wrapper() {
   local evidence_blocker_enabled="$1"
   local tool_failure_enabled="$2"
   local tool_min_successful="$3"
+  local verdict_policy="$4"
   PYTHONPATH="${SCRIPT_DIR}/.." python3 -c "
-from pr_reviewer.enforcement import apply_all_enforcement
+from pr_reviewer.enforcement import apply_all_enforcement, apply_verdict_policy
+# Verdict policy first (may derive the verdict from findings); enforcement
+# overlays run after and can still force request_changes.
+apply_verdict_policy('$verdict_policy')
 apply_all_enforcement(
   evidence_blocker_enabled=('$evidence_blocker_enabled' == 'true'),
   tool_failure_enabled=('$tool_failure_enabled' == 'true'),
@@ -1221,10 +1234,11 @@ if [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" == "plan_execut
   TOOL_FAILURE_ENABLED="true"
 fi
 
-apply_all_enforcement_wrapper "$EVIDENCE_BLOCKER_ENABLED" "$TOOL_FAILURE_ENABLED" "$TOOL_MIN_SUCCESSFUL_REQUESTS"
+apply_all_enforcement_wrapper "$EVIDENCE_BLOCKER_ENABLED" "$TOOL_FAILURE_ENABLED" "$TOOL_MIN_SUCCESSFUL_REQUESTS" "$VERDICT_POLICY"
 
 echo "analysis_engine=$ANALYSIS_ENGINE" >> "$OUTPUT_FILE"
 echo "verdict=$(jq -r '.verdict' ai-output.json)" >> "$OUTPUT_FILE"
+echo "verdict_source=$(jq -r '.verdict_source // "model"' ai-output.json)" >> "$OUTPUT_FILE"
 
 # Use a random heredoc delimiter so model-controlled review text (which can be
 # influenced by prompt injection in the PR diff/title/body) cannot terminate the
@@ -1234,6 +1248,15 @@ RM_DELIM="EOF_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   echo "review_markdown<<$RM_DELIM"
   jq -r '.review_markdown' ai-output.json
   echo "$RM_DELIM"
+} >> "$OUTPUT_FILE"
+
+# Structured findings (normalized JSON array; [] when the model emitted none).
+# Same random-delimiter defense — finding messages are model-controlled text.
+FD_DELIM="EOF_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+{
+  echo "findings<<$FD_DELIM"
+  jq -c '.findings // []' ai-output.json
+  echo "$FD_DELIM"
 } >> "$OUTPUT_FILE"
 
 log "Analysis complete. Writing outputs..."
@@ -1277,13 +1300,19 @@ write_step_summary() {
     budget_desc="context_limit_mode=${CONTEXT_LIMIT_MODE:-normal}"
   fi
 
+  local findings_count blockers_count verdict_source
+  findings_count="$(jq -r '.findings | length' ai-output.json 2>/dev/null || echo 0)"
+  blockers_count="$(jq -r '[.findings[]? | select(.severity == "blocker")] | length' ai-output.json 2>/dev/null || echo 0)"
+  verdict_source="$(jq -r '.verdict_source // "model"' ai-output.json 2>/dev/null || echo model)"
+
   {
     echo "### AI PR Review"
     echo ""
     echo "| Field | Value |"
     echo "| --- | --- |"
     echo "| Engine | ${ANALYSIS_ENGINE} |"
-    echo "| Verdict | ${verdict} |"
+    echo "| Verdict | ${verdict} (source: ${verdict_source}) |"
+    echo "| Findings | ${findings_count} (blockers: ${blockers_count}) |"
     echo "| Scope | ${EFFECTIVE_SCOPE} |"
     echo "| Budget | ${budget_desc} |"
     echo "| Diff bytes | ${diff_bytes} (truncated: ${diff_trunc}) |"
