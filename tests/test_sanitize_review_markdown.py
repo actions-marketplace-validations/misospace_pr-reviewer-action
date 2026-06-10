@@ -245,3 +245,27 @@ class TestEdgeCases:
         text = "(see #552 for details)"
         result = sanitize_markdown(text)
         assert "PR 552" in result
+
+
+class TestSanitizeMention:
+    """@-mentions must be neutralized so posted output never notifies users/teams."""
+
+    def test_user_mention_neutralized(self):
+        result = sanitize_markdown("Thanks @octocat for the fix")
+        assert "@​octocat" in result      # zero-width space inserted
+        assert "@octocat" not in result          # raw (linkable) form gone
+
+    def test_team_mention_neutralized(self):
+        result = sanitize_markdown("cc @acme/platform-team")
+        assert "@​acme/platform-team" in result
+        assert "@acme/platform-team" not in result
+
+    def test_email_local_part_not_touched(self):
+        # foo@bar.com is not a mention — the @ is preceded by a word char.
+        result = sanitize_markdown("contact foo@bar.com")
+        assert "foo@bar.com" in result
+
+    def test_already_escaped_at_not_double_escaped(self):
+        # An @@ sequence (e.g. literal) must not be turned into a mention.
+        result = sanitize_markdown("see user@@host")
+        assert "​" not in result

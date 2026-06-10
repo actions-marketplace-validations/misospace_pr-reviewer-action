@@ -63,6 +63,14 @@ _RE_BARE_REF = re.compile(
     r"(?<!\w)#(\d+)(?!\w)"
 )
 
+# @-mentions: @user and @org/team. The model can echo these from PR content
+# (incl. prompt-injected text); posted verbatim they ping people and create
+# notification noise / a social-engineering vector. Word-boundary lookbehind
+# avoids matching email local parts (foo@bar) and existing code spans.
+_RE_MENTION = re.compile(
+    r"(?<![\w/`@])@([A-Za-z0-9][A-Za-z0-9-]{0,38}(?:/[A-Za-z0-9._-]+)?)"
+)
+
 
 def sanitize_pr_url(match: re.Match) -> str:
     """Convert GitHub PR URL to inert text."""
@@ -105,6 +113,15 @@ def sanitize_bare_ref(match: re.Match) -> str:
     return f"PR {num}"
 
 
+def sanitize_mention(match: re.Match) -> str:
+    """Neutralize an @-mention by inserting a zero-width space after the @.
+
+    Renders identically to a human but is not treated as a mention by GitHub,
+    so it does not notify the named user/team.
+    """
+    return "@\u200b" + match.group(1)
+
+
 def sanitize_markdown(text: str) -> str:
     """Return *text* with upstream references neutralized.
 
@@ -130,6 +147,9 @@ def sanitize_markdown(text: str) -> str:
 
     # 3. Sanitize bare references (#123)
     text = _RE_BARE_REF.sub(sanitize_bare_ref, text)
+
+    # 4. Neutralize @-mentions so posted output never pings users/teams
+    text = _RE_MENTION.sub(sanitize_mention, text)
 
     return text
 

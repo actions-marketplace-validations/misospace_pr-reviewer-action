@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Shared secret-redaction helpers for tool harness and evidence providers."""
 
+from __future__ import annotations
+
 import re
 
 
