@@ -91,5 +91,44 @@ check "HTTP error is logged to stderr" \
   "$(printf '%s' "$LOG" | grep -q 'HTTP 400' && echo yes || echo no)" "yes"
 
 echo ""
+echo "=== build_model_request: payload shaping ==="
+CORPUS="$TMPDIR/corpus.md"
+printf 'CORPUS BODY' > "$CORPUS"
+REQ="$TMPDIR/req.json"
+
+( AI_MAX_TOKENS=4096; AI_TEMPERATURE=0.1; AI_RESPONSE_FORMAT=off; AI_TOKENS_PARAM=max_tokens
+  build_model_request openai m "sys" "usr" "$CORPUS" "$REQ" false )
+check "openai default: temperature included" "$(jq -r '.temperature' "$REQ")" "0.1"
+check "openai default: max_tokens key present" "$(jq -r 'has("max_tokens")' "$REQ")" "true"
+check "openai default: no response_format" "$(jq -r 'has("response_format")' "$REQ")" "false"
+check "openai: corpus appended to user message" \
+  "$(jq -r '.messages[1].content' "$REQ" | grep -q 'CORPUS BODY' && echo yes || echo no)" "yes"
+
+( AI_MAX_TOKENS=4096; AI_RESPONSE_FORMAT=json_object
+  build_model_request openai m "sys" "usr" "$CORPUS" "$REQ" false )
+check "openai json_object: response_format.type" "$(jq -r '.response_format.type' "$REQ")" "json_object"
+
+( AI_MAX_TOKENS=4096; AI_RESPONSE_FORMAT=json_schema
+  build_model_request openai m "sys" "usr" "$CORPUS" "$REQ" false )
+check "openai json_schema: response_format.type" "$(jq -r '.response_format.type' "$REQ")" "json_schema"
+check "openai json_schema: required keys" \
+  "$(jq -r '.response_format.json_schema.schema.required | sort | join(",")' "$REQ")" "review_markdown,verdict"
+
+( AI_MAX_TOKENS=4096; AI_TOKENS_PARAM=max_completion_tokens
+  build_model_request openai m "sys" "usr" "$CORPUS" "$REQ" false )
+check "openai: uses max_completion_tokens" "$(jq -r 'has("max_completion_tokens")' "$REQ")" "true"
+check "openai: drops max_tokens when using max_completion_tokens" "$(jq -r 'has("max_tokens")' "$REQ")" "false"
+
+( AI_MAX_TOKENS=4096; AI_TEMPERATURE=""
+  build_model_request openai m "sys" "usr" "$CORPUS" "$REQ" false )
+check "openai: temperature omitted when empty" "$(jq -r 'has("temperature")' "$REQ")" "false"
+
+( AI_MAX_TOKENS=4096; AI_TEMPERATURE=0.1; AI_RESPONSE_FORMAT=json_object
+  build_model_request anthropic m "sys" "usr" "$CORPUS" "$REQ" false )
+check "anthropic: max_tokens present" "$(jq -r 'has("max_tokens")' "$REQ")" "true"
+check "anthropic: no response_format (unsupported)" "$(jq -r 'has("response_format")' "$REQ")" "false"
+check "anthropic: system field present" "$(jq -r 'has("system")' "$REQ")" "true"
+
+echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

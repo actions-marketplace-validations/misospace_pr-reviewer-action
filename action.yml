@@ -31,6 +31,26 @@ inputs:
     description: Maximum completion tokens for the primary and fallback final review calls
     required: false
     default: "4096"
+  ai_temperature:
+    description: >-
+      Sampling temperature for the review model. Default "0.1". Set to an empty string to
+      omit the field entirely (some newer cloud models reject any non-default temperature).
+    required: false
+    default: "0.1"
+  ai_response_format:
+    description: >-
+      Structured-output mode for OpenAI-compatible endpoints (including LiteLLM): off (default),
+      json_object, or json_schema (enforces a verdict/review_markdown schema). Ignored for the
+      anthropic format. Improves output reliability with smaller local models. Applies to both
+      the primary and fallback review calls.
+    required: false
+    default: "off"
+  ai_tokens_param:
+    description: >-
+      Token-limit field name for OpenAI-compatible requests: max_tokens (default) or
+      max_completion_tokens (required by newer OpenAI reasoning models). Ignored for anthropic.
+    required: false
+    default: "max_tokens"
   anthropic_version:
     description: Anthropic API version header used when ai_api_format or ai_fallback_api_format is anthropic
     required: false
@@ -362,6 +382,9 @@ runs:
         AI_MODEL: ${{ inputs.ai_model }}
         AI_API_KEY: ${{ inputs.ai_api_key }}
         AI_MAX_TOKENS: ${{ inputs.ai_max_tokens }}
+        AI_TEMPERATURE: ${{ inputs.ai_temperature }}
+        AI_RESPONSE_FORMAT: ${{ inputs.ai_response_format }}
+        AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
         ANTHROPIC_VERSION: ${{ inputs.anthropic_version }}
         AI_FALLBACK_BASE_URL: ${{ inputs.ai_fallback_base_url }}
         AI_FALLBACK_API_FORMAT: ${{ inputs.ai_fallback_api_format }}

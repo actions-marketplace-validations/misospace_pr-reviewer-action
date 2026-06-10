@@ -80,3 +80,73 @@ curl_model() {
 
   return 0
 }
+
+# build_model_request API_FORMAT MODEL SYSTEM USER CORPUS_FILE OUTPUT_FILE [STREAM]
+#
+# Reads globals (with safe defaults so the historical behaviour is preserved):
+#   AI_MAX_TOKENS     completion-token cap (default 4096)
+#   AI_TEMPERATURE    sampling temperature; empty => omit the field entirely
+#                     (some newer cloud models reject any non-default value)
+#   AI_RESPONSE_FORMAT  OpenAI-compatible structured output: off|json_object|json_schema
+#   AI_TOKENS_PARAM     OpenAI token-limit field name: max_tokens|max_completion_tokens
+#
+# response_format and the token-field name apply only to OpenAI-format requests
+# (incl. LiteLLM). Anthropic always sends max_tokens and has no response_format.
+build_model_request() {
+  local api_format="$1"
+  local model="$2"
+  local system="$3"
+  local user="$4"
+  local corpus_file="$5"
+  local output_file="$6"
+  local stream="${7:-false}"
+
+  local max_tokens="${AI_MAX_TOKENS:-4096}"
+
+  # temperature: empty string omits the field; otherwise pass through as JSON.
+  local temp_json="null"
+  if [[ -n "${AI_TEMPERATURE-}" ]]; then
+    temp_json="$AI_TEMPERATURE"
+  fi
+
+  if [[ "$api_format" == "anthropic" ]]; then
+    jq -n \
+      --arg model "$model" \
+      --arg system "$system" \
+      --arg user "$user" \
+      --argjson max_tokens "$max_tokens" \
+      --argjson stream "$stream" \
+      --argjson temp "$temp_json" \
+      --rawfile corpus "$corpus_file" \
+      '{model:$model,max_tokens:$max_tokens,stream:$stream,system:$system,messages:[{role:"user",content:($user + "\n\n" + $corpus)}]}
+       + (if $temp == null then {} else {temperature:$temp} end)' > "$output_file"
+  else
+    local tok_field="max_tokens"
+    if [[ "${AI_TOKENS_PARAM:-max_tokens}" == "max_completion_tokens" ]]; then
+      tok_field="max_completion_tokens"
+    fi
+
+    local rf_json="null"
+    case "${AI_RESPONSE_FORMAT:-off}" in
+      json_object)
+        rf_json='{"type":"json_object"}' ;;
+      json_schema)
+        rf_json='{"type":"json_schema","json_schema":{"name":"pr_review","strict":true,"schema":{"type":"object","properties":{"verdict":{"type":"string","enum":["approve","request_changes"]},"review_markdown":{"type":"string"}},"required":["verdict","review_markdown"],"additionalProperties":false}}}' ;;
+    esac
+
+    jq -n \
+      --arg model "$model" \
+      --arg system "$system" \
+      --arg user "$user" \
+      --argjson max_tokens "$max_tokens" \
+      --argjson stream "$stream" \
+      --arg tokfield "$tok_field" \
+      --argjson temp "$temp_json" \
+      --argjson rf "$rf_json" \
+      --rawfile corpus "$corpus_file" \
+      '{model:$model,stream:$stream,messages:[{role:"system",content:$system},{role:"user",content:($user + "\n\n" + $corpus)}]}
+       + {($tokfield): $max_tokens}
+       + (if $temp == null then {} else {temperature:$temp} end)
+       + (if $rf == null then {} else {response_format:$rf} end)' > "$output_file"
+  fi
+}

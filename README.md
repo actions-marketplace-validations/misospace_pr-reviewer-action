@@ -60,6 +60,9 @@ The classification is purely rule-based — no model calls are involved. It uses
 | `ai_model` | Model name for the primary analysis pass | Yes | - |
 | `ai_api_key` | Optional API key for the primary AI endpoint. OpenAI format sends `Authorization: Bearer`; Anthropic format sends `x-api-key` | No | `""` |
 | `ai_max_tokens` | Maximum completion tokens for primary and fallback final review calls. Required by Anthropic-compatible APIs | No | `4096` |
+| `ai_temperature` | Sampling temperature for the review model. Empty string omits the field (some newer cloud models reject non-default temperature) | No | `0.1` |
+| `ai_response_format` | Structured-output mode for OpenAI-compatible endpoints (incl. LiteLLM): `off`, `json_object`, or `json_schema` (enforces the verdict/review_markdown schema). Ignored for `anthropic`. Improves reliability with smaller local models | No | `off` |
+| `ai_tokens_param` | Token-limit field name for OpenAI-compatible requests: `max_tokens` or `max_completion_tokens` (newer OpenAI reasoning models). Ignored for `anthropic` | No | `max_tokens` |
 | `anthropic_version` | `anthropic-version` header used for Anthropic-compatible requests | No | `2023-06-01` |
 | `ai_fallback_base_url` | Optional fallback AI API base URL | No | `""` |
 | `ai_fallback_api_format` | Fallback API request/response format; defaults to `ai_api_format` when blank | No | `""` |
