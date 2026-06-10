@@ -262,7 +262,7 @@ cat > "$CLEANUP_TMP/reviews.json" <<'JSONEOF'
   {"id": 22, "state": "CHANGES_REQUESTED", "user": {"login": "test-bot"},
    "body": "<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"abc\"} -->\nlegacy review"},
   {"id": 33, "state": "APPROVED", "user": {"login": "human"},
-   "body": "<!-- my-marker -->\nhuman pasted the marker"},
+   "body": "Quoting the bot here: <!-- my-marker -->\nhuman pasted the marker mid-body"},
   {"id": 44, "state": "COMMENTED", "user": {"login": "test-bot"},
    "body": "unrelated bot output"}
 ]
@@ -271,7 +271,6 @@ JSONEOF
 cat > "$CLEANUP_TMP/bin/gh" <<SHELLEOF
 #!/usr/bin/env bash
 echo "\$*" >> "$CALL_LOG"
-if [ "\$1" = "api" ] && [ "\$2" = "user" ]; then echo "test-bot"; exit 0; fi
 case "\$*" in
   *"/reviews --paginate"*) cat "$CLEANUP_TMP/reviews.json" ;;
   *dismissals*) echo '{"id": 1}' ;;
@@ -303,24 +302,31 @@ LIST_QUERIES="$(grep -c '/reviews --paginate' "$CALL_LOG" || true)"
 check "exactly one review list query" "$LIST_QUERIES" "1"
 
 echo ""
-echo "=== Functional: default GITHUB_TOKEN (no /user access) falls back to github-actions[bot] ==="
+echo "=== Functional: identity-independent matching (installation tokens) ==="
 
-# Reviews authored by github-actions[bot] — the identity used when reviews
-# were created with the default GITHUB_TOKEN, whose /user endpoint 403s.
+# Under installation tokens (default GITHUB_TOKEN and GitHub App tokens),
+# /user returns 403 — and gh prints the JSON error body to STDOUT, which is
+# how the old author-matching cleanup silently dismissed nothing on every
+# production run (#190). Matching is now marker-based and must work for any
+# bot identity without ever calling /user.
 cat > "$CLEANUP_TMP/reviews.json" <<'JSONEOF'
 [
   {"id": 55, "state": "APPROVED", "user": {"login": "github-actions[bot]"},
-   "body": "<!-- ai-pr-reviewer -->\nold bot review"},
-  {"id": 66, "state": "APPROVED", "user": {"login": "someone-else"},
-   "body": "<!-- ai-pr-reviewer -->\nnot ours"}
+   "body": "<!-- ai-pr-reviewer -->\nold default-token review"},
+  {"id": 66, "state": "APPROVED", "user": {"login": "its-saffron[bot]"},
+   "body": "<!-- ai-pr-reviewer -->\nold app-token review"},
+  {"id": 77, "state": "APPROVED", "user": {"login": "human"},
+   "body": "LGTM"}
 ]
 JSONEOF
 
+# True-to-production mock: /user prints the JSON error body to stdout and
+# exits 1 (gh api does NOT apply --jq to error responses).
 cat > "$CLEANUP_TMP/bin/gh" <<SHELLEOF
 #!/usr/bin/env bash
 echo "\$*" >> "$CALL_LOG"
 if [ "\$1" = "api" ] && [ "\$2" = "user" ]; then
-  echo "Resource not accessible by integration (HTTP 403)" >&2
+  printf '{\n  "message": "Resource not accessible by integration",\n  "status": "403"\n}\n'
   exit 1
 fi
 case "\$*" in
@@ -338,14 +344,18 @@ CLEANUP_OUTPUT="$(
   bash -c 'source "'"$HELPER_SCRIPT"'"; cleanup_native_reviews true' 2>&1
 )"
 
-check_contains "falls back to the github-actions[bot] identity" \
-  "$CLEANUP_OUTPUT" "assuming github-actions[bot]"
-check_contains "github-actions[bot] review is dismissed" \
+check_contains "default-token bot review is dismissed" \
   "$CLEANUP_OUTPUT" "Dismissed outdated managed review #55 (APPROVED)"
-check_not_contains "other users' reviews untouched" \
-  "$CLEANUP_OUTPUT" "#66"
-check_not_contains "cleanup is no longer skipped" \
+check_contains "app-token bot review is dismissed (no identity needed)" \
+  "$CLEANUP_OUTPUT" "Dismissed outdated managed review #66 (APPROVED)"
+check_not_contains "human review untouched" \
+  "$CLEANUP_OUTPUT" "#77"
+check_not_contains "cleanup is not skipped" \
   "$CLEANUP_OUTPUT" "skipping cleanup"
+check_not_contains "no identity fallback remains" \
+  "$CLEANUP_OUTPUT" "assuming github-actions"
+USER_CALLS="$(grep -c '^api user' "$CALL_LOG" || true)"
+check "no /user lookup is made" "$USER_CALLS" "0"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
