@@ -125,6 +125,52 @@ inputs:
       output and metadata marker) without changing the published review.
     required: false
     default: "warn"
+  review_routing_mode:
+    description: >-
+      Route PR reviews between fast and smart models based on the deterministic
+      classification. 'off' (default) preserves existing primary/fallback behavior.
+      'auto' sends PRs whose pr_kind or risk_flags match escalate_on_risk_flags to the
+      smart model and everything else to the fast model.
+    required: false
+    default: "off"
+  ai_fast_model:
+    description: Fast/local model for low-risk reviews when review_routing_mode=auto. Defaults to ai_model.
+    required: false
+    default: ""
+  ai_fast_base_url:
+    description: Base URL for the fast model. Defaults to ai_base_url.
+    required: false
+    default: ""
+  ai_fast_api_format:
+    description: API format for the fast model (openai or anthropic). Defaults to ai_api_format.
+    required: false
+    default: ""
+  ai_fast_api_key:
+    description: API key for the fast model. Defaults to ai_api_key.
+    required: false
+    default: ""
+  ai_smart_model:
+    description: Smarter model for high-risk reviews when review_routing_mode=auto. Defaults to ai_fallback_model; with neither set, risky PRs stay on the fast model.
+    required: false
+    default: ""
+  ai_smart_base_url:
+    description: Base URL for the smart model. Defaults to ai_fallback_base_url.
+    required: false
+    default: ""
+  ai_smart_api_format:
+    description: API format for the smart model (openai or anthropic). Defaults to ai_fallback_api_format, then ai_api_format.
+    required: false
+    default: ""
+  ai_smart_api_key:
+    description: API key for the smart model. Defaults to ai_fallback_api_key.
+    required: false
+    default: ""
+  escalate_on_risk_flags:
+    description: >-
+      Comma-separated pr_kind / risk_flag names that route directly to the smart model
+      when review_routing_mode=auto.
+    required: false
+    default: "linked_security_issue,linked_priority_p0,linked_priority_p1,auth_changes,public_route_changes,file_serving_changes,path_handling_changes,secret_handling_changes,db_or_migration_changes"
   ai_stream:
     description: If true, use streaming responses to avoid timeouts behind proxies with short read timeouts (e.g. Cloudflare 100s edge timer)
     required: false
@@ -337,6 +383,9 @@ outputs:
   required_checks:
     description: Required-check validation status ('complete', 'incomplete', or 'none' when validation did not run)
     value: ${{ steps.review.outputs.required_checks }}
+  review_route:
+    description: Model route used for this review ('legacy', 'fast', or 'smart')
+    value: ${{ steps.review.outputs.review_route }}
   findings:
     description: Normalized structured findings as a JSON array (empty array when the model produced none)
     value: ${{ steps.review.outputs.findings }}
@@ -402,6 +451,10 @@ runs:
         AI_RESPONSE_FORMAT: ${{ inputs.ai_response_format }}
         AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
         AI_FALLBACK_MODEL: ${{ inputs.ai_fallback_model }}
+        REVIEW_ROUTING_MODE: ${{ inputs.review_routing_mode }}
+        AI_FAST_MODEL: ${{ inputs.ai_fast_model }}
+        AI_SMART_MODEL: ${{ inputs.ai_smart_model }}
+        ESCALATE_ON_RISK_FLAGS: ${{ inputs.escalate_on_risk_flags }}
         ANTHROPIC_VERSION: ${{ inputs.anthropic_version }}
         SYSTEM_PROMPT: ${{ inputs.system_prompt }}
         SYSTEM_PROMPT_FILE: ${{ inputs.system_prompt_file }}
@@ -474,6 +527,16 @@ runs:
         VERDICT_POLICY: ${{ inputs.verdict_policy }}
         VALIDATE_REQUIRED_CHECKS: ${{ inputs.validate_required_checks }}
         REQUIRED_CHECK_VALIDATION_MODE: ${{ inputs.required_check_validation_mode }}
+        REVIEW_ROUTING_MODE: ${{ inputs.review_routing_mode }}
+        AI_FAST_BASE_URL: ${{ inputs.ai_fast_base_url }}
+        AI_FAST_MODEL: ${{ inputs.ai_fast_model }}
+        AI_FAST_API_FORMAT: ${{ inputs.ai_fast_api_format }}
+        AI_FAST_API_KEY: ${{ inputs.ai_fast_api_key }}
+        AI_SMART_BASE_URL: ${{ inputs.ai_smart_base_url }}
+        AI_SMART_MODEL: ${{ inputs.ai_smart_model }}
+        AI_SMART_API_FORMAT: ${{ inputs.ai_smart_api_format }}
+        AI_SMART_API_KEY: ${{ inputs.ai_smart_api_key }}
+        ESCALATE_ON_RISK_FLAGS: ${{ inputs.escalate_on_risk_flags }}
         AI_STREAM: ${{ inputs.ai_stream }}
         AI_FALLBACK_STREAM: ${{ inputs.ai_fallback_stream }}
         ALLOWED_SOURCE_HOSTS: ${{ inputs.allowed_source_hosts }}
@@ -525,6 +588,7 @@ runs:
         BROAD_FINGERPRINT: ${{ steps.precheck.outputs.diff_fingerprint }}
         VERDICT: ${{ steps.review.outputs.verdict }}
         REQUIRED_CHECKS: ${{ steps.review.outputs.required_checks }}
+        REVIEW_ROUTE: ${{ steps.review.outputs.review_route }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
         COMMENT_MARKER: ${{ inputs.comment_marker }}
@@ -587,6 +651,7 @@ runs:
         HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         VERDICT: ${{ steps.review.outputs.verdict }}
         REQUIRED_CHECKS: ${{ steps.review.outputs.required_checks }}
+        REVIEW_ROUTE: ${{ steps.review.outputs.review_route }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
         FINDINGS: ${{ steps.review.outputs.findings }}
         INLINE_FINDINGS: ${{ inputs.inline_findings }}
@@ -687,6 +752,7 @@ runs:
         HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         VERDICT: ${{ steps.review.outputs.verdict }}
         REQUIRED_CHECKS: ${{ steps.review.outputs.required_checks }}
+        REVIEW_ROUTE: ${{ steps.review.outputs.review_route }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
         FINDINGS: ${{ steps.review.outputs.findings }}
         INLINE_FINDINGS: ${{ inputs.inline_findings }}

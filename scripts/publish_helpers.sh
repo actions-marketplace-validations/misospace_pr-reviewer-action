@@ -115,9 +115,11 @@ build_metadata_marker() {
     --arg scope "${EFFECTIVE_SCOPE}" \
     --arg result "${REVIEW_RESULT}" \
     --arg checks "${REQUIRED_CHECKS:-}" \
+    --arg route "${REVIEW_ROUTE:-}" \
     --arg prev "$previous_head_sha" \
     '{version: 1, head_sha: $head, base_sha: $base, review_scope: $scope, review_result: $result}
      + (if $checks == "" or $checks == "none" then {} else {required_checks: $checks} end)
+     + (if $route == "" or $route == "legacy" then {} else {review_route: $route} end)
      + (if $scope == "incremental" and $prev != "" then {previous_head_sha: $prev} else {} end)')"
   printf '<!-- ai-pr-reviewer:%s -->' "$marker_json"
 }

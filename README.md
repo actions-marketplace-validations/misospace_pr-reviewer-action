@@ -102,6 +102,16 @@ The result is exposed as the `required_checks` output (`complete` / `incomplete`
 | `inline_findings_max` | Maximum inline review comments per review when `inline_findings=true` | No | `20` |
 | `validate_required_checks` | Validate the final review against the classifier's `must_check` items: `auto` (when must_check is non-empty), `true`, or `false` | No | `auto` |
 | `required_check_validation_mode` | Action on unaddressed required checks: `warn` (append a section to the review), `fail` (also force `request_changes`), or `metadata_only` | No | `warn` |
+| `review_routing_mode` | Route reviews between fast and smart models from the classification: `off` (existing primary/fallback behavior) or `auto` | No | `off` |
+| `ai_fast_model` | Fast model for low-risk reviews in `auto` mode; defaults to `ai_model` | No | `""` |
+| `ai_fast_base_url` | Base URL for the fast model; defaults to `ai_base_url` | No | `""` |
+| `ai_fast_api_format` | API format for the fast model; defaults to `ai_api_format` | No | `""` |
+| `ai_fast_api_key` | API key for the fast model; defaults to `ai_api_key` | No | `""` |
+| `ai_smart_model` | Smart model for high-risk reviews in `auto` mode; defaults to `ai_fallback_model` | No | `""` |
+| `ai_smart_base_url` | Base URL for the smart model; defaults to `ai_fallback_base_url` | No | `""` |
+| `ai_smart_api_format` | API format for the smart model; defaults to `ai_fallback_api_format`, then `ai_api_format` | No | `""` |
+| `ai_smart_api_key` | API key for the smart model; defaults to `ai_fallback_api_key` | No | `""` |
+| `escalate_on_risk_flags` | Comma-separated `pr_kind`/`risk_flag` names that route to the smart model in `auto` mode | No | security/priority/auth/route/file-serving/path/secret/db list |
 | `ai_primary_retry_delay_sec` | Delay between retries in seconds | No | `15` |
 | `allowed_source_hosts` | Comma-separated allowlist for linked URL fetching | No | `github.com,api.github.com,gitlab.com,registry.terraform.io,artifacthub.io` |
 | `system_prompt` | Optional system prompt override | No | bundled prompt |
@@ -155,6 +165,7 @@ The result is exposed as the `required_checks` output (`complete` / `incomplete`
 | `verdict` | `approve` or `request_changes` |
 | `verdict_source` | `model` or `findings`, per `verdict_policy` |
 | `required_checks` | Required-check validation status: `complete`, `incomplete`, or `none` (validation did not run) |
+| `review_route` | Model route used: `legacy` (routing off), `fast`, or `smart` |
 | `findings` | Normalized structured findings as a JSON array (`[]` when the model produced none) |
 | `review_markdown` | Full markdown review body |
 | `analysis_engine` | Model and endpoint that produced the final result |
@@ -612,6 +623,30 @@ Anchors are validated against the diff before submission (GitHub only accepts co
     verdict_policy: findings_severity_gated
     inline_findings: "true"
 ```
+
+### Fast/smart model routing
+
+With `review_routing_mode: auto`, the deterministic classification decides which model reviews the PR — boring PRs go to a fast/local model, scary ones go straight to a smarter model:
+
+```yaml
+- uses: misospace/pr-reviewer-action@v1
+  with:
+    github_token: ${{ secrets.GITHUB_TOKEN }}
+    ai_base_url: http://llama-server.internal:8080/v1   # fast (default = primary)
+    ai_model: qwen3-32b
+    ai_smart_base_url: https://api.anthropic.com/v1
+    ai_smart_api_format: anthropic
+    ai_smart_model: claude-sonnet-4-6
+    ai_smart_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+    review_routing_mode: auto
+```
+
+Routing rules:
+- A PR whose `pr_kind` **or** any `risk_flags` entry matches `escalate_on_risk_flags` routes to the **smart** model; everything else routes to the **fast** model.
+- The fast config defaults to the primary `ai_*` inputs; the smart config defaults to the `ai_fallback_*` inputs. If a risky PR is detected but no smart/fallback model is configured, the review stays on the fast model (logged, never fails).
+- `off` (the default) preserves the existing primary/fallback behavior exactly (`review_route` output reports `legacy`).
+- The retry and failure-fallback machinery is unchanged — routing only picks which model it talks to.
+- The chosen route appears in the `review_route` output, the step summary, and the managed metadata marker; routing config is part of the precheck fingerprint, so changing it forces a fresh review.
 
 ### Token-saving with incremental reviews
 

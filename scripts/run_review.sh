@@ -102,6 +102,16 @@ ON_MODEL_FAILURE="${ON_MODEL_FAILURE:-fail}"
 VERDICT_POLICY="${VERDICT_POLICY:-model}"
 VALIDATE_REQUIRED_CHECKS="${VALIDATE_REQUIRED_CHECKS:-auto}"
 REQUIRED_CHECK_VALIDATION_MODE="${REQUIRED_CHECK_VALIDATION_MODE:-warn}"
+REVIEW_ROUTING_MODE="${REVIEW_ROUTING_MODE:-off}"
+AI_FAST_BASE_URL="${AI_FAST_BASE_URL:-}"
+AI_FAST_MODEL="${AI_FAST_MODEL:-}"
+AI_FAST_API_FORMAT="${AI_FAST_API_FORMAT:-}"
+AI_FAST_API_KEY="${AI_FAST_API_KEY:-}"
+AI_SMART_BASE_URL="${AI_SMART_BASE_URL:-}"
+AI_SMART_MODEL="${AI_SMART_MODEL:-}"
+AI_SMART_API_FORMAT="${AI_SMART_API_FORMAT:-}"
+AI_SMART_API_KEY="${AI_SMART_API_KEY:-}"
+ESCALATE_ON_RISK_FLAGS="${ESCALATE_ON_RISK_FLAGS:-linked_security_issue,linked_priority_p0,linked_priority_p1,auth_changes,public_route_changes,file_serving_changes,path_handling_changes,secret_handling_changes,db_or_migration_changes}"
 REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
 EFFECTIVE_SCOPE="${EFFECTIVE_SCOPE:-full}"
 PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA:-}"
@@ -276,6 +286,23 @@ case "$(printf '%s' "$REQUIRED_CHECK_VALIDATION_MODE" | tr '[:upper:]' '[:lower:
     REQUIRED_CHECK_VALIDATION_MODE=warn
     ;;
 esac
+
+case "$(printf '%s' "$REVIEW_ROUTING_MODE" | tr '[:upper:]' '[:lower:]')" in
+  off|auto) REVIEW_ROUTING_MODE="$(printf '%s' "$REVIEW_ROUTING_MODE" | tr '[:upper:]' '[:lower:]')" ;;
+  *)
+    error "Invalid REVIEW_ROUTING_MODE '$REVIEW_ROUTING_MODE'; defaulting to off"
+    REVIEW_ROUTING_MODE=off
+    ;;
+esac
+
+if [[ -n "$AI_FAST_API_FORMAT" ]] && ! AI_FAST_API_FORMAT="$(normalize_api_format "$AI_FAST_API_FORMAT")"; then
+  error "Invalid AI_FAST_API_FORMAT '$AI_FAST_API_FORMAT'; expected openai or anthropic"
+  exit 1
+fi
+if [[ -n "$AI_SMART_API_FORMAT" ]] && ! AI_SMART_API_FORMAT="$(normalize_api_format "$AI_SMART_API_FORMAT")"; then
+  error "Invalid AI_SMART_API_FORMAT '$AI_SMART_API_FORMAT'; expected openai or anthropic"
+  exit 1
+fi
 
 if [[ -n "$AI_FALLBACK_BASE_URL" && -z "$AI_FALLBACK_MODEL" ]]; then
   error "AI_FALLBACK_MODEL is required when AI_FALLBACK_BASE_URL is set"
@@ -896,6 +923,77 @@ else
 fi
 section_timer_end
 
+# ── Model routing (#159) ─────────────────────────────────────────────
+# With review_routing_mode=auto, low-risk PRs go to the fast model and PRs
+# whose pr_kind or risk_flags match ESCALATE_ON_RISK_FLAGS go straight to the
+# smart model. The fast config defaults to the primary model; the smart config
+# defaults to the fallback model. Routing only rebinds which model the
+# existing retry/fallback machinery talks to — that machinery is unchanged.
+resolve_review_route() {
+  REVIEW_ROUTE="legacy"
+  ROUTE_REASON="routing off"
+  if [[ "$(printf '%s' "$REVIEW_ROUTING_MODE" | tr '[:upper:]' '[:lower:]')" != "auto" ]]; then
+    return
+  fi
+
+  local kind flags candidates matched="" raw_flag flag
+  kind="$(jq -r '.pr_kind // ""' classification.json 2>/dev/null || echo "")"
+  flags="$(jq -r '(.risk_flags // []) | join(",")' classification.json 2>/dev/null || echo "")"
+  # Match against the union of pr_kind and risk_flags: the default escalation
+  # list mixes kind names (auth_changes, ...) and flag names (linked_*).
+  candidates=",${kind},${flags},"
+
+  IFS=',' read -ra _esc_flags <<< "$ESCALATE_ON_RISK_FLAGS"
+  for raw_flag in "${_esc_flags[@]}"; do
+    flag="$(printf '%s' "$raw_flag" | xargs)"
+    [ -n "$flag" ] || continue
+    if [[ "$candidates" == *",${flag},"* ]]; then
+      matched="$flag"
+      break
+    fi
+  done
+
+  if [[ -n "$matched" ]]; then
+    if [[ -n "$SMART_MODEL_RESOLVED" ]]; then
+      REVIEW_ROUTE="smart"
+      ROUTE_REASON="risk match: ${matched}"
+    else
+      REVIEW_ROUTE="fast"
+      ROUTE_REASON="risk match: ${matched}, but no smart model configured"
+    fi
+  else
+    REVIEW_ROUTE="fast"
+    ROUTE_REASON="no escalation flags matched"
+  fi
+}
+
+# Fast defaults to the primary config; smart defaults to the fallback config.
+FAST_BASE_URL="${AI_FAST_BASE_URL:-$AI_BASE_URL}"
+FAST_MODEL="${AI_FAST_MODEL:-$AI_MODEL}"
+FAST_API_FORMAT="${AI_FAST_API_FORMAT:-$AI_API_FORMAT}"
+FAST_API_KEY="${AI_FAST_API_KEY:-$AI_API_KEY}"
+SMART_BASE_URL="${AI_SMART_BASE_URL:-$AI_FALLBACK_BASE_URL}"
+SMART_MODEL="${AI_SMART_MODEL:-$AI_FALLBACK_MODEL}"
+SMART_API_FORMAT="${AI_SMART_API_FORMAT:-${AI_FALLBACK_API_FORMAT:-$AI_API_FORMAT}}"
+SMART_API_KEY="${AI_SMART_API_KEY:-$AI_FALLBACK_API_KEY}"
+SMART_MODEL_RESOLVED=""
+if [[ -n "$SMART_BASE_URL" && -n "$SMART_MODEL" ]]; then
+  SMART_MODEL_RESOLVED=1
+fi
+
+resolve_review_route
+if [[ "$REVIEW_ROUTE" == "fast" ]]; then
+  AI_BASE_URL="$FAST_BASE_URL"
+  AI_MODEL="$FAST_MODEL"
+  AI_API_FORMAT="$FAST_API_FORMAT"
+  AI_API_KEY="$FAST_API_KEY"
+elif [[ "$REVIEW_ROUTE" == "smart" ]]; then
+  AI_BASE_URL="$SMART_BASE_URL"
+  AI_MODEL="$SMART_MODEL"
+  AI_API_FORMAT="$SMART_API_FORMAT"
+  AI_API_KEY="$SMART_API_KEY"
+fi
+log "Review route: $REVIEW_ROUTE ($ROUTE_REASON) → $AI_MODEL"
 
 log "Building review corpus..."
 : > standards-context.md
@@ -1271,6 +1369,7 @@ echo "analysis_engine=$ANALYSIS_ENGINE" >> "$OUTPUT_FILE"
 echo "verdict=$(jq -r '.verdict' ai-output.json)" >> "$OUTPUT_FILE"
 echo "verdict_source=$(jq -r '.verdict_source // "model"' ai-output.json)" >> "$OUTPUT_FILE"
 echo "required_checks=$(jq -r '.required_checks // "none"' ai-output.json)" >> "$OUTPUT_FILE"
+echo "review_route=${REVIEW_ROUTE:-legacy}" >> "$OUTPUT_FILE"
 
 # Use a random heredoc delimiter so model-controlled review text (which can be
 # influenced by prompt injection in the PR diff/title/body) cannot terminate the
@@ -1348,6 +1447,7 @@ write_step_summary() {
     echo "| Verdict | ${verdict} (source: ${verdict_source}) |"
     echo "| Findings | ${findings_count} (blockers: ${blockers_count}) |"
     echo "| Required checks | ${required_checks_status} |"
+    echo "| Route | ${REVIEW_ROUTE:-legacy} (${ROUTE_REASON:-}) |"
     echo "| Scope | ${EFFECTIVE_SCOPE} |"
     echo "| Budget | ${budget_desc} |"
     echo "| Diff bytes | ${diff_bytes} (truncated: ${diff_trunc}) |"
