@@ -56,6 +56,11 @@ AI_API_FORMAT="${AI_API_FORMAT:-openai}"
 AI_MODEL="${AI_MODEL:-}"
 AI_API_KEY="${AI_API_KEY:-}"
 AI_MAX_TOKENS="${AI_MAX_TOKENS:-4096}"
+# Single-dash default: an explicitly empty AI_TEMPERATURE is preserved (it means
+# "omit the field"); only an unset value falls back to 0.1.
+AI_TEMPERATURE="${AI_TEMPERATURE-0.1}"
+AI_RESPONSE_FORMAT="${AI_RESPONSE_FORMAT:-off}"
+AI_TOKENS_PARAM="${AI_TOKENS_PARAM:-max_tokens}"
 ANTHROPIC_VERSION="${ANTHROPIC_VERSION:-2023-06-01}"
 AI_FALLBACK_BASE_URL="${AI_FALLBACK_BASE_URL:-}"
 AI_FALLBACK_API_FORMAT="${AI_FALLBACK_API_FORMAT:-}"
@@ -169,6 +174,28 @@ if [[ ! "$AI_MAX_TOKENS" =~ ^[0-9]+$ || "$AI_MAX_TOKENS" -lt 1 ]]; then
   AI_MAX_TOKENS=4096
 fi
 
+# AI_TEMPERATURE: empty means "omit the field"; otherwise must be numeric.
+if [[ -n "$AI_TEMPERATURE" && ! "$AI_TEMPERATURE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  error "Invalid AI_TEMPERATURE '$AI_TEMPERATURE'; defaulting to 0.1"
+  AI_TEMPERATURE=0.1
+fi
+
+case "$AI_RESPONSE_FORMAT" in
+  off|json_object|json_schema) ;;
+  *)
+    error "Invalid AI_RESPONSE_FORMAT '$AI_RESPONSE_FORMAT'; defaulting to off"
+    AI_RESPONSE_FORMAT=off
+    ;;
+esac
+
+case "$AI_TOKENS_PARAM" in
+  max_tokens|max_completion_tokens) ;;
+  *)
+    error "Invalid AI_TOKENS_PARAM '$AI_TOKENS_PARAM'; defaulting to max_tokens"
+    AI_TOKENS_PARAM=max_tokens
+    ;;
+esac
+
 if [[ -n "$AI_FALLBACK_BASE_URL" && -z "$AI_FALLBACK_MODEL" ]]; then
   error "AI_FALLBACK_MODEL is required when AI_FALLBACK_BASE_URL is set"
   exit 1
@@ -239,35 +266,8 @@ fi
 # can be unit-tested independently of the main driver.
 source "${SCRIPT_DIR}/model_call.sh"
 
-build_model_request() {
-  local api_format="$1"
-  local model="$2"
-  local system="$3"
-  local user="$4"
-  local corpus_file="$5"
-  local output_file="$6"
-  local stream="${7:-false}"
-
-  if [[ "$api_format" == "anthropic" ]]; then
-    jq -n \
-      --arg model "$model" \
-      --arg system "$system" \
-      --arg user "$user" \
-      --argjson max_tokens "$AI_MAX_TOKENS" \
-      --argjson stream "$stream" \
-      --rawfile corpus "$corpus_file" \
-      '{model:$model,max_tokens:$max_tokens,stream:$stream,system:$system,messages:[{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > "$output_file"
-  else
-    jq -n \
-      --arg model "$model" \
-      --arg system "$system" \
-      --arg user "$user" \
-      --argjson max_tokens "$AI_MAX_TOKENS" \
-      --argjson stream "$stream" \
-      --rawfile corpus "$corpus_file" \
-      '{model:$model,max_tokens:$max_tokens,stream:$stream,messages:[{role:"system",content:$system},{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > "$output_file"
-  fi
-}
+# build_model_request is defined in scripts/model_call.sh (sourced above) so the
+# request-payload shaping can be unit-tested independently of the main driver.
 
 reassemble_sse_response() {
   local response_file="$1"
