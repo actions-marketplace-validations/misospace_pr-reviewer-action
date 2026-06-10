@@ -70,6 +70,7 @@ The classification is purely rule-based — no model calls are involved. It uses
 | `ai_fallback_api_key` | Optional API key for the fallback AI endpoint | No | `""` |
 | `ai_primary_retries` | Number of retries for the primary model | No | `8` |
 | `on_model_failure` | Behavior when primary **and** fallback models fail: `fail` (fail the step) or `notice` (post a visible `request_changes` notice explaining the review could not run — never auto-approves) | No | `fail` |
+| `verdict_policy` | How the final verdict is decided: `model` (the model's own verdict) or `findings_severity_gated` (derived from structured findings: `request_changes` iff any blocker finding; falls back to the model verdict when no findings). Enforcement settings still apply afterwards | No | `model` |
 | `ai_primary_retry_delay_sec` | Delay between retries in seconds | No | `15` |
 | `allowed_source_hosts` | Comma-separated allowlist for linked URL fetching | No | `github.com,api.github.com,gitlab.com,registry.terraform.io,artifacthub.io` |
 | `system_prompt` | Optional system prompt override | No | bundled prompt |
@@ -121,6 +122,8 @@ The classification is purely rule-based — no model calls are involved. It uses
 | Output | Description |
 |--------|-------------|
 | `verdict` | `approve` or `request_changes` |
+| `verdict_source` | `model` or `findings`, per `verdict_policy` |
+| `findings` | Normalized structured findings as a JSON array (`[]` when the model produced none) |
 | `review_markdown` | Full markdown review body |
 | `analysis_engine` | Model and endpoint that produced the final result |
 | `should_review` | `true` when a new LLM review was run |
@@ -526,6 +529,35 @@ If a repo wants more than policy context and needs to fully control the reviewer
     ai_model: gpt-4.1
     ai_api_key: ${{ secrets.OPENAI_API_KEY }}
     system_prompt_file: .github/pr-review-prompt.md
+```
+
+### Structured findings and verdict policy
+
+The model may return an optional `findings` array alongside the verdict — concrete, located issues:
+
+```json
+{
+  "verdict": "request_changes",
+  "review_markdown": "...",
+  "findings": [
+    {"severity": "blocker", "category": "security", "file": "app/serve.py", "line": 42,
+     "message": "Resolved path is not checked against the data root before opening."}
+  ]
+}
+```
+
+Findings are normalized (severities mapped to `blocker`/`major`/`minor`/`info`, malformed entries dropped) and exposed as the `findings` output. **Absence is fine** — weaker local models that only produce `verdict`/`review_markdown` keep exactly the previous behavior.
+
+With `verdict_policy: findings_severity_gated`, the verdict is derived deterministically from the findings instead of trusting the model's headline call: `request_changes` iff any blocker-severity finding exists, otherwise `approve`. When no findings were produced, the model's verdict is used (the `verdict_source` output tells you which path applied). Enforcement settings (`evidence_blocker_enforcement`, tool-failure enforcement) still run afterwards and can force `request_changes`.
+
+```yaml
+- uses: misospace/pr-reviewer-action@v1
+  with:
+    github_token: ${{ secrets.GITHUB_TOKEN }}
+    ai_base_url: http://llama-server.internal:8080/v1
+    ai_model: qwen3-32b
+    ai_response_format: json_schema   # schema includes the findings array
+    verdict_policy: findings_severity_gated
 ```
 
 ### Token-saving with incremental reviews

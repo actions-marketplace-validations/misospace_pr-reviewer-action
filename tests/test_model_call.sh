@@ -112,7 +112,11 @@ check "openai json_object: response_format.type" "$(jq -r '.response_format.type
   build_model_request openai m "sys" "usr" "$CORPUS" "$REQ" false )
 check "openai json_schema: response_format.type" "$(jq -r '.response_format.type' "$REQ")" "json_schema"
 check "openai json_schema: required keys" \
-  "$(jq -r '.response_format.json_schema.schema.required | sort | join(",")' "$REQ")" "review_markdown,verdict"
+  "$(jq -r '.response_format.json_schema.schema.required | sort | join(",")' "$REQ")" "findings,review_markdown,verdict"
+check "openai json_schema: findings is nullable (optional for weak models)" \
+  "$(jq -c '.response_format.json_schema.schema.properties.findings.type' "$REQ")" '["array","null"]'
+check "openai json_schema: finding severity enum" \
+  "$(jq -c '.response_format.json_schema.schema.properties.findings.items.properties.severity.enum' "$REQ")" '["blocker","major","minor","info"]'
 
 ( AI_MAX_TOKENS=4096; AI_TOKENS_PARAM=max_completion_tokens
   build_model_request openai m "sys" "usr" "$CORPUS" "$REQ" false )
@@ -164,8 +168,8 @@ echo ""
 echo "=== Test: response_format=json_schema enforces verdict/review_markdown ==="
 T_AI_RESPONSE_FORMAT=json_schema build_req openai
 check "response_format type is json_schema" "$(jq -r '.response_format.type' "$REQ")" "json_schema"
-check "schema requires verdict+review_markdown" \
-  "$(jq -c '.response_format.json_schema.schema.required' "$REQ")" '["verdict","review_markdown"]'
+check "schema requires verdict+review_markdown (findings nullable)" \
+  "$(jq -c '.response_format.json_schema.schema.required' "$REQ")" '["verdict","review_markdown","findings"]'
 
 echo ""
 echo "=== Test: AI_TOKENS_PARAM=max_completion_tokens (newer OpenAI models) ==="

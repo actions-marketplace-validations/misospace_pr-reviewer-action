@@ -324,5 +324,97 @@ class TestTruncationAndStreamError:
         assert "context length exceeded" in msg
 
 
+def _openai_with(payload: dict) -> dict:
+    return {"choices": [{"message": {"content": json.dumps(payload)}}]}
+
+
+class TestFindingsNormalization:
+    BASE = {"verdict": "approve", "review_markdown": "ok"}
+
+    def _parse_findings(self, findings):
+        payload = dict(self.BASE)
+        if findings is not None:
+            payload["findings"] = findings
+        return parse_response(_openai_with(payload))["findings"]
+
+    def test_absent_findings_become_empty_list(self):
+        assert self._parse_findings(None) == []
+
+    def test_null_findings_become_empty_list(self):
+        payload = dict(self.BASE, findings=None)
+        assert parse_response(_openai_with(payload))["findings"] == []
+
+    def test_non_list_findings_become_empty_list(self):
+        assert self._parse_findings("not a list") == []
+
+    def test_valid_finding_normalized(self):
+        out = self._parse_findings([
+            {"severity": "blocker", "category": "security", "file": "./a/b.py",
+             "line": "42", "message": "  path traversal  "}
+        ])
+        assert out == [{
+            "severity": "blocker", "category": "security", "file": "a/b.py",
+            "line": 42, "message": "path traversal",
+        }]
+
+    def test_severity_aliases_mapped(self):
+        out = self._parse_findings([
+            {"severity": "Critical", "message": "a"},
+            {"severity": "HIGH", "message": "b"},
+            {"severity": "warning", "message": "c"},
+            {"severity": "nit", "message": "d"},
+            {"severity": "made-up", "message": "e"},
+        ])
+        assert [f["severity"] for f in out] == [
+            "blocker", "major", "minor", "info", "info",
+        ]
+
+    def test_unknown_category_becomes_other(self):
+        out = self._parse_findings([{"message": "x", "category": "vibes"}])
+        assert out[0]["category"] == "other"
+
+    def test_items_without_message_dropped(self):
+        out = self._parse_findings([
+            {"severity": "blocker"},
+            "just a string",
+            42,
+            {"message": "   "},
+            {"message": "kept"},
+        ])
+        assert len(out) == 1
+        assert out[0]["message"] == "kept"
+
+    def test_message_fallbacks_summary_and_title(self):
+        out = self._parse_findings([
+            {"summary": "from summary"},
+            {"title": "from title"},
+        ])
+        assert [f["message"] for f in out] == ["from summary", "from title"]
+
+    def test_invalid_lines_become_null(self):
+        out = self._parse_findings([
+            {"message": "a", "line": 0},
+            {"message": "b", "line": -3},
+            {"message": "c", "line": "abc"},
+            {"message": "d", "line": True},
+            {"message": "e", "line": 7.0},
+        ])
+        assert [f["line"] for f in out] == [None, None, None, None, 7]
+
+    def test_parent_traversal_path_not_silently_rewritten(self):
+        out = self._parse_findings([{"message": "x", "file": "../etc/passwd"}])
+        assert out[0]["file"] == "../etc/passwd"
+
+    def test_findings_capped_at_50(self):
+        out = self._parse_findings([{"message": f"f{i}"} for i in range(80)])
+        assert len(out) == 50
+
+    def test_weak_model_without_findings_unchanged(self):
+        result = parse_response(_openai_with(self.BASE))
+        assert result["verdict"] == "approve"
+        assert result["review_markdown"] == "ok"
+        assert result["findings"] == []
+
+
 if __name__ == "__main__":
     unittest_main()

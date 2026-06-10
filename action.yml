@@ -87,6 +87,16 @@ inputs:
       so reviewers see an explanation instead of only a red check.
     required: false
     default: "fail"
+  verdict_policy:
+    description: >-
+      How the final verdict is decided. 'model' (default) uses the model's own verdict.
+      'findings_severity_gated' derives the verdict deterministically from the structured
+      findings array: request_changes iff any blocker-severity finding exists, otherwise
+      approve. When the model returns no findings, the policy falls back to the model
+      verdict (weak models degrade gracefully). Enforcement settings (evidence blockers,
+      tool failure) still apply afterwards and can force request_changes.
+    required: false
+    default: "model"
   ai_stream:
     description: If true, use streaming responses to avoid timeouts behind proxies with short read timeouts (e.g. Cloudflare 100s edge timer)
     required: false
@@ -293,6 +303,12 @@ outputs:
   verdict:
     description: AI verdict, approve or request_changes
     value: ${{ steps.review.outputs.verdict }}
+  verdict_source:
+    description: Where the final verdict came from ('model' or 'findings', per verdict_policy)
+    value: ${{ steps.review.outputs.verdict_source }}
+  findings:
+    description: Normalized structured findings as a JSON array (empty array when the model produced none)
+    value: ${{ steps.review.outputs.findings }}
   review_markdown:
     description: Human-readable markdown review body
     value: ${{ steps.review.outputs.review_markdown }}
@@ -424,6 +440,7 @@ runs:
         AI_PRIMARY_RETRIES: ${{ inputs.ai_primary_retries }}
         AI_PRIMARY_RETRY_DELAY_SEC: ${{ inputs.ai_primary_retry_delay_sec }}
         ON_MODEL_FAILURE: ${{ inputs.on_model_failure }}
+        VERDICT_POLICY: ${{ inputs.verdict_policy }}
         AI_STREAM: ${{ inputs.ai_stream }}
         AI_FALLBACK_STREAM: ${{ inputs.ai_fallback_stream }}
         ALLOWED_SOURCE_HOSTS: ${{ inputs.allowed_source_hosts }}
