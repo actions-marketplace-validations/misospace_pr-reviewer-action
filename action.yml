@@ -109,6 +109,22 @@ inputs:
     description: Maximum inline review comments attached per review when inline_findings=true.
     required: false
     default: "20"
+  validate_required_checks:
+    description: >-
+      Whether to validate the final review against the classifier's must_check items.
+      'auto' (default) validates whenever must_check is non-empty; 'true' and 'false'
+      force it on or off. Validation is deterministic keyword matching — it catches
+      reviews that never discussed a required check, not incorrect discussion.
+    required: false
+    default: "auto"
+  required_check_validation_mode:
+    description: >-
+      What to do when required checks are unaddressed. 'warn' (default) appends an
+      'Unaddressed required checks' section to the published review. 'fail' also forces
+      a request_changes verdict. 'metadata_only' records the result (required_checks
+      output and metadata marker) without changing the published review.
+    required: false
+    default: "warn"
   ai_stream:
     description: If true, use streaming responses to avoid timeouts behind proxies with short read timeouts (e.g. Cloudflare 100s edge timer)
     required: false
@@ -318,6 +334,9 @@ outputs:
   verdict_source:
     description: Where the final verdict came from ('model' or 'findings', per verdict_policy)
     value: ${{ steps.review.outputs.verdict_source }}
+  required_checks:
+    description: Required-check validation status ('complete', 'incomplete', or 'none' when validation did not run)
+    value: ${{ steps.review.outputs.required_checks }}
   findings:
     description: Normalized structured findings as a JSON array (empty array when the model produced none)
     value: ${{ steps.review.outputs.findings }}
@@ -453,6 +472,8 @@ runs:
         AI_PRIMARY_RETRY_DELAY_SEC: ${{ inputs.ai_primary_retry_delay_sec }}
         ON_MODEL_FAILURE: ${{ inputs.on_model_failure }}
         VERDICT_POLICY: ${{ inputs.verdict_policy }}
+        VALIDATE_REQUIRED_CHECKS: ${{ inputs.validate_required_checks }}
+        REQUIRED_CHECK_VALIDATION_MODE: ${{ inputs.required_check_validation_mode }}
         AI_STREAM: ${{ inputs.ai_stream }}
         AI_FALLBACK_STREAM: ${{ inputs.ai_fallback_stream }}
         ALLOWED_SOURCE_HOSTS: ${{ inputs.allowed_source_hosts }}
@@ -503,6 +524,7 @@ runs:
         HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         BROAD_FINGERPRINT: ${{ steps.precheck.outputs.diff_fingerprint }}
         VERDICT: ${{ steps.review.outputs.verdict }}
+        REQUIRED_CHECKS: ${{ steps.review.outputs.required_checks }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
         COMMENT_MARKER: ${{ inputs.comment_marker }}
@@ -564,6 +586,7 @@ runs:
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         VERDICT: ${{ steps.review.outputs.verdict }}
+        REQUIRED_CHECKS: ${{ steps.review.outputs.required_checks }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
         FINDINGS: ${{ steps.review.outputs.findings }}
         INLINE_FINDINGS: ${{ inputs.inline_findings }}
@@ -663,6 +686,7 @@ runs:
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
         HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         VERDICT: ${{ steps.review.outputs.verdict }}
+        REQUIRED_CHECKS: ${{ steps.review.outputs.required_checks }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
         FINDINGS: ${{ steps.review.outputs.findings }}
         INLINE_FINDINGS: ${{ inputs.inline_findings }}

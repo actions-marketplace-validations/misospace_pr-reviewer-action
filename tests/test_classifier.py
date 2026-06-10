@@ -274,6 +274,29 @@ class TestMustCheck:
             "app_code", ["linked_security_issue"])
         assert any("security issue" in c for c in checks)
 
+    def test_risk_flag_adds_checks_beyond_pr_kind(self):
+        # An auth_changes flag on an app_code PR must still pull in the auth
+        # checklist (#157) — checks are not keyed off pr_kind alone.
+        checks = _build_must_check("app_code", ["auth_changes"])
+        assert any("auth flow" in c for c in checks)
+        assert any("session token" in c for c in checks)
+
+    def test_multiple_risk_flags_union(self):
+        checks = _build_must_check(
+            "app_code", ["auth_changes", "path_handling_changes"])
+        assert any("auth flow" in c for c in checks)
+        assert any("path traversal" in c for c in checks)
+
+    def test_kind_equal_to_flag_deduplicates(self):
+        # auth_changes as both pr_kind and risk flag yields each check once.
+        checks = _build_must_check("auth_changes", ["auth_changes"])
+        assert len(checks) == len(set(checks))
+        assert sum(1 for c in checks if "auth flow" in c) == 1
+
+    def test_pr_kind_checks_come_first(self):
+        checks = _build_must_check("file_serving_changes", ["auth_changes"])
+        assert "sanitization" in checks[0] or "traversal" in checks[0]
+
 
 # ---------------------------------------------------------------------------
 # Full classify_pr integration tests

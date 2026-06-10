@@ -42,6 +42,33 @@ Before invoking the AI model, the action runs a deterministic classification ste
 
 The classification is purely rule-based — no model calls are involved. It uses pattern matching on file paths, diff content, and linked issue metadata to determine the PR type and associated risk flags.
 
+**Default required checks per risk class** (`must_check` is the union of the checks for the `pr_kind` and every detected risk flag — a PR classified as `app_code` that still trips the `auth_changes` flag gets the auth checklist):
+
+| Risk class | Required checks |
+|------------|-----------------|
+| `renovate_digest_only` | verify no functional changes beyond lockfile hashes |
+| `dependency_upgrade` | breaking API changes in updated dependencies; run full test suite after upgrade |
+| `k8s_manifest` | validate manifest against target cluster version; resource quota / limit changes |
+| `auth_changes` | review auth flow for regression; session token handling |
+| `public_route_changes` | route access controls; unintended public endpoints |
+| `file_serving_changes` | file path sanitization; directory traversal |
+| `path_handling_changes` | path traversal; edge-case paths (null bytes, symlinks) |
+| `secret_handling_changes` | secrets not logged/exposed; secret rotation impact |
+| `db_or_migration_changes` | migration data-loss risk; test on a copy of production schema |
+| `linked_security_issue` / `linked_audit_issue` / `linked_priority_p0`/`p1` | explicitly address the linked issue / verify thoroughly |
+
+These checklists exist to keep weaker local models honest on high-risk PRs: the items are injected into the model's instructions ("address EACH of these"), and the review is then **validated** against them.
+
+### Required-check completeness validation
+
+After the model returns, the action deterministically checks whether `review_markdown` actually discussed each `must_check` item (shallow keyword matching — it catches reviews that never mentioned a required check, not incorrect discussion). Controlled by `validate_required_checks` (`auto` = validate when must_check is non-empty) and `required_check_validation_mode`:
+
+- `warn` (default): an **Unaddressed required checks** section listing the missing items is appended to the published review, so a human sees exactly what the model skipped. The verdict is not changed.
+- `fail`: additionally forces a `request_changes` verdict.
+- `metadata_only`: records the result without touching the published review — for downstream automation.
+
+The result is exposed as the `required_checks` output (`complete` / `incomplete` / `none`), written to the run's step summary, and recorded in the managed metadata marker for future runs. Low-risk PRs (empty `must_check`) produce no validation noise.
+
 ## Requirements
 
 - The repository under review must already be checked out.
@@ -73,6 +100,8 @@ The classification is purely rule-based — no model calls are involved. It uses
 | `verdict_policy` | How the final verdict is decided: `model` (the model's own verdict) or `findings_severity_gated` (derived from structured findings: `request_changes` iff any blocker finding; falls back to the model verdict when no findings). Enforcement settings still apply afterwards | No | `model` |
 | `inline_findings` | Attach diff-anchorable structured findings as native line-anchored review comments in `review_comment`/`review_verdict` modes. Ignored for `comment` mode | No | `false` |
 | `inline_findings_max` | Maximum inline review comments per review when `inline_findings=true` | No | `20` |
+| `validate_required_checks` | Validate the final review against the classifier's `must_check` items: `auto` (when must_check is non-empty), `true`, or `false` | No | `auto` |
+| `required_check_validation_mode` | Action on unaddressed required checks: `warn` (append a section to the review), `fail` (also force `request_changes`), or `metadata_only` | No | `warn` |
 | `ai_primary_retry_delay_sec` | Delay between retries in seconds | No | `15` |
 | `allowed_source_hosts` | Comma-separated allowlist for linked URL fetching | No | `github.com,api.github.com,gitlab.com,registry.terraform.io,artifacthub.io` |
 | `system_prompt` | Optional system prompt override | No | bundled prompt |
@@ -125,6 +154,7 @@ The classification is purely rule-based — no model calls are involved. It uses
 |--------|-------------|
 | `verdict` | `approve` or `request_changes` |
 | `verdict_source` | `model` or `findings`, per `verdict_policy` |
+| `required_checks` | Required-check validation status: `complete`, `incomplete`, or `none` (validation did not run) |
 | `findings` | Normalized structured findings as a JSON array (`[]` when the model produced none) |
 | `review_markdown` | Full markdown review body |
 | `analysis_engine` | Model and endpoint that produced the final result |
