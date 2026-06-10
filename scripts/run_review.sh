@@ -104,6 +104,30 @@ PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA:-}"
 ENRICHMENT_BUDGET_SEC="${ENRICHMENT_BUDGET_SEC:-60}"
 
 apply_context_limits() {
+  # When MODEL_CONTEXT_TOKENS is set, derive byte budgets from the model's real
+  # context window instead of the coarse named modes. This matters for local
+  # models (ollama/llama.cpp/vLLM) whose windows are often 8k-32k — the named
+  # 'normal' mode alone is ~55-70k tokens and silently overflows them.
+  local ctx="${MODEL_CONTEXT_TOKENS:-}"
+  if [[ "$ctx" =~ ^[0-9]+$ && "$ctx" -gt 0 ]]; then
+    # Reserve output tokens plus headroom for the system prompt, standards
+    # section and formatting; convert the remainder to bytes conservatively
+    # (~3 bytes/token, which under-fills rather than overflows).
+    local reserve=$(( AI_MAX_TOKENS + 2000 ))
+    local usable=$(( ctx - reserve ))
+    if [[ "$usable" -lt 2000 ]]; then
+      usable=2000
+    fi
+    local total_bytes=$(( usable * 3 ))
+    MAX_CORPUS="$total_bytes"
+    MAX_DIFF=$(( total_bytes * 6 / 10 ))
+    MAX_FILES=$(( total_bytes * 15 / 100 ))
+    [[ "$MAX_DIFF" -lt 2000 ]] && MAX_DIFF=2000
+    [[ "$MAX_FILES" -lt 1000 ]] && MAX_FILES=1000
+    log "Context budget from MODEL_CONTEXT_TOKENS=${ctx}: corpus=${MAX_CORPUS}B diff=${MAX_DIFF}B files=${MAX_FILES}B (output reserve=${AI_MAX_TOKENS})"
+    return
+  fi
+
   case "${CONTEXT_LIMIT_MODE:-normal}" in
     minimal)
       MAX_DIFF=40000; MAX_FILES=20000; MAX_CORPUS=60000 ;;
@@ -114,6 +138,27 @@ apply_context_limits() {
   esac
 }
 apply_context_limits
+
+# Truncate SRC into DST at a UTF-8 / newline boundary (never mid-character or
+# mid-line), appending MARKER when truncation occurred. Replaces bare `head -c`,
+# which split multibyte characters and JSON/code fences and confused weak models.
+truncate_clean() {
+  local src="$1" dst="$2" max="$3" marker="${4:-…[content truncated]}"
+  MARKER="$marker" python3 - "$src" "$dst" "$max" <<'PY'
+import os, sys
+src, dst, max_b = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = open(src, "rb").read() if os.path.exists(src) else b""
+if len(data) <= max_b:
+    open(dst, "wb").write(data)
+    sys.exit(0)
+clip = data[:max_b]
+nl = clip.rfind(b"\n")
+if nl > 0:
+    clip = clip[:nl]
+text = clip.decode("utf-8", errors="ignore")
+open(dst, "w", encoding="utf-8").write(text + "\n" + os.environ.get("MARKER", "") + "\n")
+PY
+}
 
 fetch_incremental_patch() {
   local previous_head="$1"
@@ -316,14 +361,14 @@ if [[ "$IS_FORK_PR" == "true" ]]; then
 fi
 
 gh pr diff "$PR_NUMBER" --repo "$REPO" > pr.diff
-head -c "$MAX_DIFF" pr.diff > pr.diff.truncated
+truncate_clean pr.diff pr.diff.truncated "$MAX_DIFF" '…[diff truncated to fit context budget]'
 
 gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate > pr-files.raw.json
 # Note: 'patch' is intentionally dropped — the per-file patches duplicate the
 # raw diff that is already embedded in the corpus, and the classifier does not
 # read them. Keeping them here doubled the diff bytes sent to the model.
 jq '[.[] | {filename,status,additions,deletions,changes,previous_filename}]' pr-files.raw.json > pr-files.json
-head -c "$MAX_FILES" pr-files.json > pr-files.truncated.json
+truncate_clean pr-files.json pr-files.truncated.json "$MAX_FILES" '…[file list truncated]'
 
 jq -r '.body // ""' pr.json > pr-body.txt
 section_timer_end
@@ -691,8 +736,10 @@ if [ -s terms.txt ]; then
     } >> repo-history.md
   done < terms.txt
 
-  head -c 45000 repo-impact.md > repo-impact.truncated.md
-  head -c 20000 repo-history.md > repo-history.truncated.md
+  # These grep/log dumps are the lowest-value corpus sections (and on small PRs
+  # can dwarf the actual change), so keep their caps tight.
+  truncate_clean repo-impact.md repo-impact.truncated.md 24000 '…[impact scan truncated]'
+  truncate_clean repo-history.md repo-history.truncated.md 12000 '…[history truncated]'
 else
   echo "No candidate dependency terms extracted." > repo-impact.md
   echo "No candidate dependency terms extracted." > repo-history.md
@@ -785,7 +832,10 @@ build_review_corpus() {
     echo
     echo "# PR Metadata"
     echo '```json'
-    jq . pr.json
+    # Project to review-relevant fields and cap the body: the full object also
+    # carries the entire .files array (duplicating the PR Files section and the
+    # classification summary) and an unbounded body.
+    jq '{number, title, author: (.author.login // .author), baseRefName, headRefName, headRefOid, changedFiles, additions, deletions, url, body: ((.body // "")[0:4000])}' pr.json
     echo '```'
     echo
 
@@ -806,7 +856,8 @@ build_review_corpus() {
       echo
       if [ -f incremental.diff ]; then
         echo '```diff'
-        head -c "$MAX_DIFF" incremental.diff
+        truncate_clean incremental.diff incremental.diff.truncated "$MAX_DIFF" '…[delta truncated]'
+        cat incremental.diff.truncated
         echo '```'
       else
         echo "(No incremental diff available)"
@@ -832,14 +883,9 @@ build_review_corpus() {
       echo
     fi
 
-    echo "# Linked Sources"
-    cat linked-sources.md
-    echo
-    echo "# Evidence Providers"
-    cat evidence-providers.md
-    echo
-
-    # Tool harness section — label based on scope
+    # High-value evidence comes BEFORE linked sources / repo scans so that when
+    # the corpus overflows the budget, the noisy low-value sections at the tail
+    # are dropped first instead of this evidence.
     if [[ "$corpus_type" == "incremental" ]]; then
       echo "# Tool Harness Findings (incremental review)"
     else
@@ -847,8 +893,16 @@ build_review_corpus() {
     fi
     cat tool-harness.md
     echo
+    echo "# Evidence Providers"
+    cat evidence-providers.md
+    echo
     echo "# Image Digest Provenance"
     cat image-digest-context.md
+    echo
+
+    # Lowest-value sections last — first to be dropped on truncation.
+    echo "# Linked Sources"
+    cat linked-sources.md
     echo
     echo "# Repository Impact Scan"
     cat repo-impact.truncated.md
@@ -858,13 +912,23 @@ build_review_corpus() {
     echo
   } > review-corpus.body.md
 
-  # Truncate only the non-standards body to MAX_CORPUS
-  head -c "$MAX_CORPUS" review-corpus.body.md > review-corpus.body.truncated.md
+  # MAX_CORPUS is the total budget (standards + body). Cap the standards section
+  # first, then give the truncatable body whatever budget remains so a large
+  # standards file can't silently blow past the model's context window.
+  local std_cap=16000
+  truncate_clean standards-context.md standards-context.capped.md "$std_cap" '…[standards truncated]'
+  local std_bytes body_budget
+  std_bytes="$(wc -c < standards-context.capped.md | tr -d ' ')"
+  body_budget=$(( MAX_CORPUS - std_bytes ))
+  [ "$body_budget" -lt 4000 ] && body_budget=4000
+  truncate_clean review-corpus.body.md review-corpus.body.truncated.md "$body_budget" \
+    '```
+…[review corpus truncated to fit the model context budget]'
 
-  # Prepend standards section in full, then append truncated body
+  # Prepend the (capped) standards section, then append the truncated body
   {
     echo "# Repository Standards and Conventions ($STANDARDS_FILE)"
-    cat standards-context.md
+    cat standards-context.capped.md
     echo
     cat review-corpus.body.truncated.md
   } > review-corpus.md
