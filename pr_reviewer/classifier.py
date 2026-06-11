@@ -97,25 +97,33 @@ K8S_PATTERNS = [
     re.compile(r"helm/"),
 ]
 
+# Common source-file extensions across ecosystems (not just Python), so auth /
+# route / DB filename heuristics fire for JS/TS/Go/Java/etc. repos too.
+_SRC_EXT = r"(py|js|jsx|ts|tsx|go|rb|java|kt|cs|php|rs|scala|swift)"
+
 # Auth-related changes
 AUTH_PATTERNS = [
     re.compile(r"(auth|login|oauth|oidc|saml|jwt|token|mfa|2fa|session)"
-               r"[_.-]?\w*\.py$", re.IGNORECASE),
+               r"[_.-]?\w*\." + _SRC_EXT + r"$", re.IGNORECASE),
     re.compile(r"middleware[_.-]?auth", re.IGNORECASE),
     re.compile(r"permissions?\.ya?ml$"),
     re.compile(r"rbac\.ya?ml$"),
     re.compile(r"role[-_].*binding", re.IGNORECASE),
     re.compile(r"\.env(\.example)?$", re.IGNORECASE),
+    re.compile(r"(auth|authn|authz)[-_]?(controller|service|guard|middleware|handler)",
+               re.IGNORECASE),
 ]
 
 # Public route changes
 PUBLIC_ROUTE_PATTERNS = [
-    re.compile(r"(routes?|urls?|api|endpoints?)\.py$", re.IGNORECASE),
+    re.compile(r"(routes?|urls?|api|endpoints?|controller)\." + _SRC_EXT + r"$",
+               re.IGNORECASE),
     re.compile(r"router[_.-]?py$"),
     re.compile(r"urlpatterns"),
     re.compile(r"app\.route\("),
     re.compile(r"@\w+\.route\("),
-    re.compile(r"registerEndpoint"),
+    re.compile(r"(registerEndpoint|@(Get|Post|Put|Delete|Patch|RequestMapping))",
+               re.IGNORECASE),
 ]
 
 # File serving changes — match directory names or file patterns
@@ -151,8 +159,9 @@ SECRET_HANDLING_PATTERNS = [
 # DB / migration changes
 DB_MIGRATION_PATTERNS = [
     re.compile(r"(migration|migrate|migrations?)", re.IGNORECASE),
-    re.compile(r"schema\.py$"),
-    re.compile(r"models?\.(py|go|rb)$"),
+    re.compile(r"schema\.(py|rb|ts|js|sql|prisma)$", re.IGNORECASE),
+    re.compile(r"models?\." + _SRC_EXT + r"$", re.IGNORECASE),
+    re.compile(r"(entity|entities|repository)\.(java|kt|cs|ts)$", re.IGNORECASE),
     re.compile(r"\.sql$", re.IGNORECASE),
     re.compile(r"alembic|django.*migrat|sequelize|migrate_", re.IGNORECASE),
     re.compile(r"prisma/schema\.prisma$"),
@@ -176,8 +185,31 @@ class PRClassification:
 
 
 def _has_version_bump(diff_text: str) -> bool:
-    """Check if the diff contains a version bump (not just a digest)."""
-    return bool(re.search(r'"version"\s*:\s*"[^"]+"', diff_text))
+    """Check if the diff contains a version bump (not just a digest).
+
+    Detects both JSON (`"version": "..."`) and YAML (`version:`/`appVersion:`)
+    forms. The YAML check only matches changed (+/-) lines so an unchanged
+    `version:` context line in a digest-only update is not a false positive.
+    """
+    if re.search(r'"version"\s*:\s*"[^"]+"', diff_text):
+        return True
+    if re.search(r'(?m)^[+-]\s*(?:app)?[Vv]ersion:\s*\S+', diff_text):
+        return True
+    return False
+
+
+def _all_files_are_lockfiles(filenames: list[str]) -> bool:
+    """True only when every changed file is a known lockfile.
+
+    Guards renovate_digest_only against mixed PRs (code + a lockfile), which
+    must not be classified as a trivial digest update.
+    """
+    if not filenames:
+        return False
+    return all(
+        any(pat.search(f) for pat in RENOVATE_DIGEST_FILE_PATTERNS)
+        for f in filenames
+    )
 
 
 def _is_digest_only_hash(diff_text: str) -> bool:
@@ -193,19 +225,11 @@ def _classify_pr_kind(
     """Determine the single best pr_kind from file patterns and diff content."""
     filenames = [f.get("filename", "") for f in files]
 
-    # Check Renovate digest-only first (most specific — if it's only lockfile
-    # hash updates with no version bumps, it's definitely not a meaningful code change)
-    is_renovate_digest = False
-    for pat in RENOVATE_DIGEST_FILE_PATTERNS:
-        if any(pat.search(f) for f in filenames):
-            has_version_bump_val = _has_version_bump(diff_text)
-            has_digest = _is_digest_only_hash(diff_text)
-            # If there are no version bumps, or only digest hashes, it's digest-only
-            if not has_version_bump_val or (has_digest and not has_version_bump_val):
-                is_renovate_digest = True
-                break
-
-    if is_renovate_digest:
+    # Check Renovate digest-only first (most specific). Require that EVERY
+    # changed file is a lockfile and the diff has no version bump — otherwise a
+    # mixed PR (real code + a lockfile) would be mislabeled as trivial and steer
+    # weaker models toward rubber-stamping it.
+    if _all_files_are_lockfiles(filenames) and not _has_version_bump(diff_text):
         return "renovate_digest_only"
 
     # Check dependency upgrade (has version bumps in lockfiles/deps)
@@ -301,45 +325,71 @@ def _detect_risk_flags(
     return flags
 
 
+# Checklist items per risk class. Keys are pr_kind values AND the file-based
+# risk flags (which share names), so a flag like auth_changes detected on an
+# app_code PR still pulls in the auth checklist (#157).
+KIND_CHECKS: dict[str, list[str]] = {
+    "renovate_digest_only": [
+        "verify no functional changes beyond lockfile hashes",
+    ],
+    "dependency_upgrade": [
+        "check for breaking API changes in updated dependencies",
+        "run full test suite after upgrade",
+    ],
+    "k8s_manifest": [
+        "validate manifest against target cluster version",
+        "check for resource quota / limit changes",
+    ],
+    "auth_changes": [
+        "review auth flow for regression",
+        "verify session token handling is correct",
+    ],
+    "public_route_changes": [
+        "verify route access controls are in place",
+        "check for unintended public endpoints",
+    ],
+    "file_serving_changes": [
+        "verify file path sanitization",
+        "check for directory traversal vulnerabilities",
+    ],
+    "path_handling_changes": [
+        "review for path traversal vulnerabilities",
+        "test with edge-case paths (null bytes, symlinks)",
+    ],
+    "secret_handling_changes": [
+        "verify secrets are not logged or exposed in diffs",
+        "check secret rotation impact",
+    ],
+    "db_or_migration_changes": [
+        "review migration for data loss risk",
+        "test migration on a copy of production schema",
+    ],
+}
+
+# Checklist items per linked-issue risk flag.
+FLAG_CHECKS: dict[str, list[str]] = {
+    "linked_security_issue": ["explicitly address the linked security issue"],
+    "linked_audit_issue": ["verify audit findings are addressed"],
+    "linked_priority_p0": ["treat as critical — verify all changes thoroughly"],
+    "linked_priority_p1": ["treat as high priority — verify correctness carefully"],
+}
+
+
 def _build_must_check(pr_kind: str, risk_flags: list[str]) -> list[str]:
-    """Generate explicit must-check items based on classification."""
+    """Generate explicit must-check items based on classification.
+
+    Checks come from the union of the pr_kind and every detected risk flag
+    (deduplicated, pr_kind first) — not the pr_kind alone, so secondary risk
+    signals still produce their checklists.
+    """
     checks: list[str] = []
+    seen: set[str] = set()
 
-    if pr_kind == "renovate_digest_only":
-        checks.append("verify no functional changes beyond lockfile hashes")
-    elif pr_kind == "dependency_upgrade":
-        checks.append("check for breaking API changes in updated dependencies")
-        checks.append("run full test suite after upgrade")
-    elif pr_kind == "k8s_manifest":
-        checks.append("validate manifest against target cluster version")
-        checks.append("check for resource quota / limit changes")
-    elif pr_kind == "auth_changes":
-        checks.append("review auth flow for regression")
-        checks.append("verify session token handling is correct")
-    elif pr_kind == "public_route_changes":
-        checks.append("verify route access controls are in place")
-        checks.append("check for unintended public endpoints")
-    elif pr_kind == "file_serving_changes":
-        checks.append("verify file path sanitization")
-        checks.append("check for directory traversal vulnerabilities")
-    elif pr_kind == "path_handling_changes":
-        checks.append("review for path traversal vulnerabilities")
-        checks.append("test with edge-case paths (null bytes, symlinks)")
-    elif pr_kind == "secret_handling_changes":
-        checks.append("verify secrets are not logged or exposed in diffs")
-        checks.append("check secret rotation impact")
-    elif pr_kind == "db_or_migration_changes":
-        checks.append("review migration for data loss risk")
-        checks.append("test migration on a copy of production schema")
-
-    if "linked_security_issue" in risk_flags:
-        checks.append("explicitly address the linked security issue")
-    if "linked_audit_issue" in risk_flags:
-        checks.append("verify audit findings are addressed")
-    if "linked_priority_p0" in risk_flags:
-        checks.append("treat as critical — verify all changes thoroughly")
-    if "linked_priority_p1" in risk_flags:
-        checks.append("treat as high priority — verify correctness carefully")
+    for key in [pr_kind, *risk_flags]:
+        for check in KIND_CHECKS.get(key, []) + FLAG_CHECKS.get(key, []):
+            if check not in seen:
+                seen.add(check)
+                checks.append(check)
 
     return checks
 

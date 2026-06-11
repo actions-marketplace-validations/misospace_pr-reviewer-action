@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Bash >= 4 required: empty-array expansion under `set -u` and other 4.x
+# behaviors break on macOS stock bash 3.2. Skip (not fail) so local runs
+# explain themselves; CI runs bash 5.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "SKIP: bash >= 4 required (found ${BASH_VERSION:-unknown}); on macOS run with PATH=\"/opt/homebrew/bin:\$PATH\"" >&2
+  exit 0
+fi
+
 # Tests for incremental PR review scope feature
 # Validates review_scope input, effective scope resolution, metadata tracking, and verdict safety.
 
@@ -88,9 +96,9 @@ case "\$1" in
     ;;
   "api")
     if echo "\$*" | grep -q 'comments'; then
-      RESULT="$(cat /tmp/testfp_comments.json)"
+      RESULT="\$(cat /tmp/testfp_comments.json)"
     elif echo "\$*" | grep -q 'pulls/42'; then
-      RESULT="$(printf '{"head":{"repo":{"full_name":"test/repo"}},"base":{"repo":{"full_name":"test/repo"},"sha":"%s"}}' "\$PR_BASE_SHA")"
+      RESULT="\$(printf '{"head":{"repo":{"full_name":"test/repo"}},"base":{"repo":{"full_name":"test/repo"},"sha":"%s"}}' "\$PR_BASE_SHA")"
     elif echo "\$*" | grep -q 'compare/'; then
       RESULT='{"status":"ok"}'
     else
@@ -126,7 +134,11 @@ chmod +x "$TMPDIR/bin/git"
 run_precheck() {
   local output_file="$TMPDIR/out_$RANDOM$RANDOM"
   printf '%s' "$FIXED_DIFF" > /tmp/testfp_diff
+  # The precheck writes pr.diff / pr-object.json into its CWD; run it in a
+  # scratch workdir so test runs do not litter the repository root.
+  rm -rf "$TMPDIR/work" && mkdir -p "$TMPDIR/work"
   (
+    cd "$TMPDIR/work" || exit 1
     export PATH="$TMPDIR/bin:$PATH"
     export PR_HEAD_SHA="$PR_HEAD_SHA"
     export PR_BASE_SHA="$PR_BASE_SHA"
@@ -177,9 +189,6 @@ set_pr_data() {
   if [ -n "$PR_BASE_SHA" ]; then
     echo "$PR_BASE_SHA" >> "$SHA_TRACK_FILE"
   fi
-  cat > pr.json <<JSONEOF
-{"number":42,"title":"Test PR","headRefOid":"${PR_HEAD_SHA}","baseRefName":"main","headRefName":"feature","author":{"login":"test"},"changedFiles":1,"additions":1,"deletions":0,"files":[],"url":"https://github.com/test/repo/pull/42"}
-JSONEOF
 }
 
 # ── Test 1: review_scope=full always does full review ─────────────────

@@ -7,6 +7,7 @@ COMMENT_MARKER="${COMMENT_MARKER:-<!-- ai-pr-reviewer -->}"
 SKIP_IF_DIFF_UNCHANGED="${SKIP_IF_DIFF_UNCHANGED:-true}"
 OUTPUT_FILE="${GITHUB_OUTPUT:-/dev/null}"
 REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
+PUBLISH_MODE="${PUBLISH_MODE:-comment}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}/..${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -16,7 +17,14 @@ if [[ -z "$REPO" || -z "$PR_NUMBER" ]]; then
 fi
 
 # ── Diff fingerprint (unchanged) ──────────────────────────────────────
-current_fingerprint="$(gh pr diff "$PR_NUMBER" --repo "$REPO" | git patch-id --stable | awk 'NR == 1 { print $1 }')"
+# Tolerate a failing `gh pr diff` (network/auth blip) so the precheck degrades
+# to a fresh review instead of aborting the action. The diff is saved to
+# pr.diff so run_review.sh can reuse it instead of fetching it a second time —
+# this also guarantees the reviewed diff is the one that was fingerprinted.
+if ! gh pr diff "$PR_NUMBER" --repo "$REPO" > pr.diff 2>/dev/null; then
+  : > pr.diff
+fi
+current_fingerprint="$(git patch-id --stable < pr.diff | awk 'NR == 1 { print $1 }' || true)"
 if [[ -z "$current_fingerprint" ]]; then
   current_fingerprint="empty-diff"
 fi
@@ -38,6 +46,18 @@ compute_config_hash() {
   fi
   if [[ -n "${AI_API_FORMAT:-}" ]]; then
     parts+=("api_format:${AI_API_FORMAT}")
+  fi
+  # Sampling / output-format params affect the review, so a change forces a
+  # fresh review even on an unchanged diff. AI_TEMPERATURE may be intentionally
+  # empty (means "omit"), so include it whenever the var is set at all.
+  if [[ -n "${AI_TEMPERATURE+x}" ]]; then
+    parts+=("temperature:${AI_TEMPERATURE}")
+  fi
+  if [[ -n "${AI_RESPONSE_FORMAT:-}" ]]; then
+    parts+=("response_format:${AI_RESPONSE_FORMAT}")
+  fi
+  if [[ -n "${AI_TOKENS_PARAM:-}" ]]; then
+    parts+=("tokens_param:${AI_TOKENS_PARAM}")
   fi
   if [[ -n "${AI_FALLBACK_MODEL:-}" ]]; then
     parts+=("fallback_model:${AI_FALLBACK_MODEL}")
@@ -83,6 +103,9 @@ compute_config_hash() {
   # Context limit mode
   if [[ -n "${CONTEXT_LIMIT_MODE:-}" ]]; then
     parts+=("context_limit:${CONTEXT_LIMIT_MODE}")
+  fi
+  if [[ -n "${MODEL_CONTEXT_TOKENS:-}" ]]; then
+    parts+=("model_context_tokens:${MODEL_CONTEXT_TOKENS}")
   fi
 
   # Evidence provider config
@@ -139,6 +162,20 @@ compute_config_hash() {
     parts+=("tool_forks:${TOOL_ENABLE_FOR_FORKS}")
   fi
 
+  # Model routing (#159): a routing change must force a fresh review
+  if [[ -n "${REVIEW_ROUTING_MODE:-}" ]]; then
+    parts+=("routing_mode:${REVIEW_ROUTING_MODE}")
+  fi
+  if [[ -n "${AI_FAST_MODEL:-}" ]]; then
+    parts+=("fast_model:${AI_FAST_MODEL}")
+  fi
+  if [[ -n "${AI_SMART_MODEL:-}" ]]; then
+    parts+=("smart_model:${AI_SMART_MODEL}")
+  fi
+  if [[ -n "${ESCALATE_ON_RISK_FLAGS:-}" ]]; then
+    parts+=("escalate_flags:${ESCALATE_ON_RISK_FLAGS}")
+  fi
+
   # Review scope
   if [[ -n "${REVIEW_SCOPE:-}" ]]; then
     parts+=("review_scope:${REVIEW_SCOPE}")
@@ -157,16 +194,39 @@ config_hash="$(compute_config_hash)"
 # Broader fingerprint = patch_id + config_hash (pipe-delimited)
 broad_fingerprint="${current_fingerprint}|cfg:${config_hash}"
 
-# ── Last review comment lookup ────────────────────────────────────────
-last_comment_body="$({
-  gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" | \
+# ── Last managed review body lookup ───────────────────────────────────
+# The managed body lives in a different place depending on publish mode:
+# `comment` and `review_comment` write an issue comment; `review_verdict`
+# submits a native PR review. Look in the right place so skip-if-unchanged
+# and incremental scope can find prior state in every mode.
+last_managed_comment_body() {
+  gh api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100" 2>/dev/null | \
     jq -r --arg marker "$COMMENT_MARKER" '
       [ .[] | select((.body // "") | contains($marker)) ]
       | sort_by(.updated_at // .created_at)
       | last
       | .body // empty
     '
-} || true)"
+}
+
+last_managed_review_body() {
+  gh api "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" 2>/dev/null | \
+    jq -r --arg marker "$COMMENT_MARKER" '
+      [ .[] | select((.body // "") | contains($marker)) ]
+      | sort_by(.submitted_at // "")
+      | last
+      | .body // empty
+    '
+}
+
+case "$(printf '%s' "$PUBLISH_MODE" | tr '[:upper:]' '[:lower:]')" in
+  review_verdict)
+    last_comment_body="$(last_managed_review_body || true)"
+    ;;
+  *)
+    last_comment_body="$(last_managed_comment_body || true)"
+    ;;
+esac
 
 # Extract the PR head SHA and broad fingerprint from the last published comment.
 # ai-pr-review-sha: stored for future out-of-date detection (not yet used in skip logic).
@@ -179,6 +239,25 @@ skip_reason=""
 if [[ "$SKIP_IF_DIFF_UNCHANGED" == "true" && -n "$last_broad_fingerprint" && "$last_broad_fingerprint" == "$broad_fingerprint" ]]; then
   should_review=false
   skip_reason="diff-unchanged"
+fi
+
+# ── Short-circuit when no review will run ─────────────────────────────
+# Scope resolution below costs a PR-object fetch plus (potentially) a compare
+# API call — all of it feeds steps that are gated on should_review=true, so
+# skip it entirely when the review is being skipped.
+if [[ "$should_review" == "false" ]]; then
+  {
+    echo "effective_review_scope=full"
+    echo "previous_head_sha="
+    echo "baseline_clean=false"
+    echo "head_sha="
+    echo "base_sha="
+    echo "is_fork_pr="
+    echo "diff_fingerprint=$broad_fingerprint"
+    echo "should_review=$should_review"
+    echo "skip_reason=$skip_reason"
+  } >> "$OUTPUT_FILE"
+  exit 0
 fi
 
 # ── Review scope resolution ───────────────────────────────────────────
@@ -195,17 +274,49 @@ extract_review_metadata() {
   LAST_REVIEW_SCOPE=""
   LAST_REVIEW_RESULT=""
   
-  # Use Python to parse the JSON marker reliably (handles embedded quotes)
+  # Use Python to parse the JSON marker reliably (handles embedded quotes).
+  # The comment body is attacker-controllable (any user can post a comment
+  # carrying the marker), and the output of this helper is eval'd below, so
+  # every field is sanitized to a safe character set first: SHAs to hex, the
+  # scope/result enums to lowercase letters and underscores. This prevents
+  # shell-command injection through crafted metadata markers.
+  #
+  # open_findings (carried forward for incremental cumulative verdicts, #193)
+  # never touches the eval path: it is sanitized field-by-field in Python and
+  # written straight to previous-findings.json for the review step.
   eval "$(printf '%s' "$comment_body" | python3 -c "
-import sys
+import json, re, sys
 sys.path.insert(0, '.')
 from pr_reviewer.metadata import parse_metadata
 data = parse_metadata(sys.stdin.read())
 if data:
-    print(f'LAST_HEAD_SHA={data.get(\"head_sha\", \"\")}')
-    print(f'LAST_BASE_SHA={data.get(\"base_sha\", \"\")}')
-    print(f'LAST_REVIEW_SCOPE={data.get(\"review_scope\", \"\")}')
-    print(f'LAST_REVIEW_RESULT={data.get(\"review_result\", \"\")}')
+    def hexsan(v):
+        return re.sub(r'[^0-9a-fA-F]', '', str(v or ''))[:64]
+    def enumsan(v):
+        return re.sub(r'[^a-z_]', '', str(v or '').lower())[:32]
+    print(f'LAST_HEAD_SHA={hexsan(data.get(\"head_sha\"))}')
+    print(f'LAST_BASE_SHA={hexsan(data.get(\"base_sha\"))}')
+    print(f'LAST_REVIEW_SCOPE={enumsan(data.get(\"review_scope\"))}')
+    print(f'LAST_REVIEW_RESULT={enumsan(data.get(\"review_result\"))}')
+    raw = data.get('open_findings')
+    sanitized = []
+    if isinstance(raw, list):
+        for item in raw[:20]:
+            if not isinstance(item, dict):
+                continue
+            message = item.get('message')
+            if not isinstance(message, str) or not message.strip():
+                continue
+            line = item.get('line')
+            sanitized.append({
+                'severity': enumsan(item.get('severity')),
+                'category': enumsan(item.get('category')),
+                'file': str(item.get('file'))[:200] if isinstance(item.get('file'), str) else None,
+                'line': line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None,
+                'message': re.sub(r'[\\x00-\\x08\\x0b-\\x1f<>]', '', message)[:200],
+            })
+    with open('previous-findings.json', 'w', encoding='utf-8') as fh:
+        json.dump(sanitized, fh, ensure_ascii=False)
 " 2>/dev/null || true)"
 }
 
@@ -305,9 +416,16 @@ if [[ -n "$last_comment_body" ]]; then
   extract_review_metadata "$last_comment_body"
 fi
 
-# Get current PR head/base SHAs
-CURRENT_HEAD_SHA="$(jq -r '.headRefOid' pr.json 2>/dev/null || echo "")"
-CURRENT_BASE_SHA="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.base.sha' 2>/dev/null || echo "")"
+# Get the current PR object once. This is the single PR-object fetch point for
+# the whole action: the head/base SHAs drive scope resolution here, and the
+# object is saved to pr-object.json so run_review.sh (and the publish steps,
+# via the is_fork_pr output) do not have to fetch it again.
+if ! gh api "repos/$REPO/pulls/$PR_NUMBER" > pr-object.json 2>/dev/null; then
+  echo '{}' > pr-object.json
+fi
+CURRENT_HEAD_SHA="$(jq -r '.head.sha // ""' pr-object.json 2>/dev/null || echo "")"
+CURRENT_BASE_SHA="$(jq -r '.base.sha // ""' pr-object.json 2>/dev/null || echo "")"
+IS_FORK_PR="$(jq -r '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' pr-object.json 2>/dev/null || echo "")"
 
 # Resolve effective review scope
 resolve_review_scope "$REVIEW_SCOPE" "$LAST_HEAD_SHA" "$LAST_BASE_SHA" \
@@ -317,6 +435,12 @@ resolve_review_scope "$REVIEW_SCOPE" "$LAST_HEAD_SHA" "$LAST_BASE_SHA" \
 echo "effective_review_scope=$EFFECTIVE_SCOPE" >> "$OUTPUT_FILE"
 echo "previous_head_sha=$PREVIOUS_HEAD_SHA" >> "$OUTPUT_FILE"
 echo "baseline_clean=$BASELINE_CLEAN" >> "$OUTPUT_FILE"
+
+# Forward the PR facts fetched above so later steps can reuse them instead of
+# re-fetching the PR object.
+echo "head_sha=$CURRENT_HEAD_SHA" >> "$OUTPUT_FILE"
+echo "base_sha=$CURRENT_BASE_SHA" >> "$OUTPUT_FILE"
+echo "is_fork_pr=$IS_FORK_PR" >> "$OUTPUT_FILE"
 
 echo "diff_fingerprint=$broad_fingerprint" >> "$OUTPUT_FILE"
 echo "should_review=$should_review" >> "$OUTPUT_FILE"

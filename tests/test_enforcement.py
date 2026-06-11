@@ -14,6 +14,7 @@ from pr_reviewer.enforcement import (
     apply_evidence_blocker_enforcement,
     apply_tool_harness_failure_enforcement,
     apply_tool_min_successful_enforcement,
+    apply_verdict_policy,
     normalize_enforced_review_markdown,
     apply_all_enforcement,
     _get_tool_harness_failure_reason,
@@ -393,6 +394,84 @@ class TestApplyAllEnforcement:
         assert updated["verdict"] == "request_changes"
         assert "insufficient evidence" in updated["review_markdown"].lower()
         assert "requires at least 3" in updated["review_markdown"].lower()
+
+
+class TestApplyVerdictPolicy:
+    def _write(self, tmp_path, verdict, findings=None):
+        out = tmp_path / "ai-output.json"
+        data = {"verdict": verdict, "review_markdown": "Review body."}
+        if findings is not None:
+            data["findings"] = findings
+        out.write_text(json.dumps(data))
+        return out
+
+    def _blocker(self):
+        return {"severity": "blocker", "category": "bug", "file": "a.py", "line": 1, "message": "bad"}
+
+    def _minor(self):
+        return {"severity": "minor", "category": "style", "file": None, "line": None, "message": "meh"}
+
+    def test_model_policy_is_a_no_op(self, tmp_path):
+        out = self._write(tmp_path, "approve", [self._blocker()])
+        source = apply_verdict_policy("model", str(out))
+        data = json.loads(out.read_text())
+        assert source == "model"
+        assert data["verdict"] == "approve"
+        assert data["verdict_source"] == "model"
+
+    def test_gated_blocker_forces_request_changes(self, tmp_path):
+        out = self._write(tmp_path, "approve", [self._minor(), self._blocker()])
+        source = apply_verdict_policy("findings_severity_gated", str(out))
+        data = json.loads(out.read_text())
+        assert source == "findings"
+        assert data["verdict"] == "request_changes"
+        assert data["verdict_source"] == "findings"
+        assert "derived from structured findings" in data["review_markdown"]
+
+    def test_gated_no_blockers_approves(self, tmp_path):
+        out = self._write(tmp_path, "request_changes", [self._minor()])
+        source = apply_verdict_policy("findings_severity_gated", str(out))
+        data = json.loads(out.read_text())
+        assert source == "findings"
+        assert data["verdict"] == "approve"
+
+    def test_gated_without_findings_falls_back_to_model(self, tmp_path):
+        out = self._write(tmp_path, "request_changes", [])
+        source = apply_verdict_policy("findings_severity_gated", str(out))
+        data = json.loads(out.read_text())
+        assert source == "model"
+        assert data["verdict"] == "request_changes"
+        assert data["verdict_source"] == "model"
+
+    def test_gated_with_absent_findings_key_falls_back(self, tmp_path):
+        out = self._write(tmp_path, "approve")
+        source = apply_verdict_policy("findings_severity_gated", str(out))
+        assert source == "model"
+        assert json.loads(out.read_text())["verdict"] == "approve"
+
+    def test_unchanged_verdict_adds_no_note(self, tmp_path):
+        out = self._write(tmp_path, "request_changes", [self._blocker()])
+        apply_verdict_policy("findings_severity_gated", str(out))
+        data = json.loads(out.read_text())
+        assert data["verdict"] == "request_changes"
+        assert "derived from structured findings" not in data["review_markdown"]
+
+    def test_enforcement_still_overrides_gated_approve(self, tmp_path):
+        out = self._write(tmp_path, "approve", [self._minor()])
+        evidence = tmp_path / "evidence-providers.json"
+        evidence.write_text(json.dumps({
+            "has_blocker": True,
+            "providers": [{"id": "sec-scan", "provider_severity": "blocker"}],
+        }))
+        apply_verdict_policy("findings_severity_gated", str(out))
+        apply_all_enforcement(
+            evidence_blocker_enabled=True,
+            evidence_path=str(evidence),
+            tool_harness_path=str(tmp_path / "missing.json"),
+            output_path=str(out),
+        )
+        data = json.loads(out.read_text())
+        assert data["verdict"] == "request_changes"
 
 
 if __name__ == "__main__":

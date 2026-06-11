@@ -2,8 +2,11 @@
 
 
 def test_anthropic_payload_includes_max_tokens():
-    """Anthropic-compatible payloads must include max_tokens."""
-    with open("scripts/run_review.sh") as f:
+    """Anthropic-compatible payloads must include max_tokens.
+
+    build_model_request lives in scripts/model_call.sh (sourced by run_review.sh).
+    """
+    with open("scripts/model_call.sh") as f:
         content = f.read()
 
     assert "anthropic" in content
@@ -12,17 +15,22 @@ def test_anthropic_payload_includes_max_tokens():
 
 
 def test_openai_payload_includes_max_tokens():
-    """OpenAI-compatible payloads must include max_tokens (issue #38)."""
-    with open("scripts/run_review.sh") as f:
+    """OpenAI-compatible payloads must include the token limit (issue #38)."""
+    with open("scripts/model_call.sh") as f:
         content = f.read()
 
-    # Both branches should contain max_tokens:$max_tokens in their jq expressions
-    assert "max_tokens:$max_tokens" in content
+    # The OpenAI branch sends the limit under a configurable field name, while
+    # the anthropic branch keeps the literal max_tokens key.
+    assert "max_tokens:$max_tokens" in content or "($tokfield): $max_tokens" in content
 
 
 def test_openai_uses_chat_completions_endpoint():
-    """OpenAI-compatible requests must target /chat/completions."""
-    with open("scripts/run_review.sh") as f:
+    """OpenAI-compatible requests must target /chat/completions.
+
+    curl_model (which builds the endpoint) lives in scripts/model_call.sh,
+    sourced by run_review.sh.
+    """
+    with open("scripts/model_call.sh") as f:
         content = f.read()
 
     assert "chat/completions" in content
@@ -30,7 +38,7 @@ def test_openai_uses_chat_completions_endpoint():
 
 def test_anthropic_uses_messages_endpoint():
     """Anthropic requests must target /messages."""
-    with open("scripts/run_review.sh") as f:
+    with open("scripts/model_call.sh") as f:
         content = f.read()
 
     assert "/messages" in content

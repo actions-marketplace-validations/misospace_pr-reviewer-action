@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Bash >= 4 required: empty-array expansion under `set -u` and other 4.x
+# behaviors break on macOS stock bash 3.2. Skip (not fail) so local runs
+# explain themselves; CI runs bash 5.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "SKIP: bash >= 4 required (found ${BASH_VERSION:-unknown}); on macOS run with PATH=\"/opt/homebrew/bin:\$PATH\"" >&2
+  exit 0
+fi
+
 # Tests for PR verdict safety: incremental reviews require clean full baseline for approval
 
 PASS=0
@@ -102,8 +110,12 @@ check_exists "action.yml has EFFECTIVE_SCOPE reference in verdict step" \
   "$(grep -c 'EFFECTIVE_SCOPE' "$ACTION_YML" || echo 0)"
 check_exists "action.yml has BASELINE_CLEAN reference in verdict step" \
   "$(grep -c 'BASELINE_CLEAN' "$ACTION_YML" || echo 0)"
-check_exists "action.yml has incremental disclaimer text" \
-  "$(grep -c 'incremental delta review' "$ACTION_YML" || echo 0)"
+check_exists "action.yml marks incremental reviews in the header" \
+  "$(grep -c 'AI Automated Review (incremental)' "$ACTION_YML" || echo 0)"
+check_exists "action.yml has carried-forward disclaimer text" \
+  "$(grep -c 'carried forward' "$ACTION_YML" || echo 0)"
+check_exists "action.yml explains dirty-baseline withheld approvals" \
+  "$(grep -c 'Approval withheld' "$ACTION_YML" || echo 0)"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

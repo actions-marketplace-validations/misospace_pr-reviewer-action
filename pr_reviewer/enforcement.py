@@ -15,7 +15,7 @@ from pathlib import Path
 def apply_evidence_blocker_enforcement(
     evidence_path: str = "evidence-providers.json",
     output_path: str = "ai-output.json",
-) -> bool:
+) -> tuple[bool, str]:
     """Override verdict to request_changes if any evidence provider reported a blocker.
 
     Parameters
@@ -27,8 +27,8 @@ def apply_evidence_blocker_enforcement(
 
     Returns
     -------
-    bool
-        True if enforcement was applied, False otherwise.
+    tuple[bool, str]
+        (applied, reason) — reason is empty when not applied.
     """
     if not Path(evidence_path).exists():
         return False, ""
@@ -48,7 +48,6 @@ def apply_evidence_blocker_enforcement(
     ids_str = ", ".join(blocker_ids)
 
     data = json.loads(Path(output_path).read_text(encoding="utf-8", errors="replace"))
-    verdict = data.get("verdict")
     markdown = str(data.get("review_markdown") or "")
 
     markdown = (
@@ -118,7 +117,7 @@ def _harness_requested_tools(tool_harness_path: str = "tool-harness.json") -> bo
 def apply_tool_harness_failure_enforcement(
     tool_harness_path: str = "tool-harness.json",
     output_path: str = "ai-output.json",
-) -> bool:
+) -> tuple[bool, str]:
     """Override verdict to request_changes if tool harness planning or execution failed.
 
     Parameters
@@ -130,8 +129,8 @@ def apply_tool_harness_failure_enforcement(
 
     Returns
     -------
-    bool
-        True if enforcement was applied, False otherwise.
+    tuple[bool, str]
+        (applied, reason) — reason is empty when not applied.
     """
     reason = _get_tool_harness_failure_reason(tool_harness_path)
     if not reason:
@@ -163,7 +162,7 @@ def apply_tool_min_successful_enforcement(
     min_required: int,
     tool_harness_path: str = "tool-harness.json",
     output_path: str = "ai-output.json",
-) -> bool:
+) -> tuple[bool, str]:
     """Override verdict to request_changes if fewer than ``min_required`` tool requests succeeded.
 
     Parameters
@@ -177,8 +176,8 @@ def apply_tool_min_successful_enforcement(
 
     Returns
     -------
-    bool
-        True if enforcement was applied, False otherwise.
+    tuple[bool, str]
+        (applied, reason) — reason is empty when not applied.
     """
     successful = _count_successful_requests(tool_harness_path)
     if successful >= min_required:
@@ -249,6 +248,56 @@ def normalize_enforced_review_markdown(
 
         data["review_markdown"] = markdown
         Path(output_path).write_text(json.dumps(data, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def apply_verdict_policy(
+    policy: str = "model",
+    output_path: str = "ai-output.json",
+) -> str:
+    """Derive the verdict from structured findings when configured.
+
+    ``model`` (default) leaves the model's verdict untouched. With
+    ``findings_severity_gated`` the verdict is computed deterministically from
+    the findings array: ``request_changes`` iff any blocker-severity finding
+    exists, otherwise ``approve``. When the model produced no findings the
+    policy falls back to the model verdict, so weaker models degrade to
+    today's behaviour. Enforcement overlays (evidence blockers, tool-harness
+    failure) run after this and can still force ``request_changes``.
+
+    Returns the verdict source applied: ``"model"`` or ``"findings"``. The
+    source is also recorded in the output JSON as ``verdict_source``.
+    """
+    data = json.loads(Path(output_path).read_text(encoding="utf-8", errors="replace"))
+    findings = data.get("findings")
+    source = "model"
+
+    if (
+        policy == "findings_severity_gated"
+        and isinstance(findings, list)
+        and findings
+    ):
+        blockers = [
+            f
+            for f in findings
+            if isinstance(f, dict) and f.get("severity") == "blocker"
+        ]
+        derived = "request_changes" if blockers else "approve"
+        if derived != data.get("verdict"):
+            note = (
+                f"\n\n_Verdict derived from structured findings "
+                f"(verdict_policy=findings_severity_gated): "
+                f"{len(blockers)} blocker finding(s) out of {len(findings)}; "
+                f"model verdict was '{data.get('verdict')}'._"
+            )
+            data["review_markdown"] = str(data.get("review_markdown") or "") + note
+        data["verdict"] = derived
+        source = "findings"
+
+    data["verdict_source"] = source
+    Path(output_path).write_text(
+        json.dumps(data, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    return source
 
 
 def apply_all_enforcement(

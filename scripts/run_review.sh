@@ -56,6 +56,11 @@ AI_API_FORMAT="${AI_API_FORMAT:-openai}"
 AI_MODEL="${AI_MODEL:-}"
 AI_API_KEY="${AI_API_KEY:-}"
 AI_MAX_TOKENS="${AI_MAX_TOKENS:-4096}"
+# Single-dash default: an explicitly empty AI_TEMPERATURE is preserved (it means
+# "omit the field"); only an unset value falls back to 0.1.
+AI_TEMPERATURE="${AI_TEMPERATURE-0.1}"
+AI_RESPONSE_FORMAT="${AI_RESPONSE_FORMAT:-off}"
+AI_TOKENS_PARAM="${AI_TOKENS_PARAM:-max_tokens}"
 ANTHROPIC_VERSION="${ANTHROPIC_VERSION:-2023-06-01}"
 AI_FALLBACK_BASE_URL="${AI_FALLBACK_BASE_URL:-}"
 AI_FALLBACK_API_FORMAT="${AI_FALLBACK_API_FORMAT:-}"
@@ -80,7 +85,7 @@ EVIDENCE_ENABLE_FOR_FORKS="${EVIDENCE_ENABLE_FOR_FORKS:-false}"
 TOOL_MODE="${TOOL_MODE:-off}"
 TOOL_MAX_REQUESTS="${TOOL_MAX_REQUESTS:-4}"
 TOOL_MAX_RESPONSE_BYTES="${TOOL_MAX_RESPONSE_BYTES:-12000}"
-TOOL_PLANNING_TIMEOUT_SEC="${TOOL_PLANNING_TIMEOUT_SEC:-30}"
+TOOL_PLANNING_TIMEOUT_SEC="${TOOL_PLANNING_TIMEOUT_SEC:-60}"
 TOOL_PLANNING_MAX_CONTEXT_BYTES="${TOOL_PLANNING_MAX_CONTEXT_BYTES:-50000}"
 TOOL_PLANNING_MAX_TOKENS="${TOOL_PLANNING_MAX_TOKENS:-400}"
 TOOL_REQUEST_TIMEOUT_SEC="${TOOL_REQUEST_TIMEOUT_SEC:-20}"
@@ -93,12 +98,59 @@ AI_CONNECT_TIMEOUT_SEC="${AI_CONNECT_TIMEOUT_SEC:-30}"
 AI_FALLBACK_REQUEST_TIMEOUT_SEC="${AI_FALLBACK_REQUEST_TIMEOUT_SEC:-${AI_REQUEST_TIMEOUT_SEC}}"
 AI_FALLBACK_CONNECT_TIMEOUT_SEC="${AI_FALLBACK_CONNECT_TIMEOUT_SEC:-${AI_CONNECT_TIMEOUT_SEC}}"
 OUTPUT_FILE="${GITHUB_OUTPUT:-/dev/null}"
+ON_MODEL_FAILURE="${ON_MODEL_FAILURE:-fail}"
+VERDICT_POLICY="${VERDICT_POLICY:-model}"
+VALIDATE_REQUIRED_CHECKS="${VALIDATE_REQUIRED_CHECKS:-auto}"
+REQUIRED_CHECK_VALIDATION_MODE="${REQUIRED_CHECK_VALIDATION_MODE:-warn}"
+REVIEW_ROUTING_MODE="${REVIEW_ROUTING_MODE:-off}"
+AI_FAST_BASE_URL="${AI_FAST_BASE_URL:-}"
+AI_FAST_MODEL="${AI_FAST_MODEL:-}"
+AI_FAST_API_FORMAT="${AI_FAST_API_FORMAT:-}"
+AI_FAST_API_KEY="${AI_FAST_API_KEY:-}"
+AI_SMART_BASE_URL="${AI_SMART_BASE_URL:-}"
+AI_SMART_MODEL="${AI_SMART_MODEL:-}"
+AI_SMART_API_FORMAT="${AI_SMART_API_FORMAT:-}"
+AI_SMART_API_KEY="${AI_SMART_API_KEY:-}"
+ESCALATE_ON_RISK_FLAGS="${ESCALATE_ON_RISK_FLAGS:-linked_security_issue,linked_priority_p0,linked_priority_p1,auth_changes,public_route_changes,file_serving_changes,path_handling_changes,secret_handling_changes,db_or_migration_changes}"
+ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS="${ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS:-true}"
+ESCALATE_ON_FAST_REQUEST_CHANGES="${ESCALATE_ON_FAST_REQUEST_CHANGES:-true}"
+ESCALATE_ON_FAST_LOW_CONFIDENCE="${ESCALATE_ON_FAST_LOW_CONFIDENCE:-true}"
+ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS="${ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS:-true}"
+ESCALATE_ON_TOOL_PLANNING_FAILURE="${ESCALATE_ON_TOOL_PLANNING_FAILURE:-false}"
+ESCALATE_ON_DIRTY_BASELINE="${ESCALATE_ON_DIRTY_BASELINE:-true}"
+# Default true: only the precheck can assert a dirty baseline; standalone runs
+# (smoke test, manual) have no baseline signal and must not over-escalate.
+BASELINE_CLEAN="${BASELINE_CLEAN:-true}"
 REVIEW_SCOPE="${REVIEW_SCOPE:-auto}"
 EFFECTIVE_SCOPE="${EFFECTIVE_SCOPE:-full}"
 PREVIOUS_HEAD_SHA="${PREVIOUS_HEAD_SHA:-}"
 ENRICHMENT_BUDGET_SEC="${ENRICHMENT_BUDGET_SEC:-60}"
 
 apply_context_limits() {
+  # When MODEL_CONTEXT_TOKENS is set, derive byte budgets from the model's real
+  # context window instead of the coarse named modes. This matters for local
+  # models (ollama/llama.cpp/vLLM) whose windows are often 8k-32k — the named
+  # 'normal' mode alone is ~55-70k tokens and silently overflows them.
+  local ctx="${MODEL_CONTEXT_TOKENS:-}"
+  if [[ "$ctx" =~ ^[0-9]+$ && "$ctx" -gt 0 ]]; then
+    # Reserve output tokens plus headroom for the system prompt, standards
+    # section and formatting; convert the remainder to bytes conservatively
+    # (~3 bytes/token, which under-fills rather than overflows).
+    local reserve=$(( AI_MAX_TOKENS + 2000 ))
+    local usable=$(( ctx - reserve ))
+    if [[ "$usable" -lt 2000 ]]; then
+      usable=2000
+    fi
+    local total_bytes=$(( usable * 3 ))
+    MAX_CORPUS="$total_bytes"
+    MAX_DIFF=$(( total_bytes * 6 / 10 ))
+    MAX_FILES=$(( total_bytes * 15 / 100 ))
+    [[ "$MAX_DIFF" -lt 2000 ]] && MAX_DIFF=2000
+    [[ "$MAX_FILES" -lt 1000 ]] && MAX_FILES=1000
+    log "Context budget from MODEL_CONTEXT_TOKENS=${ctx}: corpus=${MAX_CORPUS}B diff=${MAX_DIFF}B files=${MAX_FILES}B (output reserve=${AI_MAX_TOKENS})"
+    return
+  fi
+
   case "${CONTEXT_LIMIT_MODE:-normal}" in
     minimal)
       MAX_DIFF=40000; MAX_FILES=20000; MAX_CORPUS=60000 ;;
@@ -109,6 +161,27 @@ apply_context_limits() {
   esac
 }
 apply_context_limits
+
+# Truncate SRC into DST at a UTF-8 / newline boundary (never mid-character or
+# mid-line), appending MARKER when truncation occurred. Replaces bare `head -c`,
+# which split multibyte characters and JSON/code fences and confused weak models.
+truncate_clean() {
+  local src="$1" dst="$2" max="$3" marker="${4:-…[content truncated]}"
+  MARKER="$marker" python3 - "$src" "$dst" "$max" <<'PY'
+import os, sys
+src, dst, max_b = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = open(src, "rb").read() if os.path.exists(src) else b""
+if len(data) <= max_b:
+    open(dst, "wb").write(data)
+    sys.exit(0)
+clip = data[:max_b]
+nl = clip.rfind(b"\n")
+if nl > 0:
+    clip = clip[:nl]
+text = clip.decode("utf-8", errors="ignore")
+open(dst, "w", encoding="utf-8").write(text + "\n" + os.environ.get("MARKER", "") + "\n")
+PY
+}
 
 fetch_incremental_patch() {
   local previous_head="$1"
@@ -122,9 +195,17 @@ fetch_incremental_patch() {
   compare_url="$(gh api "repos/$REPO/compare/${previous_head}...${current_head}" --jq '.url' 2>/dev/null || echo "")"
 
   if [[ -n "$compare_url" ]]; then
-    curl -q -fsSL -H "Authorization: token $GH_TOKEN" \
+    # The token goes through a 0600 curl --config file rather than argv (same
+    # treatment as model API keys in model_call.sh) so it never appears in
+    # /proc/<pid>/cmdline on shared runners.
+    local auth_config
+    auth_config="$(mktemp)"
+    chmod 600 "$auth_config"
+    printf 'header = "%s"\n' "$(curl_config_escape "Authorization: token $GH_TOKEN")" > "$auth_config"
+    curl -q -fsSL --config "$auth_config" \
       -H "Accept: application/vnd.github.v3.diff" \
       "$compare_url" > "$output_file" 2>/dev/null || true
+    rm -f "$auth_config"
   fi
 
   if [[ ! -s "$output_file" ]]; then
@@ -168,6 +249,77 @@ if [[ ! "$AI_MAX_TOKENS" =~ ^[0-9]+$ || "$AI_MAX_TOKENS" -lt 1 ]]; then
   error "Invalid AI_MAX_TOKENS '$AI_MAX_TOKENS'; defaulting to 4096"
   AI_MAX_TOKENS=4096
 fi
+
+# AI_TEMPERATURE: empty means "omit the field"; otherwise must be numeric.
+if [[ -n "$AI_TEMPERATURE" && ! "$AI_TEMPERATURE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  error "Invalid AI_TEMPERATURE '$AI_TEMPERATURE'; defaulting to 0.1"
+  AI_TEMPERATURE=0.1
+fi
+
+case "$AI_RESPONSE_FORMAT" in
+  off|json_object|json_schema) ;;
+  *)
+    error "Invalid AI_RESPONSE_FORMAT '$AI_RESPONSE_FORMAT'; defaulting to off"
+    AI_RESPONSE_FORMAT=off
+    ;;
+esac
+
+case "$AI_TOKENS_PARAM" in
+  max_tokens|max_completion_tokens) ;;
+  *)
+    error "Invalid AI_TOKENS_PARAM '$AI_TOKENS_PARAM'; defaulting to max_tokens"
+    AI_TOKENS_PARAM=max_tokens
+    ;;
+esac
+
+case "$VERDICT_POLICY" in
+  model|findings_severity_gated) ;;
+  *)
+    error "Invalid VERDICT_POLICY '$VERDICT_POLICY'; defaulting to model"
+    VERDICT_POLICY=model
+    ;;
+esac
+
+case "$(printf '%s' "$VALIDATE_REQUIRED_CHECKS" | tr '[:upper:]' '[:lower:]')" in
+  auto|true|false) VALIDATE_REQUIRED_CHECKS="$(printf '%s' "$VALIDATE_REQUIRED_CHECKS" | tr '[:upper:]' '[:lower:]')" ;;
+  *)
+    error "Invalid VALIDATE_REQUIRED_CHECKS '$VALIDATE_REQUIRED_CHECKS'; defaulting to auto"
+    VALIDATE_REQUIRED_CHECKS=auto
+    ;;
+esac
+
+case "$(printf '%s' "$REQUIRED_CHECK_VALIDATION_MODE" | tr '[:upper:]' '[:lower:]')" in
+  warn|fail|metadata_only) REQUIRED_CHECK_VALIDATION_MODE="$(printf '%s' "$REQUIRED_CHECK_VALIDATION_MODE" | tr '[:upper:]' '[:lower:]')" ;;
+  *)
+    error "Invalid REQUIRED_CHECK_VALIDATION_MODE '$REQUIRED_CHECK_VALIDATION_MODE'; defaulting to warn"
+    REQUIRED_CHECK_VALIDATION_MODE=warn
+    ;;
+esac
+
+case "$(printf '%s' "$REVIEW_ROUTING_MODE" | tr '[:upper:]' '[:lower:]')" in
+  off|auto) REVIEW_ROUTING_MODE="$(printf '%s' "$REVIEW_ROUTING_MODE" | tr '[:upper:]' '[:lower:]')" ;;
+  *)
+    error "Invalid REVIEW_ROUTING_MODE '$REVIEW_ROUTING_MODE'; defaulting to off"
+    REVIEW_ROUTING_MODE=off
+    ;;
+esac
+
+if [[ -n "$AI_FAST_API_FORMAT" ]] && ! AI_FAST_API_FORMAT="$(normalize_api_format "$AI_FAST_API_FORMAT")"; then
+  error "Invalid AI_FAST_API_FORMAT '$AI_FAST_API_FORMAT'; expected openai or anthropic"
+  exit 1
+fi
+if [[ -n "$AI_SMART_API_FORMAT" ]] && ! AI_SMART_API_FORMAT="$(normalize_api_format "$AI_SMART_API_FORMAT")"; then
+  error "Invalid AI_SMART_API_FORMAT '$AI_SMART_API_FORMAT'; expected openai or anthropic"
+  exit 1
+fi
+
+ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS="$(printf '%s' "$ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS" | tr '[:upper:]' '[:lower:]')"
+ESCALATE_ON_FAST_REQUEST_CHANGES="$(printf '%s' "$ESCALATE_ON_FAST_REQUEST_CHANGES" | tr '[:upper:]' '[:lower:]')"
+ESCALATE_ON_FAST_LOW_CONFIDENCE="$(printf '%s' "$ESCALATE_ON_FAST_LOW_CONFIDENCE" | tr '[:upper:]' '[:lower:]')"
+ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS="$(printf '%s' "$ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS" | tr '[:upper:]' '[:lower:]')"
+ESCALATE_ON_TOOL_PLANNING_FAILURE="$(printf '%s' "$ESCALATE_ON_TOOL_PLANNING_FAILURE" | tr '[:upper:]' '[:lower:]')"
+ESCALATE_ON_DIRTY_BASELINE="$(printf '%s' "$ESCALATE_ON_DIRTY_BASELINE" | tr '[:upper:]' '[:lower:]')"
+BASELINE_CLEAN="$(printf '%s' "$BASELINE_CLEAN" | tr '[:upper:]' '[:lower:]')"
 
 if [[ -n "$AI_FALLBACK_BASE_URL" && -z "$AI_FALLBACK_MODEL" ]]; then
   error "AI_FALLBACK_MODEL is required when AI_FALLBACK_BASE_URL is set"
@@ -223,7 +375,7 @@ resolve_standards_file
 resolve_system_prompt
 
 case "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" in
-  off|plan_execute_once) ;;
+  off|plan_execute_once|plan_execute_loop) ;;
   *)
     error "Invalid TOOL_MODE '$TOOL_MODE'; defaulting to off"
     TOOL_MODE="off"
@@ -235,82 +387,12 @@ if [[ ! "$TOOL_MIN_SUCCESSFUL_REQUESTS" =~ ^[0-9]+$ ]]; then
   TOOL_MIN_SUCCESSFUL_REQUESTS=0
 fi
 
-curl_model() {
-  local base_url="$1"
-  local api_key="$2"
-  local api_format="$3"
-  local payload_file="$4"
-  local output_file="$5"
-  local stream="${6:-false}"
-  local request_timeout_sec="${7:-300}"
-  local connect_timeout_sec="${8:-30}"
+# curl_model is defined in scripts/model_call.sh so its HTTP-status handling
+# can be unit-tested independently of the main driver.
+source "${SCRIPT_DIR}/model_call.sh"
 
-  local endpoint
-  local auth_header=()
-  if [[ "$api_format" == "anthropic" ]]; then
-    endpoint="$base_url/messages"
-    auth_header=( -H "anthropic-version: $ANTHROPIC_VERSION" )
-    if [[ -n "$api_key" ]]; then
-      auth_header+=( -H "x-api-key: $api_key" )
-    fi
-  else
-    endpoint="$base_url/chat/completions"
-    if [[ -n "$api_key" ]]; then
-      auth_header=( -H "Authorization: Bearer $api_key" )
-    fi
-  fi
-
-  local args=(
-    -q
-    -fsSL
-    "$endpoint"
-    -H "Content-Type: application/json"
-    --data "@$payload_file"
-    --max-time "$request_timeout_sec"
-    --connect-timeout "$connect_timeout_sec"
-  )
-
-  args+=( "${auth_header[@]}" )
-
-  if [[ "$stream" == "true" ]]; then
-    args+=( --no-buffer )
-    if [[ "$api_format" == "anthropic" ]]; then
-      args+=( -H "Accept: text/event-stream" )
-    fi
-  fi
-
-  curl "${args[@]}" > "$output_file"
-}
-
-build_model_request() {
-  local api_format="$1"
-  local model="$2"
-  local system="$3"
-  local user="$4"
-  local corpus_file="$5"
-  local output_file="$6"
-  local stream="${7:-false}"
-
-  if [[ "$api_format" == "anthropic" ]]; then
-    jq -n \
-      --arg model "$model" \
-      --arg system "$system" \
-      --arg user "$user" \
-      --argjson max_tokens "$AI_MAX_TOKENS" \
-      --argjson stream "$stream" \
-      --rawfile corpus "$corpus_file" \
-      '{model:$model,max_tokens:$max_tokens,stream:$stream,system:$system,messages:[{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > "$output_file"
-  else
-    jq -n \
-      --arg model "$model" \
-      --arg system "$system" \
-      --arg user "$user" \
-      --argjson max_tokens "$AI_MAX_TOKENS" \
-      --argjson stream "$stream" \
-      --rawfile corpus "$corpus_file" \
-      '{model:$model,max_tokens:$max_tokens,stream:$stream,messages:[{role:"system",content:$system},{role:"user",content:($user + "\n\n" + $corpus)}],temperature:0.1}' > "$output_file"
-  fi
-}
+# build_model_request is defined in scripts/model_call.sh (sourced above) so the
+# request-payload shaping can be unit-tested independently of the main driver.
 
 reassemble_sse_response() {
   local response_file="$1"
@@ -337,8 +419,23 @@ apply_all_enforcement_wrapper() {
   local evidence_blocker_enabled="$1"
   local tool_failure_enabled="$2"
   local tool_min_successful="$3"
+  local verdict_policy="$4"
+  local validate_checks="$5"
+  local validation_mode="$6"
+  local carry_forward="$7"
   PYTHONPATH="${SCRIPT_DIR}/.." python3 -c "
-from pr_reviewer.enforcement import apply_all_enforcement
+from pr_reviewer.carry_forward import apply_carry_forward
+from pr_reviewer.completeness import apply_required_check_validation
+from pr_reviewer.enforcement import apply_all_enforcement, apply_verdict_policy
+# Order: carry-forward first (merges the previous review's unresolved
+# findings, so the verdict policy gates on the cumulative set and can itself
+# force request_changes on surviving blockers), then verdict policy, then
+# completeness validation, then enforcement overlays.
+if '$carry_forward' == 'true':
+    summary = apply_carry_forward()
+    print(f\"Carry-forward: carried={summary['carried']} resolved={summary['resolved']} open={summary['open']} forced_request_changes={summary['forced_request_changes']}\")
+apply_verdict_policy('$verdict_policy')
+apply_required_check_validation('$validate_checks', '$validation_mode')
 apply_all_enforcement(
   evidence_blocker_enabled=('$evidence_blocker_enabled' == 'true'),
   tool_failure_enabled=('$tool_failure_enabled' == 'true'),
@@ -350,20 +447,43 @@ apply_all_enforcement(
 section_timer_start "pr-context"
 log "Collecting PR context for #$PR_NUMBER in $REPO..."
 
-gh pr view "$PR_NUMBER" --repo "$REPO" \
-  --json number,title,body,headRefOid,baseRefName,headRefName,author,changedFiles,additions,deletions,files,url > pr.json
+# check_review_needed.sh (the precheck step) already fetched the PR object and
+# the full diff. Reuse them when present so the PR object and diff are each
+# fetched exactly once per run; fall back to fetching for standalone use
+# (smoke test, manual invocation).
+if [[ -s pr-object.json && "$(jq -r '.number // empty' pr-object.json 2>/dev/null)" == "$PR_NUMBER" ]]; then
+  log "Reusing PR object fetched by precheck"
+else
+  gh api "repos/$REPO/pulls/$PR_NUMBER" > pr-object.json
+fi
+jq '{number, title, body, headRefOid: .head.sha, baseRefName: .base.ref, headRefName: .head.ref, author: {login: (.user.login // "")}, changedFiles: .changed_files, additions, deletions, url: .html_url}' \
+  pr-object.json > pr.json
 
-IS_FORK_PR="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' 2>/dev/null || echo false)"
+IS_FORK_PR="$(jq -r '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' pr-object.json 2>/dev/null || echo false)"
 if [[ "$IS_FORK_PR" == "true" ]]; then
   log "Detected cross-repository pull request"
 fi
 
-gh pr diff "$PR_NUMBER" --repo "$REPO" > pr.diff
-head -c "$MAX_DIFF" pr.diff > pr.diff.truncated
+if [[ -s pr.diff ]]; then
+  log "Reusing PR diff fetched by precheck"
+else
+  gh pr diff "$PR_NUMBER" --repo "$REPO" > pr.diff
+fi
+truncate_clean pr.diff pr.diff.truncated "$MAX_DIFF" '…[diff truncated to fit context budget]'
 
-gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate > pr-files.raw.json
-jq '[.[] | {filename,status,additions,deletions,changes,previous_filename,patch}]' pr-files.raw.json > pr-files.json
-head -c "$MAX_FILES" pr-files.json > pr-files.truncated.json
+# One bounded page instead of --paginate: 100 files is far beyond what the
+# MAX_FILES byte budget keeps anyway, and unbounded pagination on huge PRs
+# both burned API quota and produced concatenated JSON documents.
+gh api "repos/$REPO/pulls/$PR_NUMBER/files?per_page=100" > pr-files.raw.json
+# Note: 'patch' is intentionally dropped — the per-file patches duplicate the
+# raw diff that is already embedded in the corpus, and the classifier does not
+# read them. Keeping them here doubled the diff bytes sent to the model.
+TOTAL_CHANGED_FILES="$(jq -r '.changedFiles // 0' pr.json 2>/dev/null || echo 0)"
+jq --argjson total "${TOTAL_CHANGED_FILES:-0}" \
+  '[.[] | {filename,status,additions,deletions,changes,previous_filename}]
+   + (if $total > 100 then [{note: "file list truncated to first 100 of \($total) changed files"}] else [] end)' \
+  pr-files.raw.json > pr-files.json
+truncate_clean pr-files.json pr-files.truncated.json "$MAX_FILES" '…[file list truncated]'
 
 jq -r '.body // ""' pr.json > pr-body.txt
 section_timer_end
@@ -459,6 +579,29 @@ else
 fi
 section_timer_end
 
+# Returns 0 when the URL's host is in ALLOWED_SOURCE_HOSTS.
+url_host_allowed() {
+  local host raw_host candidate
+  host=$(printf '%s' "$1" | sed -E 's#^https?://([^/]+).*#\1#' | tr '[:upper:]' '[:lower:]')
+  IFS=',' read -ra _allowed_hosts <<< "$ALLOWED_SOURCE_HOSTS"
+  for raw_host in "${_allowed_hosts[@]}"; do
+    candidate=$(printf '%s' "$raw_host" | xargs | tr '[:upper:]' '[:lower:]')
+    [ -n "$candidate" ] || continue
+    if [ "$host" = "$candidate" ]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Reduce a fetched linked-source body to corpus-worthy text: HTML pages are
+# stripped to visible text, non-HTML passes through, output capped on a clean
+# boundary. Raw HTML heads were mostly <head> boilerplate that burned corpus
+# budget without giving the model anything to read.
+strip_source_to_text() {
+  python3 "$SCRIPT_DIR/strip_source_text.py" "$1" "$2" "$3"
+}
+
 section_timer_start "enrichment"
 log "Gathering linked sources..."
 : > linked-sources.md
@@ -467,6 +610,33 @@ if [ -s urls.txt ]; then
   TARGET_VERSION="$(jq -r '.title' pr.json | sed -n 's/.*→ *v\?\([0-9][0-9.]*\).*/\1/p' | head -n1)"
   if [ -z "$TARGET_VERSION" ]; then
     TARGET_VERSION="$(grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' version-hints.truncated.txt 2>/dev/null | sed 's/^v//' | tail -n1 || true)"
+  fi
+
+  # Phase 1: fetch every allowlisted URL body in one parallel curl run instead
+  # of serially (25 URLs x 25s worst-case each). parallel-max covers the full
+  # URL cap so wall-clock is bounded by the single slowest transfer. URLs are
+  # space-free by construction (extracted with a space-excluding grep), so the
+  # unquoted curl-config value cannot smuggle extra directives.
+  : > curl-parallel.cfg
+  i=0
+  while IFS= read -r url; do
+    [ -z "$url" ] && continue
+    i=$((i + 1))
+    [ "$i" -gt 25 ] && break
+    normalized_url="$(printf '%s' "$url" | sed -E 's#^https?://redirect.github.com/#https://github.com/#')"
+    rm -f "source.$i.raw"
+    host=$(printf '%s' "$normalized_url" | sed -E 's#^https?://([^/]+).*#\1#' | tr '[:upper:]' '[:lower:]')
+    # github.com bodies are JS-app shells; phase 2's gh api branches capture
+    # the structured data instead, so don't spend a fetch on them at all.
+    if [ "$host" != "github.com" ] && url_host_allowed "$normalized_url"; then
+      {
+        echo "url = $normalized_url"
+        echo "output = source.$i.raw"
+      } >> curl-parallel.cfg
+    fi
+  done < urls.txt
+  if [ -s curl-parallel.cfg ]; then
+    curl -q -fsSL --parallel --parallel-max 25 --max-time 25 --config curl-parallel.cfg 2>/dev/null || true
   fi
 
   : > seen-repos.txt
@@ -491,20 +661,16 @@ if [ -s urls.txt ]; then
     } >> linked-sources.md
 
     host=$(printf '%s' "$normalized_url" | sed -E 's#^https?://([^/]+).*#\1#' | tr '[:upper:]' '[:lower:]')
-    allowed=0
-    IFS=',' read -ra allowed_hosts <<< "$ALLOWED_SOURCE_HOSTS"
-    for raw_host in "${allowed_hosts[@]}"; do
-      candidate=$(printf '%s' "$raw_host" | xargs | tr '[:upper:]' '[:lower:]')
-      [ -n "$candidate" ] || continue
-      if [ "$host" = "$candidate" ]; then
-        allowed=1
-        break
-      fi
-    done
 
-    if [ "$allowed" -eq 1 ]; then
-      if curl -fsSL -L --max-time 25 "$normalized_url" -o source.raw 2>/dev/null; then
-        head -c 5000 source.raw | tr $'\0' ' ' > source.tmp
+    if url_host_allowed "$normalized_url"; then
+      if [ "$host" = "github.com" ]; then
+        # Raw github.com pages are JS-app HTML shells with none of the actual
+        # content; the gh api branches below capture the release/compare data
+        # in structured form instead. Skipping the fetch saves both time and
+        # ~5KB of corpus boilerplate per URL.
+        echo "(Raw HTML fetch skipped for github.com — structured release/compare metadata is captured below when available)" >> linked-sources.md
+      elif [ -s "source.$i.raw" ]; then
+        strip_source_to_text "source.$i.raw" source.tmp 4000
         if [ -s source.tmp ]; then
           echo '```text' >> linked-sources.md
           cat source.tmp >> linked-sources.md
@@ -731,8 +897,10 @@ if [ -s terms.txt ]; then
     } >> repo-history.md
   done < terms.txt
 
-  head -c 45000 repo-impact.md > repo-impact.truncated.md
-  head -c 20000 repo-history.md > repo-history.truncated.md
+  # These grep/log dumps are the lowest-value corpus sections (and on small PRs
+  # can dwarf the actual change), so keep their caps tight.
+  truncate_clean repo-impact.md repo-impact.truncated.md 24000 '…[impact scan truncated]'
+  truncate_clean repo-history.md repo-history.truncated.md 12000 '…[history truncated]'
 else
   echo "No candidate dependency terms extracted." > repo-impact.md
   echo "No candidate dependency terms extracted." > repo-history.md
@@ -778,6 +946,77 @@ else
 fi
 section_timer_end
 
+# ── Model routing (#159) ─────────────────────────────────────────────
+# With review_routing_mode=auto, low-risk PRs go to the fast model and PRs
+# whose pr_kind or risk_flags match ESCALATE_ON_RISK_FLAGS go straight to the
+# smart model. The fast config defaults to the primary model; the smart config
+# defaults to the fallback model. Routing only rebinds which model the
+# existing retry/fallback machinery talks to — that machinery is unchanged.
+resolve_review_route() {
+  REVIEW_ROUTE="legacy"
+  ROUTE_REASON="routing off"
+  if [[ "$(printf '%s' "$REVIEW_ROUTING_MODE" | tr '[:upper:]' '[:lower:]')" != "auto" ]]; then
+    return
+  fi
+
+  local kind flags candidates matched="" raw_flag flag
+  kind="$(jq -r '.pr_kind // ""' classification.json 2>/dev/null || echo "")"
+  flags="$(jq -r '(.risk_flags // []) | join(",")' classification.json 2>/dev/null || echo "")"
+  # Match against the union of pr_kind and risk_flags: the default escalation
+  # list mixes kind names (auth_changes, ...) and flag names (linked_*).
+  candidates=",${kind},${flags},"
+
+  IFS=',' read -ra _esc_flags <<< "$ESCALATE_ON_RISK_FLAGS"
+  for raw_flag in "${_esc_flags[@]}"; do
+    flag="$(printf '%s' "$raw_flag" | xargs)"
+    [ -n "$flag" ] || continue
+    if [[ "$candidates" == *",${flag},"* ]]; then
+      matched="$flag"
+      break
+    fi
+  done
+
+  if [[ -n "$matched" ]]; then
+    if [[ -n "$SMART_MODEL_RESOLVED" ]]; then
+      REVIEW_ROUTE="smart"
+      ROUTE_REASON="risk match: ${matched}"
+    else
+      REVIEW_ROUTE="fast"
+      ROUTE_REASON="risk match: ${matched}, but no smart model configured"
+    fi
+  else
+    REVIEW_ROUTE="fast"
+    ROUTE_REASON="no escalation flags matched"
+  fi
+}
+
+# Fast defaults to the primary config; smart defaults to the fallback config.
+FAST_BASE_URL="${AI_FAST_BASE_URL:-$AI_BASE_URL}"
+FAST_MODEL="${AI_FAST_MODEL:-$AI_MODEL}"
+FAST_API_FORMAT="${AI_FAST_API_FORMAT:-$AI_API_FORMAT}"
+FAST_API_KEY="${AI_FAST_API_KEY:-$AI_API_KEY}"
+SMART_BASE_URL="${AI_SMART_BASE_URL:-$AI_FALLBACK_BASE_URL}"
+SMART_MODEL="${AI_SMART_MODEL:-$AI_FALLBACK_MODEL}"
+SMART_API_FORMAT="${AI_SMART_API_FORMAT:-${AI_FALLBACK_API_FORMAT:-$AI_API_FORMAT}}"
+SMART_API_KEY="${AI_SMART_API_KEY:-$AI_FALLBACK_API_KEY}"
+SMART_MODEL_RESOLVED=""
+if [[ -n "$SMART_BASE_URL" && -n "$SMART_MODEL" ]]; then
+  SMART_MODEL_RESOLVED=1
+fi
+
+resolve_review_route
+if [[ "$REVIEW_ROUTE" == "fast" ]]; then
+  AI_BASE_URL="$FAST_BASE_URL"
+  AI_MODEL="$FAST_MODEL"
+  AI_API_FORMAT="$FAST_API_FORMAT"
+  AI_API_KEY="$FAST_API_KEY"
+elif [[ "$REVIEW_ROUTE" == "smart" ]]; then
+  AI_BASE_URL="$SMART_BASE_URL"
+  AI_MODEL="$SMART_MODEL"
+  AI_API_FORMAT="$SMART_API_FORMAT"
+  AI_API_KEY="$SMART_API_KEY"
+fi
+log "Review route: $REVIEW_ROUTE ($ROUTE_REASON) → $AI_MODEL"
 
 log "Building review corpus..."
 : > standards-context.md
@@ -796,7 +1035,7 @@ fi
 
 if [ ! -f tool-harness.md ]; then
   case "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" in
-    plan_execute_once)
+    plan_execute_once|plan_execute_loop)
       cat > tool-harness.md <<'EOF'
 Tool harness planning pending.
 EOF
@@ -825,7 +1064,10 @@ build_review_corpus() {
     echo
     echo "# PR Metadata"
     echo '```json'
-    jq . pr.json
+    # Project to review-relevant fields and cap the body: the full object also
+    # carries the entire .files array (duplicating the PR Files section and the
+    # classification summary) and an unbounded body.
+    jq '{number, title, author: (.author.login // .author), baseRefName, headRefName, headRefOid, changedFiles, additions, deletions, url, body: ((.body // "")[0:4000])}' pr.json
     echo '```'
     echo
 
@@ -846,10 +1088,21 @@ build_review_corpus() {
       echo
       if [ -f incremental.diff ]; then
         echo '```diff'
-        head -c "$MAX_DIFF" incremental.diff
+        truncate_clean incremental.diff incremental.diff.truncated "$MAX_DIFF" '…[delta truncated]'
+        cat incremental.diff.truncated
         echo '```'
       else
         echo "(No incremental diff available)"
+      fi
+      echo
+      # Carried-forward open findings (#193): the previous review's unresolved
+      # findings, which the model must answer one-by-one. High in the corpus
+      # on purpose — it is the most important context an incremental review has.
+      if [ -s previous-findings.json ] && [ "$(jq 'length' previous-findings.json 2>/dev/null || echo 0)" -gt 0 ]; then
+        PYTHONPATH="${SCRIPT_DIR}/.." python3 -c "
+from pr_reviewer.carry_forward import load_carried_findings, render_carried_findings_section
+print(render_carried_findings_section(load_carried_findings()), end='')
+" 2>/dev/null || echo "(Previous review findings could not be loaded)"
       fi
     else
       echo "# Linked Issue Context"
@@ -872,14 +1125,9 @@ build_review_corpus() {
       echo
     fi
 
-    echo "# Linked Sources"
-    cat linked-sources.md
-    echo
-    echo "# Evidence Providers"
-    cat evidence-providers.md
-    echo
-
-    # Tool harness section — label based on scope
+    # High-value evidence comes BEFORE linked sources / repo scans so that when
+    # the corpus overflows the budget, the noisy low-value sections at the tail
+    # are dropped first instead of this evidence.
     if [[ "$corpus_type" == "incremental" ]]; then
       echo "# Tool Harness Findings (incremental review)"
     else
@@ -887,8 +1135,16 @@ build_review_corpus() {
     fi
     cat tool-harness.md
     echo
+    echo "# Evidence Providers"
+    cat evidence-providers.md
+    echo
     echo "# Image Digest Provenance"
     cat image-digest-context.md
+    echo
+
+    # Lowest-value sections last — first to be dropped on truncation.
+    echo "# Linked Sources"
+    cat linked-sources.md
     echo
     echo "# Repository Impact Scan"
     cat repo-impact.truncated.md
@@ -898,13 +1154,23 @@ build_review_corpus() {
     echo
   } > review-corpus.body.md
 
-  # Truncate only the non-standards body to MAX_CORPUS
-  head -c "$MAX_CORPUS" review-corpus.body.md > review-corpus.body.truncated.md
+  # MAX_CORPUS is the total budget (standards + body). Cap the standards section
+  # first, then give the truncatable body whatever budget remains so a large
+  # standards file can't silently blow past the model's context window.
+  local std_cap=16000
+  truncate_clean standards-context.md standards-context.capped.md "$std_cap" '…[standards truncated]'
+  local std_bytes body_budget
+  std_bytes="$(wc -c < standards-context.capped.md | tr -d ' ')"
+  body_budget=$(( MAX_CORPUS - std_bytes ))
+  [ "$body_budget" -lt 4000 ] && body_budget=4000
+  truncate_clean review-corpus.body.md review-corpus.body.truncated.md "$body_budget" \
+    '```
+…[review corpus truncated to fit the model context budget]'
 
-  # Prepend standards section in full, then append truncated body
+  # Prepend the (capped) standards section, then append the truncated body
   {
     echo "# Repository Standards and Conventions ($STANDARDS_FILE)"
-    cat standards-context.md
+    cat standards-context.capped.md
     echo
     cat review-corpus.body.truncated.md
   } > review-corpus.md
@@ -922,13 +1188,13 @@ fi
 cp review-corpus.md review-corpus.truncated.md
 section_timer_end
 
-if [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" == "plan_execute_once" ]]; then
+if [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" == "plan_execute_once" || "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" == "plan_execute_loop" ]]; then
   if [[ "$IS_FORK_PR" == "true" ]] && [[ "$(printf '%s' "$TOOL_ENABLE_FOR_FORKS" | tr '[:upper:]' '[:lower:]')" != "true" ]]; then
     cat > tool-harness.md <<'EOF'
 Tool harness was skipped for a cross-repository pull request. Set tool_enable_for_forks=true to override.
 EOF
     cat > tool-harness.json <<'EOF'
-{"mode":"plan_execute_once","planned_request_count":0,"executed_request_count":0,"tool_results":[],"skipped":true,"skip_reason":"fork-pr"}
+{"mode":"plan_execute","planned_request_count":0,"executed_request_count":0,"tool_results":[],"skipped":true,"skip_reason":"fork-pr"}
 EOF
   else
     log "Running tool harness in mode: $TOOL_MODE"
@@ -938,55 +1204,206 @@ EOF
 Tool harness failed to run in this review.
 EOF
       cat > tool-harness.json <<'EOF'
-{"mode":"plan_execute_once","planned_request_count":0,"executed_request_count":0,"tool_results":[],"error":"execution failed"}
+{"mode":"plan_execute","planned_request_count":0,"executed_request_count":0,"tool_results":[],"error":"execution failed"}
 EOF
     fi
   fi
-  build_review_corpus
+  # Rebuild with the same scope used before the harness ran; build_review_corpus
+  # defaults to "full", which would silently discard an incremental delta review.
+  if [[ "$EFFECTIVE_SCOPE" == "incremental" && -n "$PREVIOUS_HEAD_SHA" ]]; then
+    build_review_corpus "incremental"
+  else
+    build_review_corpus "full"
+  fi
   cp review-corpus.md review-corpus.truncated.md
 fi
 
 log "Analyzing with $AI_MODEL using $AI_API_FORMAT API format..."
+
+# Build the user message for the final review call, steering it with the
+# deterministic classification (pr_kind / risk_flags / must_check). These go
+# in the short instruction channel because weaker models weight it far more
+# heavily than a section buried mid-corpus. Every value is generated by
+# pr_reviewer/classifier.py from file patterns — not copied from PR text — so
+# this cannot carry prompt injection from the PR.
+build_user_message() {
+  local classification_file="${1:-classification.json}"
+  local base="Analyze this pull request corpus and return STRICT JSON."
+  if [ ! -s "$classification_file" ]; then
+    printf '%s' "$base"
+    return
+  fi
+  python3 - "$classification_file" <<'PY'
+import json, sys
+
+base = "Analyze this pull request corpus and return STRICT JSON."
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("not an object")
+except Exception:
+    print(base, end="")
+    raise SystemExit(0)
+
+parts = [base]
+pr_kind = str(data.get("pr_kind") or "unknown")
+parts.append(f"PR kind (deterministic classification): {pr_kind}.")
+flags = [str(flag) for flag in (data.get("risk_flags") or []) if flag]
+if flags:
+    parts.append("Risk flags: " + ", ".join(flags[:12]) + ".")
+checks = [str(check) for check in (data.get("must_check") or []) if check]
+if checks:
+    parts.append(
+        "Required checks — explicitly address EACH of these in the review "
+        "(state what you verified, or why the check does not apply):"
+    )
+    parts.extend(f"- {check}" for check in checks[:12])
+print("\n".join(parts), end="")
+PY
+}
 
 STREAM_BOOL="false"
 if [[ "$(printf '%s' "$AI_STREAM" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
   STREAM_BOOL="true"
 fi
 
+# Carry-forward (#193) is active when this is an incremental review and the
+# precheck extracted open findings from the previous review's marker.
+CARRY_FORWARD_ACTIVE="false"
+if [[ "$EFFECTIVE_SCOPE" == "incremental" ]] && [ -s previous-findings.json ] \
+  && [ "$(jq 'length' previous-findings.json 2>/dev/null || echo 0)" -gt 0 ]; then
+  CARRY_FORWARD_ACTIVE="true"
+fi
+
+# Incremental review against a baseline the previous review flagged as having
+# issues. Used for the dirty-baseline escalation trigger.
+DIRTY_BASELINE="false"
+if [[ "$EFFECTIVE_SCOPE" == "incremental" && "$BASELINE_CLEAN" != "true" ]]; then
+  DIRTY_BASELINE="true"
+fi
+
+USER_MESSAGE="$(build_user_message classification.json)"
+if [[ "$CARRY_FORWARD_ACTIVE" == "true" ]]; then
+  USER_MESSAGE="$USER_MESSAGE
+The corpus lists Open Findings From the Previous Review. Answer EVERY one: include a finding with the same id and a resolution of resolved, still_open, or not_verifiable_from_delta. Claim resolved only when this delta demonstrably fixes it."
+  log "Carry-forward active: $(jq 'length' previous-findings.json) open finding(s) from the previous review"
+fi
+
 build_model_request \
   "$AI_API_FORMAT" \
   "$AI_MODEL" \
   "$SYSTEM_PROMPT" \
-  "Analyze this pull request corpus and return STRICT JSON." \
+  "$USER_MESSAGE" \
   review-corpus.truncated.md \
   ai-request.primary.json \
   "$STREAM_BOOL"
 
 PRIMARY_OK=0
 ATTEMPT=1
+PARSE_FAILS=0
+# A response that arrives but won't parse/validate is usually deterministic at
+# temperature 0.1 — re-sending the same corpus rarely helps. Cap those attempts
+# low and fall through to the fallback model instead of burning the full
+# transport-retry budget. Transport/HTTP failures keep the full budget.
+PARSE_FAIL_CAP=2
+RETRY_DELAY="$AI_PRIMARY_RETRY_DELAY_SEC"
 while [ "$ATTEMPT" -le "$AI_PRIMARY_RETRIES" ]; do
   echo "Primary model attempt ${ATTEMPT}/${AI_PRIMARY_RETRIES}: $AI_MODEL @ $AI_BASE_URL ($AI_API_FORMAT)"
-  if curl_model "$AI_BASE_URL" "$AI_API_KEY" "$AI_API_FORMAT" ai-request.primary.json ai-response.primary.json "$STREAM_BOOL" "$AI_REQUEST_TIMEOUT_SEC" "$AI_CONNECT_TIMEOUT_SEC" && \
-    { [[ "$STREAM_BOOL" != "true" ]] || reassemble_sse_response ai-response.primary.json "$AI_API_FORMAT"; } && \
-    parse_and_validate ai-response.primary.json; then
-    PRIMARY_OK=1
-    break
-  fi
+  if curl_model "$AI_BASE_URL" "$AI_API_KEY" "$AI_API_FORMAT" ai-request.primary.json ai-response.primary.json "$STREAM_BOOL" "$AI_REQUEST_TIMEOUT_SEC" "$AI_CONNECT_TIMEOUT_SEC"; then
+    if { [[ "$STREAM_BOOL" != "true" ]] || reassemble_sse_response ai-response.primary.json "$AI_API_FORMAT"; } && \
+      parse_and_validate ai-response.primary.json; then
+      PRIMARY_OK=1
+      break
+    fi
 
-  echo "Primary model attempt $ATTEMPT failed; waiting ${AI_PRIMARY_RETRY_DELAY_SEC}s" >&2
-  ATTEMPT=$((ATTEMPT + 1))
-  sleep "$AI_PRIMARY_RETRY_DELAY_SEC"
+    PARSE_FAILS=$((PARSE_FAILS + 1))
+    echo "Primary attempt $ATTEMPT: response received but parse/validate failed (parse failure ${PARSE_FAILS}/${PARSE_FAIL_CAP})" >&2
+    if [ -s ai-response.primary.json ]; then
+      printf '  response head (first 400 bytes): ' >&2
+      head -c 400 ai-response.primary.json >&2 || true
+      echo >&2
+    fi
+    if [ "$PARSE_FAILS" -ge "$PARSE_FAIL_CAP" ]; then
+      echo "Reached parse-failure cap; not retrying primary further" >&2
+      break
+    fi
+    ATTEMPT=$((ATTEMPT + 1))
+    sleep "$RETRY_DELAY"
+  else
+    # Transport or HTTP error (curl_model already logged the details/body).
+    echo "Primary attempt $ATTEMPT failed (connection/HTTP); waiting ${RETRY_DELAY}s" >&2
+    ATTEMPT=$((ATTEMPT + 1))
+    sleep "$RETRY_DELAY"
+    RETRY_DELAY=$((RETRY_DELAY * 2))
+    [ "$RETRY_DELAY" -gt 120 ] && RETRY_DELAY=120
+  fi
 done
 
-if [ "$PRIMARY_OK" -eq 1 ]; then
-  ANALYSIS_ENGINE="$AI_MODEL@$AI_BASE_URL ($AI_API_FORMAT)"
-  echo "Primary model succeeded"
-else
-  if [[ -z "$AI_FALLBACK_BASE_URL" || -z "$AI_FALLBACK_MODEL" ]]; then
-    error "Primary model unavailable and no fallback model configured"
+# On total model failure, either fail the step (default, preserves prior
+# behaviour) or — when on_model_failure=notice — emit a request_changes notice so
+# the publish step posts a visible explanation instead of leaving a red check
+# with nothing on the PR. request_changes is the safe default (never auto-approves).
+handle_model_failure() {
+  local reason="$1"
+  error "$reason"
+  if [[ "$(printf '%s' "$ON_MODEL_FAILURE" | tr '[:upper:]' '[:lower:]')" != "notice" ]]; then
     exit 1
   fi
+  log "on_model_failure=notice: emitting a request_changes notice instead of failing the check"
+  ANALYSIS_ENGINE="(model unavailable)"
+  REASON="$reason" python3 - > ai-output.json <<'PY'
+import json, os
+reason = os.environ.get("REASON", "model unavailable")
+md = (
+    "## AI review could not run\n\n"
+    "The configured model endpoint(s) did not return a usable review for this run "
+    f"(reason: {reason}).\n\n"
+    "This is an automated notice, not a substantive review. Re-run the workflow "
+    "once the endpoint is reachable; see the action logs for the underlying error.\n"
+)
+print(json.dumps({"verdict": "request_changes", "review_markdown": md}))
+PY
+}
 
+# Append the routing/fallback story to the analysis-engine string, so the
+# published "_Analysis engine: …_" line says not just WHICH model produced
+# the review but WHY it was chosen: deliberate smart routing, post-review
+# escalation, and primary-failure fallback read very differently on cost and
+# health. Legacy (routing off) primary success stays unannotated so the
+# output is byte-identical for routing-off users.
+# Args: $1 = base "model@url (format)" string, $2 = origin: primary|fallback|escalated
+# Uses env: REVIEW_ROUTE, ROUTE_REASON, ESCALATION_REASONS
+annotate_analysis_engine() {
+  local engine="$1" origin="$2"
+  case "$origin" in
+    fallback)
+      engine="$engine — fallback (primary failed)"
+      ;;
+    escalated)
+      engine="$engine — escalated (${ESCALATION_REASONS:-unknown})"
+      ;;
+    primary)
+      case "${REVIEW_ROUTE:-legacy}" in
+        fast) engine="$engine — fast route" ;;
+        smart) engine="$engine — routed smart (${ROUTE_REASON:-risk match})" ;;
+      esac
+      ;;
+  esac
+  printf '%s' "$engine"
+}
+
+if [ "$PRIMARY_OK" -eq 1 ]; then
+  ANALYSIS_ENGINE="$(annotate_analysis_engine "$AI_MODEL@$AI_BASE_URL ($AI_API_FORMAT)" primary)"
+  echo "Primary model succeeded"
+else
+  TRY_FALLBACK=1
+  if [[ -z "$AI_FALLBACK_BASE_URL" || -z "$AI_FALLBACK_MODEL" ]]; then
+    # In notice mode handle_model_failure returns; otherwise it exits.
+    handle_model_failure "Primary model unavailable and no fallback model configured"
+    TRY_FALLBACK=0
+  fi
+
+  if [ "$TRY_FALLBACK" -eq 1 ]; then
   echo "Primary model unavailable after retries; trying fallback: $AI_FALLBACK_MODEL @ $AI_FALLBACK_BASE_URL ($AI_FALLBACK_API_FORMAT)" >&2
   head -c 120000 review-corpus.md > review-corpus.fallback.truncated.md
 
@@ -999,7 +1416,7 @@ else
     "$AI_FALLBACK_API_FORMAT" \
     "$AI_FALLBACK_MODEL" \
     "$SYSTEM_PROMPT" \
-    "Analyze this pull request corpus and return STRICT JSON." \
+    "$USER_MESSAGE" \
     review-corpus.fallback.truncated.md \
     ai-request.fallback.json \
     "$FALLBACK_STREAM_BOOL"
@@ -1007,13 +1424,101 @@ else
   if curl_model "$AI_FALLBACK_BASE_URL" "$AI_FALLBACK_API_KEY" "$AI_FALLBACK_API_FORMAT" ai-request.fallback.json ai-response.fallback.json "$FALLBACK_STREAM_BOOL" "$AI_FALLBACK_REQUEST_TIMEOUT_SEC" "$AI_FALLBACK_CONNECT_TIMEOUT_SEC" && \
     { [[ "$FALLBACK_STREAM_BOOL" != "true" ]] || reassemble_sse_response ai-response.fallback.json "$AI_FALLBACK_API_FORMAT"; } && \
     parse_and_validate ai-response.fallback.json; then
-    ANALYSIS_ENGINE="$AI_FALLBACK_MODEL@$AI_FALLBACK_BASE_URL ($AI_FALLBACK_API_FORMAT)"
+    ANALYSIS_ENGINE="$(annotate_analysis_engine "$AI_FALLBACK_MODEL@$AI_FALLBACK_BASE_URL ($AI_FALLBACK_API_FORMAT)" fallback)"
     echo "Fallback model succeeded" >&2
   else
-    error "Fallback model failed"
-    exit 1
+    handle_model_failure "Fallback model failed"
+  fi
   fi
 fi
+
+# ── Escalation (#160) ────────────────────────────────────────────────
+# When the fast route produced this review and a configured trigger fires
+# (request_changes, unaddressed required checks, low confidence, blocker
+# signals), re-run the review on the smart model and publish only that
+# result. The fast output is kept as ai-output.fast.json for debugging. A
+# smart-model failure keeps the fast review — strictly better than failing.
+ESCALATION_REASONS=""
+maybe_escalate_review() {
+  [[ "$REVIEW_ROUTING_MODE" == "auto" ]] || return 0
+  [[ "${REVIEW_ROUTE:-legacy}" == "fast" ]] || return 0
+  [[ -n "$SMART_MODEL_RESOLVED" ]] || return 0
+  if [[ "$SMART_BASE_URL" == "$AI_BASE_URL" && "$SMART_MODEL" == "$AI_MODEL" ]]; then
+    return 0  # nothing distinct to escalate to
+  fi
+  # If the fast primary failed and the fallback produced this review, and the
+  # smart config is that same fallback (the default mapping), escalating would
+  # just re-call the model that already reviewed this corpus.
+  if [[ "${PRIMARY_OK:-0}" -ne 1 && "$SMART_BASE_URL" == "$AI_FALLBACK_BASE_URL" && "$SMART_MODEL" == "$AI_FALLBACK_MODEL" ]]; then
+    log "Skipping escalation: the fallback model that produced this review is the smart model"
+    return 0
+  fi
+
+  # Decide on the RAW fast output, before verdict policy / completeness
+  # validation / enforcement mutate it.
+  local decision
+  decision="$(PYTHONPATH="${SCRIPT_DIR}/.." python3 -c "
+from pr_reviewer.escalation import should_escalate
+escalate, reasons = should_escalate(
+    on_incomplete=('$ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS' == 'true'),
+    on_request_changes=('$ESCALATE_ON_FAST_REQUEST_CHANGES' == 'true'),
+    on_low_confidence=('$ESCALATE_ON_FAST_LOW_CONFIDENCE' == 'true'),
+    on_blockers=('$ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS' == 'true'),
+    on_dirty_baseline=('$ESCALATE_ON_DIRTY_BASELINE' == 'true'),
+    on_planning_failure=('$ESCALATE_ON_TOOL_PLANNING_FAILURE' == 'true'),
+    dirty_baseline=('$DIRTY_BASELINE' == 'true'),
+)
+print('yes ' + ','.join(reasons) if escalate else 'no')
+" 2>/dev/null || echo no)"
+  if [[ "$decision" == "no" || -z "$decision" ]]; then
+    log "No escalation triggers fired; keeping the fast review"
+    return 0
+  fi
+  ESCALATION_REASONS="${decision#yes }"
+  log "Escalating to smart model $SMART_MODEL ($ESCALATION_REASONS)"
+
+  cp ai-output.json ai-output.fast.json
+
+  local escalated_user
+  escalated_user="$USER_MESSAGE
+This is an ESCALATED review: a faster preliminary review was judged insufficient (${ESCALATION_REASONS}). Review thoroughly and address every required check explicitly."
+
+  build_model_request \
+    "$SMART_API_FORMAT" \
+    "$SMART_MODEL" \
+    "$SYSTEM_PROMPT" \
+    "$escalated_user" \
+    review-corpus.truncated.md \
+    ai-request.smart.json \
+    "$STREAM_BOOL"
+
+  local attempt smart_ok=0
+  for attempt in 1 2; do
+    echo "Smart model attempt ${attempt}/2: $SMART_MODEL @ $SMART_BASE_URL ($SMART_API_FORMAT)"
+    if curl_model "$SMART_BASE_URL" "$SMART_API_KEY" "$SMART_API_FORMAT" ai-request.smart.json ai-response.smart.json "$STREAM_BOOL" "$AI_REQUEST_TIMEOUT_SEC" "$AI_CONNECT_TIMEOUT_SEC"; then
+      if { [[ "$STREAM_BOOL" != "true" ]] || reassemble_sse_response ai-response.smart.json "$SMART_API_FORMAT"; } && \
+        parse_and_validate ai-response.smart.json; then
+        smart_ok=1
+        break
+      fi
+    fi
+    sleep "$AI_PRIMARY_RETRY_DELAY_SEC"
+  done
+
+  if [[ "$smart_ok" -eq 1 ]]; then
+    REVIEW_ROUTE="escalated"
+    ROUTE_REASON="escalated: ${ESCALATION_REASONS}"
+    ANALYSIS_ENGINE="$(annotate_analysis_engine "$SMART_MODEL@$SMART_BASE_URL ($SMART_API_FORMAT)" escalated)"
+    log "Smart model succeeded; publishing the escalated review"
+  else
+    # parse_and_validate only rewrites ai-output.json on success, but restore
+    # defensively so a partial write can never replace the fast review.
+    cp ai-output.fast.json ai-output.json
+    ESCALATION_REASONS=""
+    log "Smart model failed after escalation; publishing the fast review"
+  fi
+}
+maybe_escalate_review
 
 EVIDENCE_BLOCKER_ENABLED="false"
 if [[ "$(printf '%s' "$EVIDENCE_BLOCKER_ENFORCEMENT" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
@@ -1021,20 +1526,37 @@ if [[ "$(printf '%s' "$EVIDENCE_BLOCKER_ENFORCEMENT" | tr '[:upper:]' '[:lower:]
 fi
 
 TOOL_FAILURE_ENABLED="false"
-if [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" == "plan_execute_once" ]] && \
+if [[ "$(printf '%s' "$TOOL_MODE" | tr '[:upper:]' '[:lower:]')" != "off" ]] && \
   [[ "$(printf '%s' "$TOOL_FAILURE_ENFORCEMENT" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
   TOOL_FAILURE_ENABLED="true"
 fi
 
-apply_all_enforcement_wrapper "$EVIDENCE_BLOCKER_ENABLED" "$TOOL_FAILURE_ENABLED" "$TOOL_MIN_SUCCESSFUL_REQUESTS"
+apply_all_enforcement_wrapper "$EVIDENCE_BLOCKER_ENABLED" "$TOOL_FAILURE_ENABLED" "$TOOL_MIN_SUCCESSFUL_REQUESTS" "$VERDICT_POLICY" "$VALIDATE_REQUIRED_CHECKS" "$REQUIRED_CHECK_VALIDATION_MODE" "$CARRY_FORWARD_ACTIVE"
 
 echo "analysis_engine=$ANALYSIS_ENGINE" >> "$OUTPUT_FILE"
 echo "verdict=$(jq -r '.verdict' ai-output.json)" >> "$OUTPUT_FILE"
+echo "verdict_source=$(jq -r '.verdict_source // "model"' ai-output.json)" >> "$OUTPUT_FILE"
+echo "required_checks=$(jq -r '.required_checks // "none"' ai-output.json)" >> "$OUTPUT_FILE"
+echo "review_route=${REVIEW_ROUTE:-legacy}" >> "$OUTPUT_FILE"
+echo "escalation_reason=${ESCALATION_REASONS:-}" >> "$OUTPUT_FILE"
 
+# Use a random heredoc delimiter so model-controlled review text (which can be
+# influenced by prompt injection in the PR diff/title/body) cannot terminate the
+# multiline output early and inject arbitrary step outputs (e.g. flip the verdict).
+RM_DELIM="EOF_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 {
-  echo 'review_markdown<<EOF'
+  echo "review_markdown<<$RM_DELIM"
   jq -r '.review_markdown' ai-output.json
-  echo 'EOF'
+  echo "$RM_DELIM"
+} >> "$OUTPUT_FILE"
+
+# Structured findings (normalized JSON array; [] when the model emitted none).
+# Same random-delimiter defense — finding messages are model-controlled text.
+FD_DELIM="EOF_$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+{
+  echo "findings<<$FD_DELIM"
+  jq -c '.findings // []' ai-output.json
+  echo "$FD_DELIM"
 } >> "$OUTPUT_FILE"
 
 log "Analysis complete. Writing outputs..."
@@ -1046,5 +1568,64 @@ echo "effective_review_scope=$EFFECTIVE_SCOPE" >> "$OUTPUT_FILE"
 if [[ -n "$PREVIOUS_HEAD_SHA" ]]; then
   echo "previous_head_sha=$PREVIOUS_HEAD_SHA" >> "$OUTPUT_FILE"
 fi
+
+# Observability: a step-summary table so a user debugging a slow/odd review can
+# see the engine, verdict, token usage, truncation, and the active budget
+# without digging through raw logs.
+write_step_summary() {
+  [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+
+  local verdict diff_bytes corpus_bytes prompt_tok comp_tok usage_file
+  verdict="$(jq -r '.verdict // "unknown"' ai-output.json 2>/dev/null || echo unknown)"
+  diff_bytes="$( [ -f pr.diff ] && wc -c < pr.diff | tr -d ' ' || echo 0 )"
+  corpus_bytes="$( [ -f review-corpus.md ] && wc -c < review-corpus.md | tr -d ' ' || echo 0 )"
+
+  usage_file=""
+  [ -f ai-response.primary.json ] && usage_file="ai-response.primary.json"
+  [[ "$ANALYSIS_ENGINE" == *fallback* || "$ANALYSIS_ENGINE" == "$AI_FALLBACK_MODEL"* ]] && [ -f ai-response.fallback.json ] && usage_file="ai-response.fallback.json"
+  [[ "${REVIEW_ROUTE:-}" == "escalated" ]] && [ -f ai-response.smart.json ] && usage_file="ai-response.smart.json"
+  prompt_tok="-"; comp_tok="-"
+  if [ -n "$usage_file" ]; then
+    prompt_tok="$(jq -r '.usage.prompt_tokens // "-"' "$usage_file" 2>/dev/null || echo -)"
+    comp_tok="$(jq -r '.usage.completion_tokens // "-"' "$usage_file" 2>/dev/null || echo -)"
+  fi
+
+  local diff_trunc="no" corpus_trunc="no"
+  [ "$diff_bytes" -gt "$MAX_DIFF" ] 2>/dev/null && diff_trunc="yes (cap ${MAX_DIFF})"
+  [ "$corpus_bytes" -gt "$MAX_CORPUS" ] 2>/dev/null && corpus_trunc="yes (cap ${MAX_CORPUS})"
+
+  local budget_desc
+  if [[ "${MODEL_CONTEXT_TOKENS:-}" =~ ^[0-9]+$ ]]; then
+    budget_desc="model_context_tokens=${MODEL_CONTEXT_TOKENS}"
+  else
+    budget_desc="context_limit_mode=${CONTEXT_LIMIT_MODE:-normal}"
+  fi
+
+  local findings_count blockers_count verdict_source
+  findings_count="$(jq -r '.findings | length' ai-output.json 2>/dev/null || echo 0)"
+  blockers_count="$(jq -r '[.findings[]? | select(.severity == "blocker")] | length' ai-output.json 2>/dev/null || echo 0)"
+  verdict_source="$(jq -r '.verdict_source // "model"' ai-output.json 2>/dev/null || echo model)"
+  local required_checks_status
+  required_checks_status="$(jq -r '.required_checks // "none"' ai-output.json 2>/dev/null || echo none)"
+
+  {
+    echo "### AI PR Review"
+    echo ""
+    echo "| Field | Value |"
+    echo "| --- | --- |"
+    echo "| Engine | ${ANALYSIS_ENGINE} |"
+    echo "| Verdict | ${verdict} (source: ${verdict_source}) |"
+    echo "| Findings | ${findings_count} (blockers: ${blockers_count}) |"
+    echo "| Required checks | ${required_checks_status} |"
+    echo "| Route | ${REVIEW_ROUTE:-legacy} (${ROUTE_REASON:-}) |"
+    echo "| Scope | ${EFFECTIVE_SCOPE} |"
+    echo "| Budget | ${budget_desc} |"
+    echo "| Diff bytes | ${diff_bytes} (truncated: ${diff_trunc}) |"
+    echo "| Corpus bytes | ${corpus_bytes} (truncated: ${corpus_trunc}) |"
+    echo "| Prompt tokens | ${prompt_tok} |"
+    echo "| Completion tokens | ${comp_tok} |"
+  } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+}
+write_step_summary
 
 log "Done."

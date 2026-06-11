@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+
 import tempfile
 from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT))
 
 import pytest
 
@@ -47,6 +52,50 @@ class TestPRKindRenovateDigestOnly:
         diff = '"version": "2.0.0"\n"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"'
         kind = _classify_pr_kind(files, diff)
         assert kind != "renovate_digest_only"
+
+    def test_not_digest_when_mixed_with_code(self):
+        # A lockfile plus a real source change must NOT be treated as trivial.
+        files = [
+            _make_file("package-lock.json"),
+            _make_file("src/app/handler.ts"),
+        ]
+        diff = '"a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"'
+        kind = _classify_pr_kind(files, diff)
+        assert kind != "renovate_digest_only"
+
+    def test_not_digest_when_yaml_version_bump(self):
+        # Helm/YAML version bumps (unquoted) must defeat the digest-only path.
+        files = [_make_file("Chart.yaml")]
+        diff = "-appVersion: 1.2.3\n+appVersion: 1.3.0\n"
+        kind = _classify_pr_kind(files, diff)
+        assert kind != "renovate_digest_only"
+
+
+class TestPRKindMultiLanguage:
+    """Auth/route/DB heuristics should fire beyond Python."""
+
+    def test_auth_typescript(self):
+        assert _classify_pr_kind([_make_file("src/auth.ts")], "") == "auth_changes"
+
+    def test_auth_controller_java(self):
+        # AuthController.java should be flagged (auth takes precedence over route).
+        assert _classify_pr_kind(
+            [_make_file("src/main/java/AuthController.java")], ""
+        ) == "auth_changes"
+
+    def test_route_typescript(self):
+        assert _classify_pr_kind(
+            [_make_file("src/routes.ts")], ""
+        ) == "public_route_changes"
+
+    def test_model_go(self):
+        assert _classify_pr_kind(
+            [_make_file("internal/models.go")], ""
+        ) == "db_or_migration_changes"
+
+    def test_auth_risk_flag_typescript(self):
+        flags = _detect_risk_flags([_make_file("src/auth.ts")], "", [])
+        assert "auth_changes" in flags
 
 
 class TestPRKindDependencyUpgrade:
@@ -224,6 +273,29 @@ class TestMustCheck:
         checks = _build_must_check(
             "app_code", ["linked_security_issue"])
         assert any("security issue" in c for c in checks)
+
+    def test_risk_flag_adds_checks_beyond_pr_kind(self):
+        # An auth_changes flag on an app_code PR must still pull in the auth
+        # checklist (#157) — checks are not keyed off pr_kind alone.
+        checks = _build_must_check("app_code", ["auth_changes"])
+        assert any("auth flow" in c for c in checks)
+        assert any("session token" in c for c in checks)
+
+    def test_multiple_risk_flags_union(self):
+        checks = _build_must_check(
+            "app_code", ["auth_changes", "path_handling_changes"])
+        assert any("auth flow" in c for c in checks)
+        assert any("path traversal" in c for c in checks)
+
+    def test_kind_equal_to_flag_deduplicates(self):
+        # auth_changes as both pr_kind and risk flag yields each check once.
+        checks = _build_must_check("auth_changes", ["auth_changes"])
+        assert len(checks) == len(set(checks))
+        assert sum(1 for c in checks if "auth flow" in c) == 1
+
+    def test_pr_kind_checks_come_first(self):
+        checks = _build_must_check("file_serving_changes", ["auth_changes"])
+        assert "sanitization" in checks[0] or "traversal" in checks[0]
 
 
 # ---------------------------------------------------------------------------

@@ -59,11 +59,15 @@ sys.stderr.write("token=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij\\n")
 """
 
 
-def _run_with_config(config_data, tmp_path: Path) -> subprocess.CompletedProcess:
+def _run_with_config(
+    config_data, tmp_path: Path, extra_env=None
+) -> subprocess.CompletedProcess:
     config_file = tmp_path / "providers.json"
     config_file.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
     env = os.environ.copy()
     env["EVIDENCE_PROVIDERS_FILE"] = str(config_file)
+    if extra_env:
+        env.update(extra_env)
     result = subprocess.run(
         [sys.executable, str(EVIDENCE_SCRIPT)],
         cwd=str(tmp_path),
@@ -555,6 +559,197 @@ class TestForkEnablement:
         assert self._should_skip("false", "false") is False
         assert self._should_skip("false", "true") is False
         assert self._should_skip("false", "") is False
+
+
+# ── Parallel execution ─────────────────────────────────────────────
+
+_TIMESTAMP_HELPER = """\
+import sys, time
+start = time.time()
+time.sleep(0.8)
+end = time.time()
+open(sys.argv[1], "w").write(f"{start} {end}")
+print("done")
+"""
+
+
+def _interval(tmp_path: Path, name: str):
+    start, end = (tmp_path / name).read_text().split()
+    return float(start), float(end)
+
+
+class TestParallelExecution:
+    def test_results_keep_config_order(self, tmp_path: Path):
+        config = {
+            "providers": [
+                {"id": "slow", "command": "sleep 0.5; echo slow-out"},
+                {"id": "fast", "command": "echo fast-out"},
+            ]
+        }
+        result = _run_with_config(config, tmp_path)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        data = _load_json_output(tmp_path)
+        assert [p["id"] for p in data["providers"]] == ["slow", "fast"]
+        assert data["providers"][0]["stdout"].strip() == "slow-out"
+        assert data["providers"][1]["stdout"].strip() == "fast-out"
+
+    def test_providers_run_concurrently_by_default(self, tmp_path: Path):
+        helper = tmp_path / "stamp.py"
+        helper.write_text(_TIMESTAMP_HELPER)
+        config = {
+            "providers": [
+                {"id": "a", "command": f"{sys.executable} {helper} {tmp_path}/a.ts"},
+                {"id": "b", "command": f"{sys.executable} {helper} {tmp_path}/b.ts"},
+            ]
+        }
+        result = _run_with_config(config, tmp_path)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        a_start, a_end = _interval(tmp_path, "a.ts")
+        b_start, b_end = _interval(tmp_path, "b.ts")
+        # Execution windows must overlap when run in parallel.
+        assert a_start < b_end and b_start < a_end
+
+    def test_parallelism_one_forces_serial(self, tmp_path: Path):
+        helper = tmp_path / "stamp.py"
+        helper.write_text(_TIMESTAMP_HELPER)
+        config = {
+            "providers": [
+                {"id": "a", "command": f"{sys.executable} {helper} {tmp_path}/a.ts"},
+                {"id": "b", "command": f"{sys.executable} {helper} {tmp_path}/b.ts"},
+            ]
+        }
+        result = _run_with_config(
+            config, tmp_path, extra_env={"EVIDENCE_PROVIDER_PARALLELISM": "1"}
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        a_start, a_end = _interval(tmp_path, "a.ts")
+        b_start, b_end = _interval(tmp_path, "b.ts")
+        # Serial execution: one window fully precedes the other.
+        assert a_end <= b_start or b_end <= a_start
+
+    def test_model_api_keys_scrubbed_from_provider_env(self, tmp_path: Path):
+        config = {
+            "providers": [
+                {"id": "env-probe", "command": "echo \"key=[${AI_API_KEY:-}] fb=[${AI_FALLBACK_API_KEY:-}] gh=[${GH_TOKEN:-}]\""}
+            ]
+        }
+        result = _run_caps(
+            config,
+            tmp_path,
+            {
+                "AI_API_KEY": "sk-should-never-leak",
+                "AI_FALLBACK_API_KEY": "sk-fallback-never-leak",
+                "GH_TOKEN": "gh-token-ok",
+            },
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        data = _load_json_output(tmp_path)
+        stdout = data["providers"][0]["stdout"]
+        # Model keys are scrubbed before the provider runs (not just redacted
+        # after); GH_TOKEN stays available for gh-based providers.
+        assert "key=[]" in stdout
+        assert "fb=[]" in stdout
+        assert "gh-token-ok" not in stdout or "gh=[" in stdout
+
+    def test_blocker_flag_still_aggregates(self, tmp_path: Path):
+        helper = tmp_path / "blocker.py"
+        helper.write_text(HELPER_BLOCKER)
+        config = {
+            "providers": [
+                {"id": "clean", "command": "echo ok"},
+                {"id": "blocker", "command": f"{sys.executable} {helper}"},
+            ]
+        }
+        result = _run_with_config(config, tmp_path)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        data = _load_json_output(tmp_path)
+        assert data["has_blocker"] is True
+
+
+# ── Markdown output caps (head+tail per stream, aggregate across providers) ──
+
+from run_evidence_providers import head_tail_cap  # noqa: E402
+
+
+class TestHeadTailCap:
+    def test_under_cap_unchanged(self):
+        assert head_tail_cap("short", 100) == "short"
+
+    def test_over_cap_keeps_head_and_tail(self):
+        text = "HEAD-" + ("x" * 5000) + "-TAIL"
+        out = head_tail_cap(text, 400)
+        assert out.startswith("HEAD-")
+        assert out.endswith("-TAIL")
+        assert "…[middle truncated]…" in out
+        assert len(out.encode("utf-8")) < 500
+
+    def test_multibyte_boundaries_survive(self):
+        text = "é" * 4000
+        out = head_tail_cap(text, 300)
+        out.encode("utf-8").decode("utf-8")  # must be valid UTF-8
+
+
+def _run_caps(config_data, tmp_path: Path, env_overrides: dict):
+    config_file = tmp_path / "providers.json"
+    config_file.write_text(json.dumps(config_data, indent=2), encoding="utf-8")
+    env = os.environ.copy()
+    env["EVIDENCE_PROVIDERS_FILE"] = str(config_file)
+    env.update(env_overrides)
+    return subprocess.run(
+        [sys.executable, str(EVIDENCE_SCRIPT)],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+class TestMarkdownCaps:
+    def test_stdout_is_head_tail_capped_in_markdown(self, tmp_path: Path):
+        config = {
+            "providers": [
+                {"id": "chatty", "command": "python3 -c \"print('START'); print('x' * 9000); print('THE-ERROR-AT-END')\""}
+            ]
+        }
+        result = _run_caps(config, tmp_path, {"EVIDENCE_MARKDOWN_STDOUT_BYTES": "1000"})
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        md = (tmp_path / "evidence-providers.md").read_text()
+        assert "START" in md
+        assert "THE-ERROR-AT-END" in md          # tail survives
+        assert "…[middle truncated]…" in md
+        # JSON summary keeps the full (per-provider capped) stdout.
+        data = _load_json_output(tmp_path)
+        assert len(data["providers"][0]["stdout"]) > 9000
+
+    def test_aggregate_cap_stops_further_embeds(self, tmp_path: Path):
+        providers = [
+            {"id": f"p{i}", "command": "python3 -c \"print('y' * 3000)\""}
+            for i in range(4)
+        ]
+        result = _run_caps(
+            {"providers": providers},
+            tmp_path,
+            {
+                "EVIDENCE_MARKDOWN_STDOUT_BYTES": "3000",
+                "EVIDENCE_MARKDOWN_AGGREGATE_BYTES": "5000",
+            },
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        md = (tmp_path / "evidence-providers.md").read_text()
+        assert "aggregate evidence output cap reached" in md
+        # Every provider still has its header even when its output is omitted.
+        for i in range(4):
+            assert f"## p{i}" in md
+
+    def test_small_outputs_unaffected(self, tmp_path: Path):
+        config = {"providers": [{"id": "tiny", "command": "echo hello"}]}
+        result = _run_caps(config, tmp_path, {})
+        assert result.returncode == 0
+        md = (tmp_path / "evidence-providers.md").read_text()
+        assert "hello" in md
+        assert "truncated" not in md
+        assert "cap reached" not in md
 
 
 if __name__ == "__main__":

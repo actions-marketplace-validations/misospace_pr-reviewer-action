@@ -9,6 +9,7 @@ by markdown code fences or prose.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 
@@ -109,6 +110,185 @@ def _try_decode_json(text: str) -> Any | None:
 
 
 # ---------------------------------------------------------------------------
+# Verdict normalisation, truncation, and stream-error detection
+# ---------------------------------------------------------------------------
+
+# finish_reason / stop_reason values that indicate the model hit the token cap.
+_TRUNCATION_REASONS = {"length", "max_tokens", "max_output_tokens"}
+
+_APPROVE_VERDICTS = {"approve", "approved", "approval", "lgtm"}
+_REQUEST_CHANGES_VERDICTS = {
+    "request_changes", "request_change", "requestchanges",
+    "changes_requested", "change_requested", "needs_changes",
+    "needs_change", "reject", "rejected",
+}
+
+
+def _normalize_verdict(value: Any) -> str | None:
+    """Map common local-model verdict spellings to the canonical value.
+
+    Weaker models frequently return ``"Approve"``, ``"approved"``,
+    ``"request changes"``, ``"REQUEST_CHANGES"`` and similar. Returns
+    ``"approve"``, ``"request_changes"``, or ``None`` if unrecognised.
+    """
+    if not isinstance(value, str):
+        return None
+    collapsed = "_".join(value.strip().lower().split()).replace("-", "_")
+    if collapsed in _APPROVE_VERDICTS:
+        return "approve"
+    if collapsed in _REQUEST_CHANGES_VERDICTS:
+        return "request_changes"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Findings normalisation
+# ---------------------------------------------------------------------------
+
+_SEVERITY_ALIASES = {
+    "blocker": "blocker", "critical": "blocker",
+    "major": "major", "high": "major", "error": "major",
+    "minor": "minor", "medium": "minor", "low": "minor", "warning": "minor",
+    "info": "info", "note": "info", "nit": "info", "suggestion": "info",
+}
+
+_FINDING_CATEGORIES = {
+    "bug", "security", "performance", "style", "docs", "question", "other",
+}
+
+_MAX_FINDINGS = 50
+_MAX_FINDING_MESSAGE_CHARS = 2000
+
+# Resolution labels for carried-forward findings (#193). The model is asked to
+# answer each previous open finding with one of these; anything else is
+# dropped so downstream logic treats a missing resolution as fail-closed.
+_RESOLUTION_ALIASES = {
+    "resolved": "resolved",
+    "fixed": "resolved",
+    "addressed": "resolved",
+    "still_open": "still_open",
+    "open": "still_open",
+    "unresolved": "still_open",
+    "not_verifiable_from_delta": "not_verifiable_from_delta",
+    "not_verifiable": "not_verifiable_from_delta",
+    "unknown": "not_verifiable_from_delta",
+}
+_MAX_FINDING_ID_CHARS = 16
+
+
+def _normalize_findings(value: Any) -> list[dict[str, Any]]:
+    """Normalise an optional model-provided findings array.
+
+    Tolerant by design: weaker models may omit the array entirely, emit a
+    non-list, or produce partially-formed entries. Anything unusable is
+    dropped rather than failing the parse, so the action degrades to the
+    verdict/review_markdown contract.
+    """
+    if not isinstance(value, list):
+        return []
+
+    findings: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+
+        message = item.get("message") or item.get("summary") or item.get("title")
+        if not isinstance(message, str) or not message.strip():
+            continue
+        message = message.strip()[:_MAX_FINDING_MESSAGE_CHARS]
+
+        raw_severity = item.get("severity")
+        severity = "info"
+        if isinstance(raw_severity, str):
+            severity = _SEVERITY_ALIASES.get(raw_severity.strip().lower(), "info")
+
+        raw_category = item.get("category")
+        category = "other"
+        if isinstance(raw_category, str):
+            candidate = raw_category.strip().lower()
+            if candidate in _FINDING_CATEGORIES:
+                category = candidate
+
+        file_path = item.get("file") or item.get("path")
+        if isinstance(file_path, str):
+            file_path = file_path.strip()
+            while file_path.startswith("./"):
+                file_path = file_path[2:]
+            file_path = file_path or None
+        else:
+            file_path = None
+
+        raw_line = item.get("line")
+        line: int | None = None
+        if isinstance(raw_line, bool):
+            line = None
+        elif isinstance(raw_line, int):
+            line = raw_line if raw_line > 0 else None
+        elif isinstance(raw_line, float) and raw_line.is_integer():
+            line = int(raw_line) if raw_line > 0 else None
+        elif isinstance(raw_line, str) and raw_line.strip().isdigit():
+            parsed_line = int(raw_line.strip())
+            line = parsed_line if parsed_line > 0 else None
+
+        finding: dict[str, Any] = {
+            "severity": severity,
+            "category": category,
+            "file": file_path,
+            "line": line,
+            "message": message,
+        }
+
+        # Optional carry-forward fields (#193): a short id referencing a
+        # finding from the previous review, and the model's resolution
+        # judgment for it. Preserved only when well-formed.
+        raw_id = item.get("id")
+        if isinstance(raw_id, str):
+            clean_id = re.sub(r"[^A-Za-z0-9_-]", "", raw_id)[:_MAX_FINDING_ID_CHARS]
+            if clean_id:
+                finding["id"] = clean_id
+        raw_resolution = item.get("resolution")
+        if isinstance(raw_resolution, str):
+            resolution = _RESOLUTION_ALIASES.get(raw_resolution.strip().lower())
+            if resolution:
+                finding["resolution"] = resolution
+
+        findings.append(finding)
+        if len(findings) >= _MAX_FINDINGS:
+            break
+
+    return findings
+
+
+def _finish_reason(response: dict[str, Any]) -> str | None:
+    """Best-effort extraction of the model's stop/finish reason."""
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        fr = choices[0].get("finish_reason")
+        if isinstance(fr, str):
+            return fr
+    sr = response.get("stop_reason")
+    if isinstance(sr, str):
+        return sr
+    return None
+
+
+def _surface_stream_error(response: dict[str, Any]) -> None:
+    """Raise SystemExit if the response carries a transport/stream error.
+
+    The SSE reassembler records provider error events under an ``error`` key so
+    a mid-stream error is reported instead of looking like empty output.
+    """
+    err = response.get("error")
+    if not err:
+        return
+    if isinstance(err, dict):
+        msg = err.get("message") or json.dumps(err)
+    else:
+        msg = str(err)
+    raise SystemExit(f"Model endpoint returned an error: {msg}")
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -131,6 +311,8 @@ def parse_response(response: dict[str, Any]) -> dict[str, Any]:
         If no JSON can be extracted, or the result is not a dict with the
         expected fields.
     """
+    _surface_stream_error(response)
+
     raw = _extract_content(response)
     if isinstance(raw, list):
         text = "".join(raw).strip()
@@ -147,26 +329,44 @@ def parse_response(response: dict[str, Any]) -> dict[str, Any]:
     if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
         parsed = parsed[0]
 
+    # A truncated generation is the most common cause of parse/validation
+    # failure on small local models. Surface it explicitly so the operator
+    # knows to raise ai_max_tokens rather than chasing a generic parse error.
+    finish = _finish_reason(response)
+    trunc = (
+        " (model output appears truncated at the token limit; increase ai_max_tokens)"
+        if finish in _TRUNCATION_REASONS
+        else ""
+    )
+
     if not isinstance(parsed, dict):
         raise SystemExit(
-            f"Expected JSON object but got {type(parsed).__name__}"
+            f"Expected JSON object but got {type(parsed).__name__}{trunc}"
         )
 
     # Validate required keys
     if "verdict" not in parsed:
-        raise SystemExit("Parsed JSON missing required key 'verdict'")
+        raise SystemExit(f"Parsed JSON missing required key 'verdict'{trunc}")
     if "review_markdown" not in parsed:
-        raise SystemExit("Parsed JSON missing required key 'review_markdown'")
+        raise SystemExit(f"Parsed JSON missing required key 'review_markdown'{trunc}")
 
-    verdict = parsed.get("verdict")
-    if verdict not in ("approve", "request_changes"):
+    raw_verdict = parsed.get("verdict")
+    verdict = _normalize_verdict(raw_verdict)
+    if verdict is None:
         raise SystemExit(
-            f"Expected verdict to be 'approve' or 'request_changes', got '{verdict}'"
+            f"Expected verdict to be 'approve' or 'request_changes', got '{raw_verdict}'"
         )
+    # Write back the canonical value so downstream consumers (jq -r '.verdict')
+    # always see 'approve' or 'request_changes'.
+    parsed["verdict"] = verdict
 
     markdown = parsed.get("review_markdown")
     if not isinstance(markdown, str) or not markdown.strip():
-        raise SystemExit("Parsed JSON has empty or missing 'review_markdown'")
+        raise SystemExit(f"Parsed JSON has empty or missing 'review_markdown'{trunc}")
+
+    # Optional structured findings: normalised when present, empty when the
+    # model (typically a weaker local one) does not produce them.
+    parsed["findings"] = _normalize_findings(parsed.get("findings"))
 
     return parsed
 

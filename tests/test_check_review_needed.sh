@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Bash >= 4 required: empty-array expansion under `set -u` and other 4.x
+# behaviors break on macOS stock bash 3.2. Skip (not fail) so local runs
+# explain themselves; CI runs bash 5.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "SKIP: bash >= 4 required (found ${BASH_VERSION:-unknown}); on macOS run with PATH=\"/opt/homebrew/bin:\$PATH\"" >&2
+  exit 0
+fi
+
 # Dependency preflight
 for dep in python3; do
   if ! command -v "$dep" &>/dev/null; then
@@ -42,6 +50,7 @@ index 123..456 644
 
 cat > "$TMPDIR/bin/gh" <<'SHELLEOF'
 #!/usr/bin/env bash
+echo "$*" >> /tmp/testfp_gh_calls.log
 case "$1" in
   "pr")
     case "$2" in
@@ -49,8 +58,12 @@ case "$1" in
     esac
     ;;
   "api")
-    if echo "$*" | grep -q 'comments'; then
+    if echo "$*" | grep -q 'reviews'; then
+      [ -f /tmp/testfp_reviews.json ] && cat /tmp/testfp_reviews.json
+    elif echo "$*" | grep -q 'comments'; then
       cat /tmp/testfp_comments.json
+    elif echo "$*" | grep -q 'pulls/42'; then
+      [ -f /tmp/testfp_pr_object.json ] && cat /tmp/testfp_pr_object.json
     fi
     ;;
 esac
@@ -58,10 +71,24 @@ exit 0
 SHELLEOF
 chmod +x "$TMPDIR/bin/gh"
 
+cat > /tmp/testfp_pr_object.json <<'JSONEOF'
+{
+  "number": 42,
+  "head": {"sha": "aaaa111122223333aaaa111122223333aaaa1111", "ref": "feature", "repo": {"full_name": "test/repo"}},
+  "base": {"sha": "bbbb111122223333bbbb111122223333bbbb1111", "ref": "main", "repo": {"full_name": "test/repo"}}
+}
+JSONEOF
+
+# The precheck writes pr.diff / pr-object.json into its CWD; run it in a
+# scratch workdir so test runs do not litter the repository root.
+WORKDIR="$TMPDIR/work"
+
 run_precheck() {
   local output_file="$TMPDIR/out_$RANDOM$RANDOM"
   printf '%s' "$FIXED_DIFF" > /tmp/testfp_diff
+  rm -rf "$WORKDIR" && mkdir -p "$WORKDIR"
   (
+    cd "$WORKDIR" || exit 1
     PATH="$TMPDIR/bin:$PATH" \
     REPO="test/repo" \
     PR_NUMBER=42 \
@@ -94,9 +121,19 @@ run_precheck() {
     TOOL_ENABLE_FOR_FORKS="${TOOL_ENABLE_FOR_FORKS:-false}" \
     SKIP_IF_DIFF_UNCHANGED="${SKIP_IF_DIFF_UNCHANGED:-true}" \
     COMMENT_MARKER="${COMMENT_MARKER:-<!-- ai-pr-reviewer -->}" \
+    PUBLISH_MODE="${PUBLISH_MODE:-comment}" \
     bash "$PRECHECK_SCRIPT"
   )
   cat "$output_file"
+}
+
+set_reviews() {
+  local body="$1"
+  python3 <<PYEOF > /tmp/testfp_reviews.json
+import json
+body = """${body}"""
+print(json.dumps([{"body": body, "submitted_at": "2024-01-01T00:00:00Z"}]))
+PYEOF
 }
 
 set_comments() {
@@ -115,7 +152,9 @@ set_empty_comments() {
 run_precheck_empty_diff() {
   local output_file="$TMPDIR/out_$RANDOM$RANDOM"
   printf '' > /tmp/testfp_diff
+  rm -rf "$WORKDIR" && mkdir -p "$WORKDIR"
   (
+    cd "$WORKDIR" || exit 1
     PATH="$TMPDIR/bin:$PATH" \
     REPO="test/repo" \
     PR_NUMBER=42 \
@@ -221,6 +260,66 @@ unset ACTION_REF
 RESULT="$(run_precheck)"
 
 check "should_review=false when everything matches" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "false"
+
+# ── Test 11: review_verdict mode reads prior state from PR reviews ────
+echo ""
+echo "=== Test 11: review_verdict mode finds the fingerprint in a PR review → skip ==="
+unset ACTION_REF
+rm -f /tmp/testfp_reviews.json
+set_empty_comments
+OUTPUT_FP_RV="$(PUBLISH_MODE=review_verdict run_precheck)"
+BROAD_FP_RV="$(echo "$OUTPUT_FP_RV" | grep '^diff_fingerprint=' | head -1 | cut -d= -f2)"
+set_reviews "<!-- ai-pr-reviewer -->
+<!-- ai-pr-review-fingerprint:${BROAD_FP_RV} -->
+APPROVE"
+RESULT="$(PUBLISH_MODE=review_verdict run_precheck)"
+check "should_review=false when a PR review fingerprint matches (review_verdict)" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "false"
+
+# ── Test 12: review_verdict ignores issue comments for prior state ───
+echo ""
+echo "=== Test 12: review_verdict does not read issue comments for prior state ==="
+rm -f /tmp/testfp_reviews.json
+# The matching fingerprint is only in an issue comment now; with no PR review
+# carrying it, review_verdict mode must fall back to a fresh review.
+set_comments "<!-- ai-pr-reviewer -->
+<!-- ai-pr-review-fingerprint:${BROAD_FP_RV} -->
+APPROVE"
+RESULT="$(PUBLISH_MODE=review_verdict run_precheck)"
+check "should_review=true when only an issue comment matches (review_verdict)" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+
+# ── Test 13: skip path short-circuits the PR-object fetch ─────────────
+echo ""
+echo "=== Test 13: should_review=false short-circuits scope resolution ==="
+rm -f /tmp/testfp_reviews.json
+set_empty_comments
+OUTPUT_FP_SC="$(run_precheck)"
+BROAD_FP_SC="$(echo "$OUTPUT_FP_SC" | grep '^diff_fingerprint=' | head -1 | cut -d= -f2)"
+set_comments "<!-- ai-pr-reviewer -->
+<!-- ai-pr-review-fingerprint:${BROAD_FP_SC} -->
+APPROVE"
+: > /tmp/testfp_gh_calls.log
+RESULT="$(run_precheck)"
+check "should_review=false on matching fingerprint" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "false"
+PULLS_FETCHES="$(grep -c 'api repos/test/repo/pulls/42$' /tmp/testfp_gh_calls.log || true)"
+check "PR object is not fetched when skipping" "$PULLS_FETCHES" "0"
+check "skip path still emits scope output" "$(echo "$RESULT" | grep -c '^effective_review_scope=')" "1"
+
+# ── Test 14: review path emits PR facts and reusable files ───────────
+echo ""
+echo "=== Test 14: review path forwards head/base SHA, fork flag, and files ==="
+set_empty_comments
+: > /tmp/testfp_gh_calls.log
+RESULT="$(run_precheck)"
+check "should_review=true" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+check "head_sha output forwarded" "$(echo "$RESULT" | grep '^head_sha=' | head -1 | cut -d= -f2)" "aaaa111122223333aaaa111122223333aaaa1111"
+check "base_sha output forwarded" "$(echo "$RESULT" | grep '^base_sha=' | head -1 | cut -d= -f2)" "bbbb111122223333bbbb111122223333bbbb1111"
+check "is_fork_pr output forwarded" "$(echo "$RESULT" | grep '^is_fork_pr=' | head -1 | cut -d= -f2)" "false"
+check "pr.diff saved for reuse by run_review" "$(test -s "$WORKDIR/pr.diff" && echo yes || echo no)" "yes"
+check "pr-object.json saved for reuse by run_review" "$(test -s "$WORKDIR/pr-object.json" && echo yes || echo no)" "yes"
+PULLS_FETCHES="$(grep -c 'api repos/test/repo/pulls/42$' /tmp/testfp_gh_calls.log || true)"
+check "PR object fetched exactly once" "$PULLS_FETCHES" "1"
+DIFF_FETCHES="$(grep -c '^pr diff' /tmp/testfp_gh_calls.log || true)"
+check "diff fetched exactly once" "$DIFF_FETCHES" "1"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

@@ -31,6 +31,26 @@ inputs:
     description: Maximum completion tokens for the primary and fallback final review calls
     required: false
     default: "4096"
+  ai_temperature:
+    description: >-
+      Sampling temperature for the review model. Default "0.1". Set to an empty string to
+      omit the field entirely (some newer cloud models reject any non-default temperature).
+    required: false
+    default: "0.1"
+  ai_response_format:
+    description: >-
+      Structured-output mode for OpenAI-compatible endpoints (including LiteLLM): off (default),
+      json_object, or json_schema (enforces a verdict/review_markdown schema). Ignored for the
+      anthropic format. Improves output reliability with smaller local models. Applies to both
+      the primary and fallback review calls.
+    required: false
+    default: "off"
+  ai_tokens_param:
+    description: >-
+      Token-limit field name for OpenAI-compatible requests: max_tokens (default) or
+      max_completion_tokens (required by newer OpenAI reasoning models). Ignored for anthropic.
+    required: false
+    default: "max_tokens"
   anthropic_version:
     description: Anthropic API version header used when ai_api_format or ai_fallback_api_format is anthropic
     required: false
@@ -59,6 +79,131 @@ inputs:
     description: Delay between primary retries in seconds
     required: false
     default: "15"
+  on_model_failure:
+    description: >-
+      Behavior when both primary and fallback models fail to return a usable review.
+      'fail' (default) fails the action step. 'notice' instead posts a visible
+      request_changes notice explaining the review could not run (never auto-approves),
+      so reviewers see an explanation instead of only a red check.
+    required: false
+    default: "fail"
+  verdict_policy:
+    description: >-
+      How the final verdict is decided. 'model' (default) uses the model's own verdict.
+      'findings_severity_gated' derives the verdict deterministically from the structured
+      findings array: request_changes iff any blocker-severity finding exists, otherwise
+      approve. When the model returns no findings, the policy falls back to the model
+      verdict (weak models degrade gracefully). Enforcement settings (evidence blockers,
+      tool failure) still apply afterwards and can force request_changes.
+    required: false
+    default: "model"
+  inline_findings:
+    description: >-
+      If true, structured findings that anchor to a line in the PR diff are attached as
+      native line-anchored review comments when publishing with publish_mode=review_comment
+      or review_verdict. Findings that cannot be anchored stay in the review body only.
+      Default false — no inline comments. Ignored for publish_mode=comment.
+    required: false
+    default: "false"
+  inline_findings_max:
+    description: Maximum inline review comments attached per review when inline_findings=true.
+    required: false
+    default: "20"
+  validate_required_checks:
+    description: >-
+      Whether to validate the final review against the classifier's must_check items.
+      'auto' (default) validates whenever must_check is non-empty; 'true' and 'false'
+      force it on or off. Validation is deterministic keyword matching — it catches
+      reviews that never discussed a required check, not incorrect discussion.
+    required: false
+    default: "auto"
+  required_check_validation_mode:
+    description: >-
+      What to do when required checks are unaddressed. 'warn' (default) appends an
+      'Unaddressed required checks' section to the published review. 'fail' also forces
+      a request_changes verdict. 'metadata_only' records the result (required_checks
+      output and metadata marker) without changing the published review.
+    required: false
+    default: "warn"
+  review_routing_mode:
+    description: >-
+      Route PR reviews between fast and smart models based on the deterministic
+      classification. 'off' (default) preserves existing primary/fallback behavior.
+      'auto' sends PRs whose pr_kind or risk_flags match escalate_on_risk_flags to the
+      smart model and everything else to the fast model.
+    required: false
+    default: "off"
+  ai_fast_model:
+    description: Fast/local model for low-risk reviews when review_routing_mode=auto. Defaults to ai_model.
+    required: false
+    default: ""
+  ai_fast_base_url:
+    description: Base URL for the fast model. Defaults to ai_base_url.
+    required: false
+    default: ""
+  ai_fast_api_format:
+    description: API format for the fast model (openai or anthropic). Defaults to ai_api_format.
+    required: false
+    default: ""
+  ai_fast_api_key:
+    description: API key for the fast model. Defaults to ai_api_key.
+    required: false
+    default: ""
+  ai_smart_model:
+    description: Smarter model for high-risk reviews when review_routing_mode=auto. Defaults to ai_fallback_model; with neither set, risky PRs stay on the fast model.
+    required: false
+    default: ""
+  ai_smart_base_url:
+    description: Base URL for the smart model. Defaults to ai_fallback_base_url.
+    required: false
+    default: ""
+  ai_smart_api_format:
+    description: API format for the smart model (openai or anthropic). Defaults to ai_fallback_api_format, then ai_api_format.
+    required: false
+    default: ""
+  ai_smart_api_key:
+    description: API key for the smart model. Defaults to ai_fallback_api_key.
+    required: false
+    default: ""
+  escalate_on_risk_flags:
+    description: >-
+      Comma-separated pr_kind / risk_flag names that route directly to the smart model
+      when review_routing_mode=auto.
+    required: false
+    default: "linked_security_issue,linked_priority_p0,linked_priority_p1,auth_changes,public_route_changes,file_serving_changes,path_handling_changes,secret_handling_changes,db_or_migration_changes"
+  escalate_on_incomplete_required_checks:
+    description: Escalate a fast review to the smart model when required checks are unaddressed (review_routing_mode=auto only).
+    required: false
+    default: "true"
+  escalate_on_fast_request_changes:
+    description: Escalate a fast review to the smart model when the fast verdict is request_changes (review_routing_mode=auto only).
+    required: false
+    default: "true"
+  escalate_on_fast_low_confidence:
+    description: Escalate when the fast review is low-confidence (very short, or carries a populated Unknowns/Needs Verification section). review_routing_mode=auto only.
+    required: false
+    default: "true"
+  escalate_on_tool_or_evidence_blockers:
+    description: >-
+      Escalate when evidence providers report blocker severity or every executed tool
+      request failed (review_routing_mode=auto only).
+    required: false
+    default: "true"
+  escalate_on_tool_planning_failure:
+    description: >-
+      Escalate when the tool harness planning call failed (review_routing_mode=auto only).
+      Off by default: a planning failure means the review ran with less evidence — the same
+      situation as tool_mode 'off' — not that the PR is risky. The failure is still recorded
+      in tool-harness.json and the step summary.
+    required: false
+    default: "false"
+  escalate_on_dirty_baseline:
+    description: >-
+      Escalate incremental reviews whose baseline review found issues (review_routing_mode=auto
+      only). Judging whether a delta resolves a previously-found blocker is exactly the
+      judgment worth running on the smart model.
+    required: false
+    default: "true"
   ai_stream:
     description: If true, use streaming responses to avoid timeouts behind proxies with short read timeouts (e.g. Cloudflare 100s edge timer)
     required: false
@@ -126,8 +271,21 @@ inputs:
     description: Context budget mode - normal (140k/70k/220k), low (80k/40k/120k), minimal (40k/20k/60k)
     required: false
     default: normal
+  model_context_tokens:
+    description: >-
+      The model's real context window in tokens (e.g. 8192, 32768). When set,
+      corpus/diff/file byte budgets are derived from it (reserving ai_max_tokens
+      for output) instead of context_limit_mode — recommended for local models
+      whose windows are smaller than the named modes assume. Empty uses
+      context_limit_mode.
+    required: false
+    default: ""
   enrichment_budget_sec:
     description: Maximum seconds to spend on enrichment (linked source fetching, release metadata, ghcr.io lookups). Exceeding the budget stops further enrichment. Default 60.
+    required: false
+    default: "60"
+  image_digest_budget_sec:
+    description: Maximum seconds to spend on image digest provenance lookups (registry tokens, manifests, revision compares). 0 disables the budget. Default 60.
     required: false
     default: "60"
   evidence_providers_file:
@@ -142,6 +300,10 @@ inputs:
     description: Maximum stdout or stderr bytes captured per evidence provider command
     required: false
     default: "20000"
+  evidence_provider_parallelism:
+    description: Maximum evidence provider commands run concurrently. Set 1 to force serial execution when providers contend on shared files. Default 4.
+    required: false
+    default: "4"
   evidence_blocker_enforcement:
     description: If true, force request_changes when any evidence provider reports blocker severity
     required: false
@@ -151,17 +313,25 @@ inputs:
     required: false
     default: "false"
   tool_mode:
-    description: Optional tool harness mode; set to plan_execute_once to let the model request read-only evidence tools before final review
+    description: >-
+      Optional tool harness mode. plan_execute_once lets the model request read-only
+      evidence tools in a single planning round before the final review. plan_execute_loop
+      re-plans after seeing each round's results (up to tool_max_rounds), so the model can
+      dig further based on what it found; tool_max_requests is the total budget across rounds.
     required: false
     default: "off"
   tool_max_requests:
     description: Maximum number of tool requests the harness executes when tool_mode is enabled
     required: false
     default: "4"
-  tool_planning_timeout_sec:
-    description: Timeout in seconds for the model planning call used by tool harness
+  tool_max_rounds:
+    description: Maximum planning rounds for tool_mode=plan_execute_loop. Ignored for other modes.
     required: false
-    default: "30"
+    default: "3"
+  tool_planning_timeout_sec:
+    description: Timeout in seconds for the model planning call used by tool harness. Non-streaming, so set generously for local models with slow prompt eval.
+    required: false
+    default: "60"
   tool_planning_max_context_bytes:
     description: Maximum corpus bytes passed to the planning model
     required: false
@@ -248,6 +418,21 @@ outputs:
   verdict:
     description: AI verdict, approve or request_changes
     value: ${{ steps.review.outputs.verdict }}
+  verdict_source:
+    description: Where the final verdict came from ('model' or 'findings' per verdict_policy, or 'carry_forward' when a carried-forward blocker survived an incremental review)
+    value: ${{ steps.review.outputs.verdict_source }}
+  required_checks:
+    description: Required-check validation status ('complete', 'incomplete', or 'none' when validation did not run)
+    value: ${{ steps.review.outputs.required_checks }}
+  review_route:
+    description: Model route used for this review ('legacy', 'fast', 'smart', or 'escalated')
+    value: ${{ steps.review.outputs.review_route }}
+  escalation_reason:
+    description: Comma-separated escalation trigger names when review_route is 'escalated' (empty otherwise)
+    value: ${{ steps.review.outputs.escalation_reason }}
+  findings:
+    description: Normalized structured findings as a JSON array (empty array when the model produced none)
+    value: ${{ steps.review.outputs.findings }}
   review_markdown:
     description: Human-readable markdown review body
     value: ${{ steps.review.outputs.review_markdown }}
@@ -300,18 +485,33 @@ runs:
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
         COMMENT_MARKER: ${{ inputs.comment_marker }}
+        PUBLISH_MODE: ${{ inputs.publish_mode }}
         REVIEW_SCOPE: ${{ inputs.review_scope }}
         SKIP_IF_DIFF_UNCHANGED: ${{ inputs.skip_if_diff_unchanged }}
         ACTION_REF: ${{ github.action_ref }}
         AI_MODEL: ${{ inputs.ai_model }}
         AI_API_FORMAT: ${{ inputs.ai_api_format }}
+        AI_TEMPERATURE: ${{ inputs.ai_temperature }}
+        AI_RESPONSE_FORMAT: ${{ inputs.ai_response_format }}
+        AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
         AI_FALLBACK_MODEL: ${{ inputs.ai_fallback_model }}
+        REVIEW_ROUTING_MODE: ${{ inputs.review_routing_mode }}
+        AI_FAST_MODEL: ${{ inputs.ai_fast_model }}
+        AI_SMART_MODEL: ${{ inputs.ai_smart_model }}
+        ESCALATE_ON_RISK_FLAGS: ${{ inputs.escalate_on_risk_flags }}
+        ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS: ${{ inputs.escalate_on_incomplete_required_checks }}
+        ESCALATE_ON_FAST_REQUEST_CHANGES: ${{ inputs.escalate_on_fast_request_changes }}
+        ESCALATE_ON_FAST_LOW_CONFIDENCE: ${{ inputs.escalate_on_fast_low_confidence }}
+        ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS: ${{ inputs.escalate_on_tool_or_evidence_blockers }}
+        ESCALATE_ON_TOOL_PLANNING_FAILURE: ${{ inputs.escalate_on_tool_planning_failure }}
+        ESCALATE_ON_DIRTY_BASELINE: ${{ inputs.escalate_on_dirty_baseline }}
         ANTHROPIC_VERSION: ${{ inputs.anthropic_version }}
         SYSTEM_PROMPT: ${{ inputs.system_prompt }}
         SYSTEM_PROMPT_FILE: ${{ inputs.system_prompt_file }}
         STANDARDS_FILE: ${{ inputs.standards_file }}
         STANDARDS_FILE_CANDIDATES: ${{ inputs.standards_file_candidates }}
         CONTEXT_LIMIT_MODE: ${{ inputs.context_limit_mode }}
+        MODEL_CONTEXT_TOKENS: ${{ inputs.model_context_tokens }}
         EVIDENCE_PROVIDERS_FILE: ${{ inputs.evidence_providers_file }}
         EVIDENCE_PROVIDER_TIMEOUT_SEC: ${{ inputs.evidence_provider_timeout_sec }}
         EVIDENCE_PROVIDER_MAX_OUTPUT_BYTES: ${{ inputs.evidence_provider_max_output_bytes }}
@@ -319,6 +519,7 @@ runs:
         EVIDENCE_ENABLE_FOR_FORKS: ${{ inputs.evidence_enable_for_forks }}
         TOOL_MODE: ${{ inputs.tool_mode }}
         TOOL_MAX_REQUESTS: ${{ inputs.tool_max_requests }}
+        TOOL_MAX_ROUNDS: ${{ inputs.tool_max_rounds }}
         TOOL_PLANNING_TIMEOUT_SEC: ${{ inputs.tool_planning_timeout_sec }}
         TOOL_PLANNING_MAX_CONTEXT_BYTES: ${{ inputs.tool_planning_max_context_bytes }}
         TOOL_PLANNING_MAX_TOKENS: ${{ inputs.tool_planning_max_tokens }}
@@ -343,6 +544,8 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
+        CI_STATUS_CHECK: ${{ inputs.ci_status_check }}
         CI_TIMEOUT_SEC: ${{ inputs.ci_timeout_sec }}
         CI_INTERVAL_SEC: ${{ inputs.ci_interval_sec }}
         CI_SKIP_ON_TIMEOUT: ${{ inputs.ci_skip_on_timeout }}
@@ -361,6 +564,9 @@ runs:
         AI_MODEL: ${{ inputs.ai_model }}
         AI_API_KEY: ${{ inputs.ai_api_key }}
         AI_MAX_TOKENS: ${{ inputs.ai_max_tokens }}
+        AI_TEMPERATURE: ${{ inputs.ai_temperature }}
+        AI_RESPONSE_FORMAT: ${{ inputs.ai_response_format }}
+        AI_TOKENS_PARAM: ${{ inputs.ai_tokens_param }}
         ANTHROPIC_VERSION: ${{ inputs.anthropic_version }}
         AI_FALLBACK_BASE_URL: ${{ inputs.ai_fallback_base_url }}
         AI_FALLBACK_API_FORMAT: ${{ inputs.ai_fallback_api_format }}
@@ -368,6 +574,27 @@ runs:
         AI_FALLBACK_API_KEY: ${{ inputs.ai_fallback_api_key }}
         AI_PRIMARY_RETRIES: ${{ inputs.ai_primary_retries }}
         AI_PRIMARY_RETRY_DELAY_SEC: ${{ inputs.ai_primary_retry_delay_sec }}
+        ON_MODEL_FAILURE: ${{ inputs.on_model_failure }}
+        VERDICT_POLICY: ${{ inputs.verdict_policy }}
+        VALIDATE_REQUIRED_CHECKS: ${{ inputs.validate_required_checks }}
+        REQUIRED_CHECK_VALIDATION_MODE: ${{ inputs.required_check_validation_mode }}
+        REVIEW_ROUTING_MODE: ${{ inputs.review_routing_mode }}
+        AI_FAST_BASE_URL: ${{ inputs.ai_fast_base_url }}
+        AI_FAST_MODEL: ${{ inputs.ai_fast_model }}
+        AI_FAST_API_FORMAT: ${{ inputs.ai_fast_api_format }}
+        AI_FAST_API_KEY: ${{ inputs.ai_fast_api_key }}
+        AI_SMART_BASE_URL: ${{ inputs.ai_smart_base_url }}
+        AI_SMART_MODEL: ${{ inputs.ai_smart_model }}
+        AI_SMART_API_FORMAT: ${{ inputs.ai_smart_api_format }}
+        AI_SMART_API_KEY: ${{ inputs.ai_smart_api_key }}
+        ESCALATE_ON_RISK_FLAGS: ${{ inputs.escalate_on_risk_flags }}
+        ESCALATE_ON_INCOMPLETE_REQUIRED_CHECKS: ${{ inputs.escalate_on_incomplete_required_checks }}
+        ESCALATE_ON_FAST_REQUEST_CHANGES: ${{ inputs.escalate_on_fast_request_changes }}
+        ESCALATE_ON_FAST_LOW_CONFIDENCE: ${{ inputs.escalate_on_fast_low_confidence }}
+        ESCALATE_ON_TOOL_OR_EVIDENCE_BLOCKERS: ${{ inputs.escalate_on_tool_or_evidence_blockers }}
+        ESCALATE_ON_TOOL_PLANNING_FAILURE: ${{ inputs.escalate_on_tool_planning_failure }}
+        ESCALATE_ON_DIRTY_BASELINE: ${{ inputs.escalate_on_dirty_baseline }}
+        BASELINE_CLEAN: ${{ steps.precheck.outputs.baseline_clean }}
         AI_STREAM: ${{ inputs.ai_stream }}
         AI_FALLBACK_STREAM: ${{ inputs.ai_fallback_stream }}
         ALLOWED_SOURCE_HOSTS: ${{ inputs.allowed_source_hosts }}
@@ -376,14 +603,18 @@ runs:
         STANDARDS_FILE: ${{ inputs.standards_file }}
         STANDARDS_FILE_CANDIDATES: ${{ inputs.standards_file_candidates }}
         CONTEXT_LIMIT_MODE: ${{ inputs.context_limit_mode }}
+        MODEL_CONTEXT_TOKENS: ${{ inputs.model_context_tokens }}
         ENRICHMENT_BUDGET_SEC: ${{ inputs.enrichment_budget_sec }}
+        IMAGE_DIGEST_BUDGET_SEC: ${{ inputs.image_digest_budget_sec }}
         EVIDENCE_PROVIDERS_FILE: ${{ inputs.evidence_providers_file }}
         EVIDENCE_PROVIDER_TIMEOUT_SEC: ${{ inputs.evidence_provider_timeout_sec }}
         EVIDENCE_PROVIDER_MAX_OUTPUT_BYTES: ${{ inputs.evidence_provider_max_output_bytes }}
+        EVIDENCE_PROVIDER_PARALLELISM: ${{ inputs.evidence_provider_parallelism }}
         EVIDENCE_BLOCKER_ENFORCEMENT: ${{ inputs.evidence_blocker_enforcement }}
         EVIDENCE_ENABLE_FOR_FORKS: ${{ inputs.evidence_enable_for_forks }}
         TOOL_MODE: ${{ inputs.tool_mode }}
         TOOL_MAX_REQUESTS: ${{ inputs.tool_max_requests }}
+        TOOL_MAX_ROUNDS: ${{ inputs.tool_max_rounds }}
         TOOL_PLANNING_TIMEOUT_SEC: ${{ inputs.tool_planning_timeout_sec }}
         TOOL_PLANNING_MAX_CONTEXT_BYTES: ${{ inputs.tool_planning_max_context_bytes }}
         TOOL_PLANNING_MAX_TOKENS: ${{ inputs.tool_planning_max_tokens }}
@@ -412,10 +643,14 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         BROAD_FINGERPRINT: ${{ steps.precheck.outputs.diff_fingerprint }}
         VERDICT: ${{ steps.review.outputs.verdict }}
+        REQUIRED_CHECKS: ${{ steps.review.outputs.required_checks }}
+        REVIEW_ROUTE: ${{ steps.review.outputs.review_route }}
+        ESCALATION_REASON: ${{ steps.review.outputs.escalation_reason }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
+        FINDINGS: ${{ steps.review.outputs.findings }}
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
         COMMENT_MARKER: ${{ inputs.comment_marker }}
         GITHUB_ACTION_PATH: ${{ github.action_path }}
@@ -437,19 +672,19 @@ runs:
         fi
 
         # Build metadata marker
-        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || '' }}" "${{ steps.precheck.outputs.previous_head_sha || '' }}")"
-        ANALYSIS_SCOPE_SUFFIX=""
-        if [ "$EFFECTIVE_SCOPE" = "incremental" ]; then
-          ANALYSIS_SCOPE_SUFFIX=" (incremental delta review)"
-        fi
+        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}" "${{ steps.precheck.outputs.previous_head_sha || '' }}")"
 
         if [ "$VERDICT" = "request_changes" ]; then
           VERDICT_PREFIX="⚠️ **Automated recommendation: REQUEST CHANGES**"
         else
           VERDICT_PREFIX="✅ **Automated recommendation: APPROVE**"
         fi
+        if [ "$EFFECTIVE_SCOPE" = "incremental" ]; then
+          VERDICT_PREFIX="$VERDICT_PREFIX (incremental)"
+        fi
 
         {
+          echo "$COMMENT_MARKER"
           echo "$METADATA_MARKER"
           if [ -n "${HEAD_SHA:-}" ]; then
             echo "<!-- ai-pr-review-sha:${HEAD_SHA} -->"
@@ -459,7 +694,7 @@ runs:
           fi
           echo "$VERDICT_PREFIX"
           echo
-          printf '_Analysis engine: %s%s_\n' "$ANALYSIS_ENGINE" "$ANALYSIS_SCOPE_SUFFIX"
+          printf '_Analysis engine: %s_\n' "$ANALYSIS_ENGINE"
           echo
           cat review-markdown.raw.md
         } > review-comment.md
@@ -473,10 +708,18 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         VERDICT: ${{ steps.review.outputs.verdict }}
+        REQUIRED_CHECKS: ${{ steps.review.outputs.required_checks }}
+        REVIEW_ROUTE: ${{ steps.review.outputs.review_route }}
+        ESCALATION_REASON: ${{ steps.review.outputs.escalation_reason }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
+        FINDINGS: ${{ steps.review.outputs.findings }}
+        INLINE_FINDINGS: ${{ inputs.inline_findings }}
+        INLINE_FINDINGS_MAX: ${{ inputs.inline_findings_max }}
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
+        COMMENT_MARKER: ${{ inputs.comment_marker }}
+        BROAD_FINGERPRINT: ${{ steps.precheck.outputs.diff_fingerprint }}
         CLEANUP_PREVIOUS_NATIVE_REVIEWS: ${{ inputs.cleanup_previous_native_reviews }}
         GITHUB_ACTION_PATH: ${{ github.action_path }}
       run: |
@@ -501,19 +744,26 @@ runs:
         fi
 
         # Build metadata marker
-        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || '' }}" "")"
-        ANALYSIS_SCOPE_SUFFIX=""
+        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}" "")"
+        REVIEW_HEADER="# AI Automated Review"
         if [ "$EFFECTIVE_SCOPE" = "incremental" ]; then
-          ANALYSIS_SCOPE_SUFFIX=" (incremental delta review)"
+          REVIEW_HEADER="# AI Automated Review (incremental)"
         fi
 
         # Build the review body with managed marker
         BODY_FILE="review-comment-body.md"
         {
+          echo "$COMMENT_MARKER"
           echo "$METADATA_MARKER"
-          echo "# AI Automated Review"
+          if [ -n "${HEAD_SHA:-}" ]; then
+            echo "<!-- ai-pr-review-sha:${HEAD_SHA} -->"
+          fi
+          if [ -n "${BROAD_FINGERPRINT:-}" ]; then
+            echo "<!-- ai-pr-review-fingerprint:${BROAD_FINGERPRINT} -->"
+          fi
+          echo "$REVIEW_HEADER"
           echo
-          printf '_Analysis engine: %s%s_\n' "$ANALYSIS_ENGINE" "$ANALYSIS_SCOPE_SUFFIX"
+          printf '_Analysis engine: %s_\n' "$ANALYSIS_ENGINE"
           echo
           cat review-comment-markdown.raw.md
         } > "$BODY_FILE"
@@ -528,6 +778,36 @@ runs:
         # Use gh pr comment instead for visibility, with --edit-last/--create-if-none for sticky behavior.
         gh pr comment "$PR_NUMBER" --repo "$REPO" --edit-last --create-if-none --body-file "$BODY_FILE"
 
+        # Resolve threads of carried findings this review verified as fixed,
+        # and reply on threads still open (#208, #209). Must precede the
+        # comment build so finding-threads.json suppresses duplicates.
+        resolve_finding_threads
+
+        # Optionally attach line-anchored inline comments from the structured
+        # findings as a separate native COMMENT review. It carries the managed
+        # marker so the next run's cleanup marks it superseded. Best-effort:
+        # the summary comment above is already published.
+        if [ "$(printf '%s' "${INLINE_FINDINGS:-false}" | tr '[:upper:]' '[:lower:]')" = "true" ] && [ -n "${FINDINGS:-}" ]; then
+          printf '%s' "$FINDINGS" > findings.json
+          COMMENTS_JSON="[]"
+          if SUPPRESS_FINDINGS_FILE=finding-threads.json INLINE_FINDINGS_MAX="${INLINE_FINDINGS_MAX:-20}" python3 "${GITHUB_ACTION_PATH}/scripts/build_review_comments.py" findings.json pr.diff review-comments.json; then
+            COMMENTS_JSON="$(cat review-comments.json)"
+          fi
+          if [ -n "$COMMENTS_JSON" ] && [ "$COMMENTS_JSON" != "[]" ]; then
+            {
+              echo "$COMMENT_MARKER"
+              echo "_Inline findings from the automated review (summary in the sticky comment)._"
+            } > inline-findings-body.md
+            jq -n --rawfile body inline-findings-body.md --argjson comments "$COMMENTS_JSON" \
+              '{body: $body, event: "COMMENT", comments: $comments}' > review-request.json
+            if gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --method POST --input review-request.json >/dev/null 2>&1; then
+              echo "Attached $(printf '%s' "$COMMENTS_JSON" | jq 'length') inline finding comment(s)"
+            else
+              echo "WARN: inline findings review submission failed; summary comment was still published" >&2
+            fi
+          fi
+        fi
+
     - name: Publish review verdict (native PR review)
       if: inputs.publish_mode == 'review_verdict' && steps.precheck.outputs.should_review == 'true'
       shell: bash
@@ -535,12 +815,20 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         REPO: ${{ inputs.repo || github.repository }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || steps.precheck.outputs.head_sha }}
         VERDICT: ${{ steps.review.outputs.verdict }}
+        REQUIRED_CHECKS: ${{ steps.review.outputs.required_checks }}
+        REVIEW_ROUTE: ${{ steps.review.outputs.review_route }}
+        ESCALATION_REASON: ${{ steps.review.outputs.escalation_reason }}
         REVIEW_MARKDOWN: ${{ steps.review.outputs.review_markdown }}
+        FINDINGS: ${{ steps.review.outputs.findings }}
+        INLINE_FINDINGS: ${{ inputs.inline_findings }}
+        INLINE_FINDINGS_MAX: ${{ inputs.inline_findings_max }}
         ANALYSIS_ENGINE: ${{ steps.review.outputs.analysis_engine }}
         ALLOW_APPROVE: ${{ inputs.allow_approve }}
         APPROVE_FORKS: ${{ inputs.approve_forks }}
+        COMMENT_MARKER: ${{ inputs.comment_marker }}
+        BROAD_FINGERPRINT: ${{ steps.precheck.outputs.diff_fingerprint }}
         CLEANUP_PREVIOUS_NATIVE_REVIEWS: ${{ inputs.cleanup_previous_native_reviews }}
         GITHUB_ACTION_PATH: ${{ github.action_path }}
       run: |
@@ -557,8 +845,12 @@ runs:
         CLEANUP_NATIVE_REVIEWS="$(resolve_cleanup_flag "${CLEANUP_PREVIOUS_NATIVE_REVIEWS:-auto}" "review_verdict")"
         cleanup_native_reviews "$CLEANUP_NATIVE_REVIEWS"
 
-        # Determine if the PR is from a fork
-        IS_FORK_PR="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' 2>/dev/null || echo false)"
+        # Determine if the PR is from a fork. The precheck step already fetched
+        # the PR object; only fall back to the API when its output is missing.
+        IS_FORK_PR="${{ steps.precheck.outputs.is_fork_pr }}"
+        if [ -z "$IS_FORK_PR" ]; then
+          IS_FORK_PR="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '((.head.repo.full_name // "") != (.base.repo.full_name // ""))' 2>/dev/null || echo false)"
+        fi
 
         # Resolve effective scope and review result
         EFFECTIVE_SCOPE="${{ steps.precheck.outputs.effective_review_scope || 'full' }}"
@@ -570,10 +862,10 @@ runs:
         fi
 
         # Build metadata marker with verdict safety for incremental
-        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || '' }}" "$PREVIOUS_HEAD_SHA")"
-        ANALYSIS_SCOPE_SUFFIX=""
+        METADATA_MARKER="$(build_metadata_marker "${{ github.event.pull_request.base.sha || steps.precheck.outputs.base_sha }}" "$PREVIOUS_HEAD_SHA")"
+        REVIEW_HEADER="# AI Automated Review"
         if [ "$EFFECTIVE_SCOPE" = "incremental" ]; then
-          ANALYSIS_SCOPE_SUFFIX=" (incremental delta review)"
+          REVIEW_HEADER="# AI Automated Review (incremental)"
         fi
 
         # Evaluate approval guardrails with baseline check for incremental
@@ -600,23 +892,67 @@ runs:
         # Build the review body with managed marker
         BODY_FILE="review-verdict-body.md"
         {
+          echo "$COMMENT_MARKER"
           echo "$METADATA_MARKER"
-          echo "# AI Automated Review"
+          if [ -n "${HEAD_SHA:-}" ]; then
+            echo "<!-- ai-pr-review-sha:${HEAD_SHA} -->"
+          fi
+          if [ -n "${BROAD_FINGERPRINT:-}" ]; then
+            echo "<!-- ai-pr-review-fingerprint:${BROAD_FINGERPRINT} -->"
+          fi
+          echo "$REVIEW_HEADER"
           echo
           if [ "$EFFECTIVE_SCOPE" = "incremental" ]; then
-            echo "_Incremental review: reviewed changes since the last managed review. This is not a full re-review of the entire PR._"
+            echo "_Incremental review: reviewed the changes since the last managed review; unresolved findings from that review are carried forward._"
           else
             echo "_Full PR review._"
           fi
           echo
-          printf '_Analysis engine: %s%s_\n' "$ANALYSIS_ENGINE" "$ANALYSIS_SCOPE_SUFFIX"
+          printf '_Analysis engine: %s_\n' "$ANALYSIS_ENGINE"
           echo
           cat review-verdict-markdown.raw.md
         } > "$BODY_FILE"
 
+        # Resolve threads of carried findings this review verified as fixed,
+        # and reply on threads still open (#208, #209). Must precede the
+        # comment build so finding-threads.json suppresses duplicates.
+        resolve_finding_threads
+
+        # Build line-anchored inline comments from the structured findings
+        # when enabled. Anchors are validated against pr.diff (written by the
+        # review step); non-anchorable findings stay in the body only.
+        COMMENTS_JSON="[]"
+        if [ "$(printf '%s' "${INLINE_FINDINGS:-false}" | tr '[:upper:]' '[:lower:]')" = "true" ] && [ -n "${FINDINGS:-}" ]; then
+          printf '%s' "$FINDINGS" > findings.json
+          if SUPPRESS_FINDINGS_FILE=finding-threads.json INLINE_FINDINGS_MAX="${INLINE_FINDINGS_MAX:-20}" python3 "${GITHUB_ACTION_PATH}/scripts/build_review_comments.py" findings.json pr.diff review-comments.json; then
+            COMMENTS_JSON="$(cat review-comments.json)"
+          fi
+        fi
+
+        # Submit the native review, attaching inline comments when present.
+        # If GitHub rejects the comments payload (e.g. an anchor raced a new
+        # push), fall back to the plain review so publishing never breaks
+        # because of inline findings.
+        submit_native_review() {
+          local event="$1" body_file="$2"
+          if [ -n "$COMMENTS_JSON" ] && [ "$COMMENTS_JSON" != "[]" ]; then
+            jq -n --rawfile body "$body_file" --arg event "$event" --argjson comments "$COMMENTS_JSON" \
+              '{body: $body, event: $event, comments: $comments}' > review-request.json
+            if gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --method POST --input review-request.json >/dev/null 2>&1; then
+              echo "Submitted native review ($event) with $(printf '%s' "$COMMENTS_JSON" | jq 'length') inline comment(s)"
+              return 0
+            fi
+            echo "WARN: inline-comment review submission failed; falling back to plain review" >&2
+          fi
+          case "$event" in
+            APPROVE) gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body-file "$body_file" ;;
+            *) gh pr review "$PR_NUMBER" --repo "$REPO" --request-changes --body-file "$body_file" ;;
+          esac
+        }
+
         if [ "$CAN_APPROVE" = true ]; then
           echo "Submitting native approval for #$PR_NUMBER"
-          if ! gh pr review "$PR_NUMBER" --repo "$REPO" --approve --body-file "$BODY_FILE" 2>&1; then
+          if ! submit_native_review APPROVE "$BODY_FILE" 2>&1; then
             echo "ERROR: Native approval failed for #$PR_NUMBER." >&2
             echo "This may be caused by the 'Allow GitHub Actions to create and approve pull requests' setting being disabled." >&2
             echo "Enable this setting at: Repository Settings → Actions → General → Allow GitHub Actions to create and approve pull requests" >&2
@@ -628,14 +964,22 @@ runs:
           echo "Blocking native approval for #$PR_NUMBER (allow_approve=${ALLOW_APPROVE_BOOL}, approve_forks=${APPROVE_FORKS_BOOL}, is_fork=${IS_FORK_PR})"
 
           if [ "$VERDICT" = "request_changes" ]; then
-            gh pr review "$PR_NUMBER" --repo "$REPO" --request-changes --body-file "$BODY_FILE"
+            submit_native_review REQUEST_CHANGES "$BODY_FILE"
           else
-            # Model approved but guardrails blocked it
-            {
-              echo ""
-              echo "> **Approval blocked by policy**: This workflow requires \`allow_approve: true\` to submit native approvals. Set that input to enable automatic approval."
-            } >> "$BODY_FILE"
+            # The review approved but a guardrail blocked native approval —
+            # explain the actual reason.
+            if [ "$EFFECTIVE_SCOPE" = "incremental" ] && [ "$BASELINE_CLEAN" != "true" ]; then
+              {
+                echo ""
+                echo "> **Approval withheld**: the previous review of this PR found blocking issues. This review's verdict is approve, but native approval is withheld until a review against a clean baseline confirms the PR as a whole."
+              } >> "$BODY_FILE"
+            else
+              {
+                echo ""
+                echo "> **Approval blocked by policy**: native approvals require \`allow_approve: true\` (and \`approve_forks: true\` for cross-repository PRs)."
+              } >> "$BODY_FILE"
+            fi
 
-            gh pr review "$PR_NUMBER" --repo "$REPO" --request-changes --body-file "$BODY_FILE"
+            submit_native_review REQUEST_CHANGES "$BODY_FILE"
           fi
         fi

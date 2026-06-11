@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 # Ensure the scripts directory is on sys.path so we can import shared helpers.
@@ -95,6 +96,156 @@ def parse_findings(payload: object) -> tuple[str, list[dict[str, str]]]:
     return highest, findings[:40]
 
 
+# Model API keys are stripped from provider subprocess environments: providers
+# talk to the repo, not the model, so they have no legitimate use for them,
+# and this keeps a misbehaving provider command from echoing them into
+# captured output. GH_TOKEN is intentionally kept — providers commonly use gh.
+_SCRUBBED_ENV_KEYS = ("AI_API_KEY", "AI_FALLBACK_API_KEY")
+
+
+def provider_env() -> dict:
+    env = dict(os.environ)
+    for key in _SCRUBBED_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
+def run_provider(
+    index: int, provider: object, default_timeout: int, default_max_output: int
+) -> dict:
+    """Execute a single evidence provider and return its result entry."""
+    entry = {
+        "id": f"provider-{index}",
+        "status": "invalid",
+        "command": "",
+        "duration_sec": 0.0,
+        "exit_code": None,
+        "provider_severity": "info",
+        "findings": [],
+        "stdout": "",
+        "stderr": "",
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+    }
+
+    if isinstance(provider, dict) and provider.get("id"):
+        entry["id"] = str(provider["id"])
+
+    timeout = default_timeout
+    max_output = default_max_output
+    command = None
+
+    if isinstance(provider, dict):
+        command = provider.get("command")
+        if provider.get("timeout_sec") is not None:
+            try:
+                timeout = max(1, int(provider["timeout_sec"]))
+            except (TypeError, ValueError):
+                timeout = default_timeout
+        if provider.get("max_output_bytes") is not None:
+            try:
+                max_output = max(256, int(provider["max_output_bytes"]))
+            except (TypeError, ValueError):
+                max_output = default_max_output
+
+    if not command:
+        entry["status"] = "invalid"
+        entry["stderr"] = "Missing required field: command"
+        return entry
+
+    start = time.monotonic()
+    try:
+        if isinstance(command, list):
+            args = [str(part) for part in command]
+            entry["command"] = " ".join(shlex.quote(part) for part in args)
+            completed = subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+                env=provider_env(),
+            )
+        else:
+            command_text = str(command)
+            entry["command"] = command_text
+            completed = subprocess.run(
+                ["bash", "-lc", command_text],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+                check=False,
+                env=provider_env(),
+            )
+
+        entry["duration_sec"] = round(time.monotonic() - start, 3)
+        entry["exit_code"] = completed.returncode
+        entry["status"] = "ok" if completed.returncode == 0 else "error"
+
+        # --- Secret redaction on stdout/stderr before capturing output ---
+        stdout_text = completed.stdout.decode("utf-8", errors="replace") if completed.stdout else ""
+        stderr_text = completed.stderr.decode("utf-8", errors="replace") if completed.stderr else ""
+        entry["stdout"], entry["stdout_truncated"] = mask_and_truncate(
+            stdout_text, max_output
+        )
+        entry["stderr"], entry["stderr_truncated"] = mask_and_truncate(
+            stderr_text, max_output
+        )
+    except subprocess.TimeoutExpired as exc:
+        entry["duration_sec"] = round(time.monotonic() - start, 3)
+        entry["status"] = "timeout"
+        entry["exit_code"] = None
+        stdout_raw = exc.stdout if isinstance(exc.stdout, bytes) else b""
+        stderr_raw = exc.stderr if isinstance(exc.stderr, bytes) else b""
+
+        # Redact before storing in the summary JSON and markdown.
+        entry["stdout"], entry["stdout_truncated"] = mask_and_truncate(
+            stdout_raw.decode("utf-8", errors="replace") if stdout_raw else "",
+            max_output,
+        )
+        entry["stderr"], entry["stderr_truncated"] = mask_and_truncate(
+            stderr_raw.decode("utf-8", errors="replace") if stderr_raw else "",
+            max_output,
+        )
+
+    # Also redact the stored stdout before JSON-parse attempt so that
+    # any secrets leaking into the parsed output are already gone.
+    entry["stdout"] = mask_secrets(entry["stdout"])
+
+    parsed = None
+    if entry["stdout"].strip():
+        try:
+            parsed = json.loads(entry["stdout"])
+        except json.JSONDecodeError:
+            parsed = None
+
+    if parsed is not None:
+        entry["output_format"] = "json"
+        severity, findings = parse_findings(parsed)
+        entry["provider_severity"] = severity
+        entry["findings"] = findings
+    else:
+        entry["output_format"] = "text"
+
+    return entry
+
+
+def head_tail_cap(text: str, max_bytes: int) -> str:
+    """Cap text at max_bytes keeping the head and the tail.
+
+    Command failures usually print the interesting part (the error) at the
+    end of the output, which a plain head-cap discarded.
+    """
+    raw = text.encode("utf-8", errors="replace")
+    if len(raw) <= max_bytes:
+        return text
+    head_bytes = max_bytes * 6 // 10
+    tail_bytes = max_bytes - head_bytes
+    head = raw[:head_bytes].decode("utf-8", errors="ignore")
+    tail = raw[len(raw) - tail_bytes :].decode("utf-8", errors="ignore")
+    return head + "\n…[middle truncated]…\n" + tail
+
+
 def write_outputs(summary: dict, markdown: str) -> None:
     Path("evidence-providers.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
@@ -151,123 +302,49 @@ def main() -> int:
 
     md_lines = ["Evidence providers executed before final review synthesis.", ""]
 
-    for index, provider in enumerate(providers[:25], start=1):
-        entry = {
-            "id": f"provider-{index}",
-            "status": "invalid",
-            "command": "",
-            "duration_sec": 0.0,
-            "exit_code": None,
-            "provider_severity": "info",
-            "findings": [],
-            "stdout": "",
-            "stderr": "",
-            "stdout_truncated": False,
-            "stderr_truncated": False,
-        }
+    # Providers are independent commands, so run them concurrently. Results
+    # keep config order regardless of completion order. Set
+    # EVIDENCE_PROVIDER_PARALLELISM=1 for providers that must run serially
+    # (e.g. they contend on the same working-tree files).
+    parallelism = env_int("EVIDENCE_PROVIDER_PARALLELISM", 4)
+    indexed = list(enumerate(providers[:25], start=1))
 
-        if isinstance(provider, dict) and provider.get("id"):
-            entry["id"] = str(provider["id"])
+    def _run(item: tuple) -> dict:
+        index, provider = item
+        return run_provider(index, provider, default_timeout, default_max_output)
 
-        timeout = default_timeout
-        max_output = default_max_output
-        command = None
+    if len(indexed) <= 1 or parallelism <= 1:
+        entries = [_run(item) for item in indexed]
+    else:
+        with ThreadPoolExecutor(max_workers=min(parallelism, len(indexed))) as executor:
+            entries = list(executor.map(_run, indexed))
 
-        if isinstance(provider, dict):
-            command = provider.get("command")
-            if provider.get("timeout_sec") is not None:
-                try:
-                    timeout = max(1, int(provider["timeout_sec"]))
-                except (TypeError, ValueError):
-                    timeout = default_timeout
-            if provider.get("max_output_bytes") is not None:
-                try:
-                    max_output = max(256, int(provider["max_output_bytes"]))
-                except (TypeError, ValueError):
-                    max_output = default_max_output
-
-        if not command:
-            entry["status"] = "invalid"
-            entry["stderr"] = "Missing required field: command"
-            summary["providers"].append(entry)
-            continue
-
-        start = time.monotonic()
-        try:
-            if isinstance(command, list):
-                args = [str(part) for part in command]
-                entry["command"] = " ".join(shlex.quote(part) for part in args)
-                completed = subprocess.run(
-                    args,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=timeout,
-                    check=False,
-                )
-            else:
-                command_text = str(command)
-                entry["command"] = command_text
-                completed = subprocess.run(
-                    ["bash", "-lc", command_text],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=timeout,
-                    check=False,
-                )
-
-            entry["duration_sec"] = round(time.monotonic() - start, 3)
-            entry["exit_code"] = completed.returncode
-            entry["status"] = "ok" if completed.returncode == 0 else "error"
-
-            # --- Secret redaction on stdout/stderr before capturing output ---
-            stdout_text = completed.stdout.decode("utf-8", errors="replace") if completed.stdout else ""
-            stderr_text = completed.stderr.decode("utf-8", errors="replace") if completed.stderr else ""
-            entry["stdout"], entry["stdout_truncated"] = mask_and_truncate(
-                stdout_text, max_output
-            )
-            entry["stderr"], entry["stderr_truncated"] = mask_and_truncate(
-                stderr_text, max_output
-            )
-        except subprocess.TimeoutExpired as exc:
-            entry["duration_sec"] = round(time.monotonic() - start, 3)
-            entry["status"] = "timeout"
-            entry["exit_code"] = None
-            stdout_raw = exc.stdout if isinstance(exc.stdout, bytes) else b""
-            stderr_raw = exc.stderr if isinstance(exc.stderr, bytes) else b""
-
-            # Redact before storing in the summary JSON and markdown.
-            entry["stdout"], entry["stdout_truncated"] = mask_and_truncate(
-                stdout_raw.decode("utf-8", errors="replace") if stdout_raw else "",
-                max_output,
-            )
-            entry["stderr"], entry["stderr_truncated"] = mask_and_truncate(
-                stderr_raw.decode("utf-8", errors="replace") if stderr_raw else "",
-                max_output,
-            )
-
-        # Also redact the stored stdout before JSON-parse attempt so that
-        # any secrets leaking into the parsed output are already gone.
-        entry["stdout"] = mask_secrets(entry["stdout"])
-
-        parsed = None
-        if entry["stdout"].strip():
-            try:
-                parsed = json.loads(entry["stdout"])
-            except json.JSONDecodeError:
-                parsed = None
-
-        if parsed is not None:
-            entry["output_format"] = "json"
-            severity, findings = parse_findings(parsed)
-            entry["provider_severity"] = severity
-            entry["findings"] = findings
-        else:
-            entry["output_format"] = "text"
-
+    for entry in entries:
         if entry["provider_severity"] == "blocker":
             summary["has_blocker"] = True
-
         summary["providers"].append(entry)
+
+    # Markdown embeds are head+tail capped, per stream and in aggregate, so
+    # one chatty provider cannot crowd everything else out of the corpus.
+    # evidence-providers.json keeps the full (per-provider capped) output.
+    md_stdout_cap = env_int("EVIDENCE_MARKDOWN_STDOUT_BYTES", 4000)
+    md_stderr_cap = env_int("EVIDENCE_MARKDOWN_STDERR_BYTES", 2000)
+    md_budget = env_int("EVIDENCE_MARKDOWN_AGGREGATE_BYTES", 24000)
+
+    def emit_stream(label: str, text: str, per_cap: int) -> None:
+        nonlocal md_budget
+        if md_budget < 256:
+            md_lines.append(
+                f"- {label}: (omitted — aggregate evidence output cap reached; "
+                "full output in evidence-providers.json)"
+            )
+            return
+        block = head_tail_cap(text, min(per_cap, md_budget))
+        md_budget -= len(block.encode("utf-8", errors="replace"))
+        md_lines.append(f"- {label}:")
+        md_lines.append("```text")
+        md_lines.append(block)
+        md_lines.append("```")
 
     if not summary["providers"]:
         md_lines.append("No providers were configured in the config file.")
@@ -290,17 +367,11 @@ def main() -> int:
 
             stdout_text = provider.get("stdout", "").strip()
             if stdout_text and not findings:
-                md_lines.append("- stdout:")
-                md_lines.append("```text")
-                md_lines.append(stdout_text)
-                md_lines.append("```")
+                emit_stream("stdout", stdout_text, md_stdout_cap)
 
             stderr_text = provider.get("stderr", "").strip()
             if stderr_text:
-                md_lines.append("- stderr:")
-                md_lines.append("```text")
-                md_lines.append(stderr_text)
-                md_lines.append("```")
+                emit_stream("stderr", stderr_text, md_stderr_cap)
 
             md_lines.append("")
 

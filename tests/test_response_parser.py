@@ -259,5 +259,185 @@ class TestParseResponseFile:
         assert "typo" in result["review_markdown"]
 
 
+# ---------------------------------------------------------------------------
+# Verdict normalisation, truncation, and stream-error handling
+# ---------------------------------------------------------------------------
+
+def _exit_msg(resp: dict) -> str:
+    """Call parse_response expecting SystemExit; return the message."""
+    try:
+        parse_response(resp)
+    except SystemExit as exc:
+        return str(exc)
+    raise AssertionError("expected SystemExit but parse_response returned")
+
+
+class TestVerdictNormalization:
+    @staticmethod
+    def _resp(verdict: str, finish_reason: str = "stop") -> dict:
+        return {
+            "choices": [{
+                "message": {"content": json.dumps(
+                    {"verdict": verdict, "review_markdown": "# ok"}
+                )},
+                "finish_reason": finish_reason,
+            }],
+        }
+
+    def test_capitalized_approve(self):
+        assert parse_response(self._resp("Approve"))["verdict"] == "approve"
+
+    def test_approved_synonym(self):
+        assert parse_response(self._resp("APPROVED"))["verdict"] == "approve"
+
+    def test_spaced_request_changes(self):
+        assert parse_response(self._resp("Request Changes"))["verdict"] == "request_changes"
+
+    def test_changes_requested_synonym(self):
+        assert parse_response(self._resp("changes_requested"))["verdict"] == "request_changes"
+
+    def test_unknown_verdict_still_rejected(self):
+        assert "Expected verdict" in _exit_msg(self._resp("maybe"))
+
+
+class TestTruncationAndStreamError:
+    def test_truncation_hint_openai_length(self):
+        # Unparseable (truncated) content with finish_reason=length.
+        resp = {"choices": [{"message": {"content": '{"verdict": "approve"'},
+                             "finish_reason": "length"}]}
+        assert "truncated" in _exit_msg(resp)
+
+    def test_truncation_hint_anthropic_max_tokens(self):
+        resp = {"content": [{"type": "text", "text": '{"verdict":'}],
+                "stop_reason": "max_tokens"}
+        assert "truncated" in _exit_msg(resp)
+
+    def test_no_truncation_hint_when_finished_normally(self):
+        resp = {"choices": [{"message": {"content": "no json here"},
+                             "finish_reason": "stop"}]}
+        assert "truncated" not in _exit_msg(resp)
+
+    def test_stream_error_surfaced(self):
+        resp = {"error": {"message": "context length exceeded"},
+                "choices": [{"message": {"content": ""}}]}
+        msg = _exit_msg(resp)
+        assert "context length exceeded" in msg
+
+
+def _openai_with(payload: dict) -> dict:
+    return {"choices": [{"message": {"content": json.dumps(payload)}}]}
+
+
+class TestFindingsNormalization:
+    BASE = {"verdict": "approve", "review_markdown": "ok"}
+
+    def _parse_findings(self, findings):
+        payload = dict(self.BASE)
+        if findings is not None:
+            payload["findings"] = findings
+        return parse_response(_openai_with(payload))["findings"]
+
+    def test_absent_findings_become_empty_list(self):
+        assert self._parse_findings(None) == []
+
+    def test_null_findings_become_empty_list(self):
+        payload = dict(self.BASE, findings=None)
+        assert parse_response(_openai_with(payload))["findings"] == []
+
+    def test_non_list_findings_become_empty_list(self):
+        assert self._parse_findings("not a list") == []
+
+    def test_valid_finding_normalized(self):
+        out = self._parse_findings([
+            {"severity": "blocker", "category": "security", "file": "./a/b.py",
+             "line": "42", "message": "  path traversal  "}
+        ])
+        assert out == [{
+            "severity": "blocker", "category": "security", "file": "a/b.py",
+            "line": 42, "message": "path traversal",
+        }]
+
+    def test_severity_aliases_mapped(self):
+        out = self._parse_findings([
+            {"severity": "Critical", "message": "a"},
+            {"severity": "HIGH", "message": "b"},
+            {"severity": "warning", "message": "c"},
+            {"severity": "nit", "message": "d"},
+            {"severity": "made-up", "message": "e"},
+        ])
+        assert [f["severity"] for f in out] == [
+            "blocker", "major", "minor", "info", "info",
+        ]
+
+    def test_unknown_category_becomes_other(self):
+        out = self._parse_findings([{"message": "x", "category": "vibes"}])
+        assert out[0]["category"] == "other"
+
+    def test_items_without_message_dropped(self):
+        out = self._parse_findings([
+            {"severity": "blocker"},
+            "just a string",
+            42,
+            {"message": "   "},
+            {"message": "kept"},
+        ])
+        assert len(out) == 1
+        assert out[0]["message"] == "kept"
+
+    def test_message_fallbacks_summary_and_title(self):
+        out = self._parse_findings([
+            {"summary": "from summary"},
+            {"title": "from title"},
+        ])
+        assert [f["message"] for f in out] == ["from summary", "from title"]
+
+    def test_invalid_lines_become_null(self):
+        out = self._parse_findings([
+            {"message": "a", "line": 0},
+            {"message": "b", "line": -3},
+            {"message": "c", "line": "abc"},
+            {"message": "d", "line": True},
+            {"message": "e", "line": 7.0},
+        ])
+        assert [f["line"] for f in out] == [None, None, None, None, 7]
+
+    def test_parent_traversal_path_not_silently_rewritten(self):
+        out = self._parse_findings([{"message": "x", "file": "../etc/passwd"}])
+        assert out[0]["file"] == "../etc/passwd"
+
+    def test_findings_capped_at_50(self):
+        out = self._parse_findings([{"message": f"f{i}"} for i in range(80)])
+        assert len(out) == 50
+
+    def test_id_and_resolution_preserved(self):
+        out = self._parse_findings([
+            {"message": "carried", "id": "P1", "resolution": "resolved"},
+            {"message": "alias", "id": "P2", "resolution": "FIXED"},
+            {"message": "open", "id": "P3", "resolution": "still_open"},
+            {"message": "unknown", "id": "P4", "resolution": "not_verifiable"},
+        ])
+        assert [(f["id"], f["resolution"]) for f in out] == [
+            ("P1", "resolved"), ("P2", "resolved"), ("P3", "still_open"),
+            ("P4", "not_verifiable_from_delta"),
+        ]
+
+    def test_invalid_id_and_resolution_dropped(self):
+        out = self._parse_findings([
+            {"message": "a", "id": "../;rm -rf", "resolution": "maybe?"},
+            {"message": "b", "id": 7, "resolution": ["resolved"]},
+            {"message": "c"},
+        ])
+        assert out[0]["id"] == "rm-rf"
+        assert "resolution" not in out[0]
+        assert "id" not in out[1] and "resolution" not in out[1]
+        assert "id" not in out[2]
+
+    def test_weak_model_without_findings_unchanged(self):
+        result = parse_response(_openai_with(self.BASE))
+        assert result["verdict"] == "approve"
+        assert result["review_markdown"] == "ok"
+        assert result["findings"] == []
+
+
 if __name__ == "__main__":
     unittest_main()

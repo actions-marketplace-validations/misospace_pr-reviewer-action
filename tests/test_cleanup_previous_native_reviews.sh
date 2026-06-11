@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Bash >= 4 required: empty-array expansion under `set -u` and other 4.x
+# behaviors break on macOS stock bash 3.2. Skip (not fail) so local runs
+# explain themselves; CI runs bash 5.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "SKIP: bash >= 4 required (found ${BASH_VERSION:-unknown}); on macOS run with PATH=\"/opt/homebrew/bin:\$PATH\"" >&2
+  exit 0
+fi
+
 # Tests for issue #106: cleanup of superseded native PR reviews
 # These tests validate the shell logic used by the native review publish steps.
 
@@ -131,6 +139,22 @@ STICKY_COMMENT_BODY=$(awk '/Publish review comment$/,/^    - name: Publish revie
 check_contains "sticky comment mode uses COMMENT_MARKER variable" \
   "$STICKY_COMMENT_BODY" "COMMENT_MARKER"
 
+# Every published body must carry the bare COMMENT_MARKER and the fingerprint
+# marker, otherwise the precheck cannot find prior state and skip-if-unchanged /
+# incremental scope silently never trigger (regression guard).
+check_contains "sticky comment body emits the bare COMMENT_MARKER" \
+  "$STICKY_COMMENT_BODY" 'echo "$COMMENT_MARKER"'
+check_contains "sticky comment body emits the fingerprint marker" \
+  "$STICKY_COMMENT_BODY" "ai-pr-review-fingerprint"
+check_contains "review_comment body emits the bare COMMENT_MARKER" \
+  "$BODY_CONTENT_REVIEW_COMMENT" 'echo "$COMMENT_MARKER"'
+check_contains "review_comment body emits the fingerprint marker" \
+  "$BODY_CONTENT_REVIEW_COMMENT" "ai-pr-review-fingerprint"
+check_contains "review_verdict body emits the bare COMMENT_MARKER" \
+  "$BODY_CONTENT_REVIEW_VERDICT" 'echo "$COMMENT_MARKER"'
+check_contains "review_verdict body emits the fingerprint marker" \
+  "$BODY_CONTENT_REVIEW_VERDICT" "ai-pr-review-fingerprint"
+
 echo ""
 echo "=== Helper script validation ==="
 
@@ -219,6 +243,123 @@ check_exists "README documents dismissal behavior" \
 
 check_exists "README warns about permission requirements" \
   "$(grep -ci 'permission\|warn' "$README_MD" || echo 0)"
+
+echo ""
+echo "=== Functional: cleanup_native_reviews matching + single list query ==="
+
+CLEANUP_TMP="$(mktemp -d)"
+trap 'rm -rf "$CLEANUP_TMP"' EXIT
+mkdir -p "$CLEANUP_TMP/bin"
+CALL_LOG="$CLEANUP_TMP/gh-calls.log"
+: > "$CALL_LOG"
+
+# Review fixtures: 11 carries a custom marker, 22 carries only the legacy
+# v1.1.x JSON metadata marker, 33 is a human review, 44 is unmanaged bot output.
+cat > "$CLEANUP_TMP/reviews.json" <<'JSONEOF'
+[
+  {"id": 11, "node_id": "PRR_node11", "state": "APPROVED", "user": {"login": "test-bot"},
+   "body": "<!-- my-marker -->\n<!-- ai-pr-review-sha:abc -->\nold review"},
+  {"id": 22, "node_id": "PRR_node22", "state": "CHANGES_REQUESTED", "user": {"login": "test-bot"},
+   "body": "<!-- ai-pr-reviewer:{\"version\":1,\"head_sha\":\"abc\"} -->\nlegacy review"},
+  {"id": 33, "node_id": "PRR_node33", "state": "APPROVED", "user": {"login": "human"},
+   "body": "Quoting the bot here: <!-- my-marker -->\nhuman pasted the marker mid-body"},
+  {"id": 44, "node_id": "PRR_node44", "state": "COMMENTED", "user": {"login": "test-bot"},
+   "body": "unrelated bot output"}
+]
+JSONEOF
+
+cat > "$CLEANUP_TMP/bin/gh" <<SHELLEOF
+#!/usr/bin/env bash
+echo "\$*" >> "$CALL_LOG"
+case "\$*" in
+  *"/reviews --paginate"*) cat "$CLEANUP_TMP/reviews.json" ;;
+  *dismissals*) echo '{"id": 1}' ;;
+  *"api graphql"*) echo '{"data":{"minimizeComment":{"minimizedComment":{"isMinimized":true}}}}' ;;
+  *"--method PUT"*) echo '{}' ;;
+esac
+exit 0
+SHELLEOF
+chmod +x "$CLEANUP_TMP/bin/gh"
+
+CLEANUP_OUTPUT="$(
+  PATH="$CLEANUP_TMP/bin:$PATH" \
+  GH_TOKEN=test REPO="test/repo" PR_NUMBER=9 COMMENT_MARKER="<!-- my-marker -->" \
+  bash -c 'source "'"$HELPER_SCRIPT"'"; cleanup_native_reviews true' 2>&1
+)"
+
+check_contains "custom-marker review is dismissed" \
+  "$CLEANUP_OUTPUT" "Dismissed outdated managed review #11 (APPROVED)"
+check_contains "legacy JSON-marker review is dismissed" \
+  "$CLEANUP_OUTPUT" "Dismissed outdated managed review #22 (CHANGES_REQUESTED)"
+check_not_contains "human review with pasted marker is untouched" \
+  "$CLEANUP_OUTPUT" "#33"
+check_not_contains "unmanaged bot review is untouched" \
+  "$CLEANUP_OUTPUT" "#44"
+
+# State must come from the list query — no per-review GETs.
+PER_REVIEW_GETS="$(grep -E 'reviews/[0-9]+' "$CALL_LOG" | grep -vc -- '--method' || true)"
+check "review state read from list query (no per-review GET)" "$PER_REVIEW_GETS" "0"
+LIST_QUERIES="$(grep -c '/reviews --paginate' "$CALL_LOG" || true)"
+check "exactly one review list query" "$LIST_QUERIES" "1"
+
+echo ""
+echo "=== Functional: identity-independent matching (installation tokens) ==="
+
+# Under installation tokens (default GITHUB_TOKEN and GitHub App tokens),
+# /user returns 403 — and gh prints the JSON error body to STDOUT, which is
+# how the old author-matching cleanup silently dismissed nothing on every
+# production run (#190). Matching is now marker-based and must work for any
+# bot identity without ever calling /user.
+cat > "$CLEANUP_TMP/reviews.json" <<'JSONEOF'
+[
+  {"id": 55, "node_id": "PRR_node55", "state": "APPROVED", "user": {"login": "github-actions[bot]"},
+   "body": "<!-- ai-pr-reviewer -->\nold default-token review"},
+  {"id": 66, "node_id": "PRR_node66", "state": "APPROVED", "user": {"login": "its-saffron[bot]"},
+   "body": "<!-- ai-pr-reviewer -->\nold app-token review"},
+  {"id": 77, "node_id": "PRR_node77", "state": "APPROVED", "user": {"login": "human"},
+   "body": "LGTM"}
+]
+JSONEOF
+
+# True-to-production mock: /user prints the JSON error body to stdout and
+# exits 1 (gh api does NOT apply --jq to error responses).
+cat > "$CLEANUP_TMP/bin/gh" <<SHELLEOF
+#!/usr/bin/env bash
+echo "\$*" >> "$CALL_LOG"
+if [ "\$1" = "api" ] && [ "\$2" = "user" ]; then
+  printf '{\n  "message": "Resource not accessible by integration",\n  "status": "403"\n}\n'
+  exit 1
+fi
+case "\$*" in
+  *"/reviews --paginate"*) cat "$CLEANUP_TMP/reviews.json" ;;
+  *dismissals*) echo '{"id": 1}' ;;
+  *"api graphql"*) echo '{"data":{"minimizeComment":{"minimizedComment":{"isMinimized":true}}}}' ;;
+  *"--method PUT"*) echo '{}' ;;
+esac
+exit 0
+SHELLEOF
+chmod +x "$CLEANUP_TMP/bin/gh"
+
+CLEANUP_OUTPUT="$(
+  PATH="$CLEANUP_TMP/bin:$PATH" \
+  GH_TOKEN=test REPO="test/repo" PR_NUMBER=9 COMMENT_MARKER="<!-- ai-pr-reviewer -->" \
+  bash -c 'source "'"$HELPER_SCRIPT"'"; cleanup_native_reviews true' 2>&1
+)"
+
+check_contains "default-token bot review is dismissed" \
+  "$CLEANUP_OUTPUT" "Dismissed outdated managed review #55 (APPROVED)"
+check_contains "app-token bot review is dismissed (no identity needed)" \
+  "$CLEANUP_OUTPUT" "Dismissed outdated managed review #66 (APPROVED)"
+check_contains "reviews are minimized (hidden) in the timeline" \
+  "$CLEANUP_OUTPUT" "Minimized (hidden as outdated) review #55"
+check_not_contains "human review untouched" \
+  "$CLEANUP_OUTPUT" "#77"
+check_not_contains "cleanup is not skipped" \
+  "$CLEANUP_OUTPUT" "skipping cleanup"
+check_not_contains "no identity fallback remains" \
+  "$CLEANUP_OUTPUT" "assuming github-actions"
+USER_CALLS="$(grep -c '^api user' "$CALL_LOG" || true)"
+check "no /user lookup is made" "$USER_CALLS" "0"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
