@@ -179,6 +179,82 @@ class TestTryDecodeJson(TestCase):
         result = _try_decode_json("Here is the answer: {\"key\": \"value\"}")
         self.assertEqual(result, {"key": "value"})
 
+    def test_reasoning_array_before_object(self):
+        """A reasoning model (e.g. dsv4f via litellm) folds thinking prose
+        into ``content``. That prose may contain a valid JSON array ahead
+        of the verdict object. The scanner must skip the array and recover
+        the verdict object rather than returning the array (#dsv4f)."""
+        src = (
+            'Let me weigh the verdicts: ["approve", "request_changes"]. '
+            'Now the answer: {"verdict": "approve", "review_markdown": "# OK"}'
+        )
+        result = _try_decode_json(src)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["verdict"], "approve")
+
+    def test_findings_array_before_object(self):
+        """Thinking that drafts a findings list (a JSON array of dicts)
+        must not shadow the verdict object that follows."""
+        src = (
+            'Draft findings: [{"message": "x"}, {"message": "y"}] '
+            'Final: {"verdict": "request_changes", "review_markdown": "fix"}'
+        )
+        result = _try_decode_json(src)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["verdict"], "request_changes")
+
+    def test_array_containing_verdict_dict_not_peeked(self):
+        """Hardest skip-past case: a preamble array that itself holds a
+        verdict-shaped dict, followed by the real verdict. The scanner must
+        treat the array as opaque (advance past it) and NOT pluck the
+        interior verdict dict out of the array."""
+        src = (
+            'Draft: [{"verdict": "approve", "review_markdown": "draft"}] '
+            'Real: {"verdict": "request_changes", "review_markdown": "real"}'
+        )
+        result = _try_decode_json(src)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["verdict"], "request_changes")
+        self.assertEqual(result["review_markdown"], "real")
+
+    def test_stray_dict_before_verdict_dict(self):
+        """Preamble that drafts a non-verdict object must lose to the
+        verdict-shaped object that follows."""
+        src = (
+            'Notes: {"analysis": "diff is small and safe"} '
+            'Real answer: {"verdict": "approve", "review_markdown": "# OK"}'
+        )
+        result = _try_decode_json(src)
+        self.assertEqual(result.get("review_markdown"), "# OK")
+
+    def test_partial_verdict_draft_skipped_for_complete(self):
+        """A reasoning preamble drafting a *partial* verdict (``verdict``
+        only, no ``review_markdown``) ahead of the real complete verdict
+        must not be picked — the complete one wins. This is the dsv4f
+        dogfood failure: after arrays were handled, the model's partial
+        draft was returned, yielding 'missing required key review_markdown'.
+        """
+        src = (
+            'Schema check: {"verdict": "approve"} '
+            'Final answer: {"verdict": "approve", "review_markdown": "# OK"}'
+        )
+        result = _try_decode_json(src)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["verdict"], "approve")
+        self.assertEqual(result["review_markdown"], "# OK")
+
+    def test_sample_complete_verdict_loses_to_last_real_one(self):
+        """Where two *complete* verdicts appear, the LAST one wins — the
+        real answer is conventionally the final JSON the model emits, so
+        an earlier sample draft must not shadow it."""
+        src = (
+            'Sample: {"verdict": "request_changes", "review_markdown": "draft"} '
+            'Real: {"verdict": "approve", "review_markdown": "# Looks good"}'
+        )
+        result = _try_decode_json(src)
+        self.assertEqual(result["verdict"], "approve")
+        self.assertEqual(result["review_markdown"], "# Looks good")
+
     def test_no_json(self):
         self.assertIsNone(_try_decode_json("just text"))
 
@@ -304,6 +380,39 @@ class TestParseResponse(TestCase):
         resp = {"choices": [{"message": {"content": f"Sure thing:\n{inner}\n\nThanks!"}}]}
         result = parse_response(resp)
         self.assertEqual(result["verdict"], "approve")
+
+    def test_reasoning_model_array_before_verdict(self):
+        """Regression for dsv4f: a reasoning model folds thinking into
+        ``content`` (the OpenAI SSE path has no reasoning_content channel,
+        unlike Anthropic). The thinking contains a valid JSON array ahead
+        of the real verdict object. Previously this raised "Expected JSON
+        object but got list"; now the verdict object is recovered."""
+        content = (
+            "We need answer JSON review. Need decide approve vs "
+            'request_changes. Candidates: ["approve", "request_changes"]. '
+            "Now the verdict: "
+            + json.dumps({"verdict": "approve", "review_markdown": "# Looks good"})
+        )
+        resp = {"choices": [{"message": {"content": content}}]}
+        result = parse_response(resp)
+        self.assertEqual(result["verdict"], "approve")
+        self.assertEqual(result["review_markdown"], "# Looks good")
+
+    def test_reasoning_model_partial_draft_then_complete(self):
+        """Regression for the dsv4f dogfood follow-up: thinking drafts a
+        *partial* verdict (``verdict`` only) before the complete one.
+        Previously raised 'missing required key review_markdown'; now the
+        complete verdict wins."""
+        content = (
+            "Let me set the shape: "
+            + json.dumps({"verdict": "approve"})
+            + " Now the full review: "
+            + json.dumps({"verdict": "approve", "review_markdown": "# Ship it"})
+        )
+        resp = {"choices": [{"message": {"content": content}}]}
+        result = parse_response(resp)
+        self.assertEqual(result["verdict"], "approve")
+        self.assertEqual(result["review_markdown"], "# Ship it")
 
     # --- Error cases ---
 

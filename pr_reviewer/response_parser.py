@@ -129,9 +129,16 @@ def _escape_raw_newlines_in_strings(text: str) -> str:
 def _try_decode_json(text: str) -> Any | None:
     """Attempt to decode a JSON object/list from *text*.
 
-    Scans character-by-character for the first ``{`` or ``[`` and tries to
-    parse from there, stopping at the first successful decode.  This mirrors
-    the shell script's ``for start in range(len(text))`` loop.
+    Collects every *top-level* JSON value found in *text* (skipping past
+    each decoded value so the interior of an array is never re-scanned),
+    then prefers the one that looks like the verdict object.  Reasoning
+    models routed through an OpenAI-compatible proxy frequently emit
+    thinking prose in ``content`` carrying valid but irrelevant JSON — an
+    array, or a *partial* verdict draft like ``{"verdict": "approve"}`` —
+    *before* the real verdict object. So a complete verdict dict (both
+    ``verdict`` and ``review_markdown`` keys) is preferred over a partial
+    one, and where several complete verdicts exist the *last* wins (the
+    real answer is conventionally the final JSON the model emits).
 
     If the raw scan finds nothing, retries with raw newlines inside string
     values escaped — the most common failure shape for models that emit
@@ -141,14 +148,69 @@ def _try_decode_json(text: str) -> Any | None:
     decoder = json.JSONDecoder()
 
     def _scan(source: str) -> Any | None:
-        for i, ch in enumerate(source):
+        # Collect every *top-level* JSON value in order, advancing past
+        # each decoded value so the interior of an array is never re-scanned
+        # (a nested {"verdict": ...} inside a findings array must not
+        # masquerade as the top-level verdict). Reasoning models routed
+        # through an OpenAI-compatible proxy (e.g. DeepSeek V4 Flash via
+        # litellm) often emit thinking prose in ``content`` that contains a
+        # valid but irrelevant JSON array — a findings draft, a list of
+        # candidate verdicts, a checklist — or a *partial* verdict draft
+        # (``{"verdict": "approve"}`` with no ``review_markdown``) before
+        # the real verdict object. Returning the first decodable value grabs
+        # that, so below we prefer a complete verdict dict (both keys) and,
+        # among complete ones, the last (the real final answer).
+        candidates: list[Any] = []
+        i = 0
+        while i < len(source):
+            ch = source[i]
             if ch not in ("{", "["):
+                i += 1
                 continue
             try:
-                obj, _end = decoder.raw_decode(source[i:])
-                return obj
+                obj, consumed = decoder.raw_decode(source[i:])
             except json.JSONDecodeError:
+                i += 1
                 continue
+            candidates.append(obj)
+            # raw_decode always consumes >= 1 char (it raises on empty
+            # input), so this advances the cursor unconditionally.
+            i += consumed
+        if not candidates:
+            return None
+        # Pick the most verdict-like candidate. Reasoning models route
+        # thinking through ``content`` and frequently draft sample or
+        # *partial* verdict objects (e.g. ``{"verdict": "approve"}`` with
+        # no ``review_markdown``) in their preamble before emitting the real
+        # final answer at the end. Preference, in priority order:
+        #   1. the LAST dict carrying BOTH required keys — the real verdict;
+        #      a later complete verdict beats an earlier sample draft,
+        #   2. the LAST dict carrying either key — closest to the answer; a
+        #      partial draft that fails validation downstream to retry,
+        #   3. the first dict of any shape,
+        #   4. the first list (a single-item wrapper is unwrapped by
+        #      ``parse_response``).
+        complete: list[Any] = []
+        partial: list[Any] = []
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            has_v = "verdict" in cand
+            has_m = "review_markdown" in cand
+            if has_v and has_m:
+                complete.append(cand)
+            elif has_v or has_m:
+                partial.append(cand)
+        if complete:
+            return complete[-1]
+        if partial:
+            return partial[-1]
+        for cand in candidates:
+            if isinstance(cand, dict):
+                return cand
+        for cand in candidates:
+            if isinstance(cand, list):
+                return cand
         return None
 
     parsed = _scan(text)
