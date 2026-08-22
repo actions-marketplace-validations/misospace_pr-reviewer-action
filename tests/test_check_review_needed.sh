@@ -509,6 +509,39 @@ echo "=== Test 23: Forgejo write token reviews ==="
 RESULT="$(PLATFORM=forgejo FORGEJO_API_URL="https://forge.example.com" TEST_FORGEJO_PERMISSION=write run_precheck)"
 check "write-capable Forgejo token reviews" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
 
+# ── Test 24: diff-unchanged skip carries forward the previous verdict (#517) ──
+# The precheck short-circuits on an unchanged diff, but the last managed
+# review comment's marker already carries review_result — parse it and stamp
+# verdict/verdict_source so a downstream gate cannot flip red→green on re-run.
+# Seed the real current fingerprint; a metadata-only marker must not trigger
+# the diff-unchanged path by itself.
+echo ""
+echo "=== Test 24: diff-unchanged skip carries forward request_changes ==="
+set_empty_comments
+CARRY_FORWARD_FP="$(run_precheck | grep '^diff_fingerprint=' | head -1 | cut -d= -f2-)"
+set_comments "<!-- ai-pr-reviewer -->
+<!-- ai-pr-review-fingerprint:${CARRY_FORWARD_FP} -->
+<!-- ai-pr-reviewer: {\"review_result\": \"issues\"} -->"
+RESULT="$(run_precheck)"
+check "diff-unchanged skip carries request_changes" "$(echo "$RESULT" | grep '^verdict=' | head -1 | cut -d= -f2)" "request_changes"
+check "diff-unchanged skip marks verdict_source carry_forward" "$(echo "$RESULT" | grep '^verdict_source=' | head -1 | cut -d= -f2)" "carry_forward"
+
+echo ""
+echo "=== Test 25: diff-unchanged skip carries forward approve ==="
+set_comments "<!-- ai-pr-reviewer -->
+<!-- ai-pr-review-fingerprint:${CARRY_FORWARD_FP} -->
+<!-- ai-pr-reviewer: {\"review_result\": \"clean\"} -->"
+RESULT="$(run_precheck)"
+check "diff-unchanged skip carries approve" "$(echo "$RESULT" | grep '^verdict=' | head -1 | cut -d= -f2)" "approve"
+check "diff-unchanged skip marks verdict_source carry_forward" "$(echo "$RESULT" | grep '^verdict_source=' | head -1 | cut -d= -f2)" "carry_forward"
+
+echo ""
+echo "=== Test 26: diff-unchanged skip with no marker leaves verdict empty ==="
+set_empty_comments
+RESULT="$(run_precheck)"
+check "diff-unchanged skip without marker leaves verdict empty" "$(echo "$RESULT" | grep '^verdict=' | head -1 | cut -d= -f2)" ""
+check "diff-unchanged skip without marker leaves verdict_source empty" "$(echo "$RESULT" | grep '^verdict_source=' | head -1 | cut -d= -f2)" ""
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
 
