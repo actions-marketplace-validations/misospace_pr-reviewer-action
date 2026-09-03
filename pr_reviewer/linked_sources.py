@@ -1,0 +1,565 @@
+#!/usr/bin/env python3
+"""Linked-source markdown rendering for PR enrichment.
+
+Renders ``linked-sources.md`` from extracted URLs: fetches allowlisted
+sources in parallel, then augments GitHub/Forgejo release & compare URLs and
+ghcr.io image paths with structured API metadata. Extracted from
+``scripts/run_enrichment.py`` (#359) so the rendering + budget logic is unit
+testable.
+
+Network access goes through the module-level ``fetch_url`` / ``gh_api_call``
+names (so tests can monkeypatch them here) and is bounded by a
+``BudgetTracker``.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from urllib.parse import urlparse
+
+from pr_reviewer.budget import BudgetTracker
+from pr_reviewer.enrichment import (
+    classify_url,
+    host_allowed,
+    normalize_url,
+)
+from pr_reviewer.forgejo_backend import (
+    fetch_forge_compare,
+    fetch_forge_release,
+)
+from pr_reviewer.http_client import fetch_url, gh_api_call
+
+# reduce_source lives in scripts/strip_source_text.py; put scripts/ on the
+# path so this module reuses the single HTML-strip implementation rather than
+# duplicating it.
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+from strip_source_text import reduce_source  # noqa: E402
+
+SKIP_FETCH_HOSTS = {"gitlab.com", "bitbucket.org"}
+
+
+def strip_source_to_text(raw_bytes: bytes, max_bytes: int = 4000) -> str:
+    """Strip HTML to visible text, or pass through plain text."""
+    return reduce_source(raw_bytes, max_bytes)
+
+
+def _pick(d: dict, keys: tuple[str, ...]) -> dict:
+    """Project a dict onto the given keys, dropping absent ones."""
+    return {k: d.get(k) for k in keys if k in d}
+
+
+def _commit_summaries(commits: list, with_author: bool = False) -> list[dict]:
+    """Reduce compare-API commit objects to sha + message (+ author/date)."""
+    out = []
+    for c in commits:
+        commit = c.get("commit") or {}
+        entry: dict = {"sha": c.get("sha"), "commit": {"message": commit.get("message")}}
+        if with_author:
+            entry["commit"]["author"] = commit.get("author")
+            entry["commit"]["date"] = (commit.get("author") or {}).get("date")
+        out.append(entry)
+    return out
+
+
+def _repo_allowed(
+    owner: str,
+    repo: str,
+    current_repo: str | None,
+    allowed_repos: set[str] | None,
+) -> bool:
+    """Whether a (owner, repo) is in the operator-defined allowlist.
+
+    Matches the protection in ``platform.gh_api``: a repo key is only
+    eligible for enrichment ``gh api`` calls if it equals the repo under
+    review (``current_repo``) or appears in ``TOOL_ALLOWED_GH_API_REPOS``
+    (``allowed_repos``). Without this gate, a PR body containing links
+    to any other repo would let the operator token reach that repo.
+    """
+    key = f"{owner}/{repo}".lower()
+    if current_repo and key == current_repo.lower():
+        return True
+    if allowed_repos:
+        for ar in allowed_repos:
+            if not ar:
+                continue
+            if key == ar.lower():
+                return True
+            if ar.lower().endswith("/*") and key == ar.lower()[:-2]:
+                return True
+            if ar.lower() == "*":
+                return True
+    return False
+
+
+def render_linked_sources(
+    urls: list[str],
+    allowed_hosts: set[str],
+    gh_token: str | None,
+    target_version: str,
+    ghcr_images: list[str],
+    compare_shas: tuple[str, str] | None,
+    budget: BudgetTracker,
+    current_repo: str | None = None,
+    allowed_repos: set[str] | None = None,
+) -> str:
+    """Render linked-sources.md content."""
+    lines: list[str] = []
+
+    if not urls:
+        return ""
+
+    # Security: linked-source enrichment must not reach repos outside the
+    # operator's allowlist, regardless of what URLs appear in the PR body.
+    # Mirror platform.gh_api's gate: only current_repo / allowed_repos may
+    # be queried with the operator token. Repos that fail the check are
+    # rendered with a visible "not authorized" note and skipped.
+    blocked_repos: dict[str, list[str]] = {}
+    authorized_repos: set[str] = set()
+
+    # Phase 1: parallel fetch of allowlisted URLs
+    fetch_urls: list[tuple[int, str]] = []
+    for i, url in enumerate(urls[:25]):
+        normalized = normalize_url(url)
+        host = _extract_host(normalized)
+        if host in SKIP_FETCH_HOSTS or host == "github.com":
+            continue
+        if host_allowed(normalized, allowed_hosts):
+            fetch_urls.append((i + 1, normalized))
+
+    fetched: dict[int, bytes | None] = {}
+    if fetch_urls and budget.ok():
+        with ThreadPoolExecutor(max_workers=min(8, len(fetch_urls))) as pool:
+            futures = {}
+            for idx, url in fetch_urls:
+                if not budget.ok():
+                    break
+                futures[pool.submit(fetch_url, url, timeout=25)] = idx
+            for fut in as_completed(futures):
+                fetched[futures[fut]] = fut.result()
+
+    # Thread-safe memo for every `gh api` result. Each gh_api_call is its own
+    # subprocess (~0.2s spawn + RTT); on link-heavy Renovate PRs, issuing the
+    # Phase 2-4 calls one-at-a-time blows the wall-clock budget and remaining
+    # sources get silently dropped. The prewarm below fans the INDEPENDENT
+    # calls out concurrently into this cache; the render loop is then served
+    # from it, so parallelism changes only WHEN a call runs, never the
+    # deterministic source-ordered output. The lock also makes the per-repo
+    # releases cache (#366) safe against the prewarm threads racing it.
+    api_lock = threading.Lock()
+    api_cache: dict[str, dict | list | None] = {}
+
+    def cached_gh_api(endpoint: str) -> dict | list | None:
+        # Security gate (#509): refuse any gh_api call whose owner/repo is
+        # outside the operator's allowlist (current_repo or allowed_repos).
+        # This mirrors the protection in platform.gh_api so that the
+        # enrichment path cannot be used to reach arbitrary other repos.
+        m = re.match(r"^repos/([^/]+)/([^/]+)/", endpoint)
+        if m:
+            key = f"{m.group(1)}/{m.group(2)}".lower()
+            if not _repo_allowed(m.group(1), m.group(2), current_repo, allowed_repos):
+                blocked_repos.setdefault(key, []).append(endpoint)
+                return None
+            authorized_repos.add(key)
+        with api_lock:
+            if endpoint in api_cache:
+                return api_cache[endpoint]
+        data = gh_api_call(endpoint, gh_token)  # network outside the lock
+        with api_lock:
+            return api_cache.setdefault(endpoint, data)
+
+    def get_releases(owner: str, repo: str) -> list | None:
+        # One releases fetch per unique repo (#366), shared between the per-URL
+        # "Recent Releases" rendering (Phase 2) and the releases enrichment
+        # (Phase 3); dedup + thread-safety come from cached_gh_api.
+        # Gate: only call gh_api for repos the operator has authorized via
+        # current_repo / allowed_repos (issue #509). Without this check, a
+        # PR body linking to any other repo would let the operator token
+        # query that repo's releases.
+        key = f"{owner}/{repo}".lower()
+        if not _repo_allowed(owner, repo, current_repo, allowed_repos):
+            blocked_repos.setdefault(key, []).append(f"releases")
+            return None
+        authorized_repos.add(key)
+        data = cached_gh_api(f"repos/{owner}/{repo}/releases?per_page=30")
+        return data if isinstance(data, list) else None
+
+    # Prewarm: enumerate the independent Phase 2-4 endpoints in source order and
+    # fetch them concurrently. Budget is consulted ONLY on the main thread (here
+    # at the submission boundary and in the render loop), so BudgetTracker needs
+    # no lock. Branch-dependent calls (tags-on-no-match, ghcr compare fallback)
+    # are left for the render loop to fetch on demand — they are rare and their
+    # cache miss simply falls through to a live call.
+    prewarm_endpoints: list[str] = []
+    _seen_prewarm: set[str] = set()
+    _gh_repo_keys: set[str] = set()
+
+    def _queue(endpoint: str) -> None:
+        # Gate (#509): refuse to enqueue a gh_api call whose owner/repo is
+        # outside the operator's allowlist. Without this, a PR body could
+        # make the action issue gh_api against arbitrary other repos.
+        m = re.match(r"^repos/([^/]+)/([^/]+)/", endpoint)
+        if m:
+            if not _repo_allowed(m.group(1), m.group(2), current_repo, allowed_repos):
+                key = f"{m.group(1)}/{m.group(2)}".lower()
+                blocked_repos.setdefault(key, []).append(endpoint)
+                return
+        if endpoint not in _seen_prewarm:
+            _seen_prewarm.add(endpoint)
+            prewarm_endpoints.append(endpoint)
+
+    for url in urls[:25]:
+        normalized = normalize_url(url)
+        cls = classify_url(normalized)
+        if cls and cls["type"] == "github_release":
+            _queue(f"repos/{cls['owner']}/{cls['repo']}/releases/tags/{cls['tag']}")
+            _queue(f"repos/{cls['owner']}/{cls['repo']}/releases?per_page=30")
+        elif cls and cls["type"] == "github_compare":
+            _queue(f"repos/{cls['owner']}/{cls['repo']}/compare/{cls['compare_spec']}")
+        gh_match = re.match(r"https?://github\.com/([^/]+)/([^/?#]+)", normalized)
+        if gh_match:
+            _gh_repo_keys.add(f"{gh_match.group(1)}/{gh_match.group(2)}")
+            _queue(f"repos/{gh_match.group(1)}/{gh_match.group(2)}/releases?per_page=30")
+
+    if target_version:
+        for img_repo in ghcr_images:
+            if img_repo in _gh_repo_keys:
+                continue
+            owner = img_repo.split("/")[0]
+            repo = img_repo.rsplit("/", 1)[-1]
+            if not owner or not repo or owner == img_repo:
+                continue
+            for tag_prefix in (f"v{target_version}", target_version):
+                _queue(f"repos/{owner}/{repo}/releases/tags/{tag_prefix}")
+
+    if prewarm_endpoints and budget.ok():
+        with ThreadPoolExecutor(max_workers=min(8, len(prewarm_endpoints))) as pool:
+            futures = [pool.submit(cached_gh_api, e) for e in prewarm_endpoints]
+            for fut in as_completed(futures):
+                fut.result()  # cached_gh_api fails soft; never raises
+
+    # Phase 2: render each URL section
+    repo_candidates: list[str] = []
+    seen_repos: set[str] = set()
+
+    # Hosts whose source produced only a skip notice and no enrichment (#372):
+    # each such source would otherwise emit a full "## Source N" block of pure
+    # boilerplate. They are collapsed into one trailing summary line instead.
+    skipped_hosts: list[str] = []
+
+    for i, url in enumerate(urls[:25], 1):
+        if not budget.ok():
+            break
+
+        normalized = normalize_url(url)
+        host = _extract_host(normalized)
+
+        # Mark where this source's section begins so a source that yields
+        # nothing but a skip notice can be dropped wholesale (#372). The
+        # section keeps its original 1-based `i` (tied to the fetch-phase index
+        # and the `fetched` map) — non-skipped sources are never renumbered.
+        src_start = len(lines)
+        lines.append(f"## Source {i}")
+        lines.append(f"URL: {url}")
+        if normalized != url:
+            lines.append(f"Normalized URL: {normalized}")
+        lines.append("")
+        lines.append("### Fetched Content (truncated)")
+
+        is_skip = False
+        if host_allowed(normalized, allowed_hosts):
+            if host == "github.com":
+                lines.append(
+                    "(Raw HTML fetch skipped for github.com — structured release/compare metadata is captured below when available)"
+                )
+            elif host in SKIP_FETCH_HOSTS:
+                lines.append(f"(Raw HTML fetch skipped for known non-Forgejo host: {host})")
+                is_skip = True
+            elif i in fetched and fetched[i]:
+                text = strip_source_to_text(fetched[i])
+                if text:
+                    lines.append("```text")
+                    lines.append(text)
+                    lines.append("")
+                    lines.append("```")
+                else:
+                    lines.append("(No content captured from URL)")
+            else:
+                lines.append(f"(Failed to fetch allowlisted URL content from {host})")
+        else:
+            lines.append(f"(Skipped non-allowlisted URL: {host})")
+            is_skip = True
+
+        # Enrichment appended from here on; `is_skip` with no enrichment beyond
+        # this point means the section is pure boilerplate and gets collapsed.
+        enrich_start = len(lines)
+
+        # GitHub release metadata
+        cls = classify_url(normalized)
+        if cls and cls["type"] == "github_release":
+            lines.append("")
+            lines.append(f"### GitHub Release Metadata: {cls['owner']}/{cls['repo']}@{cls['tag']}")
+            if budget.ok():
+                data = cached_gh_api(
+                    f"repos/{cls['owner']}/{cls['repo']}/releases/tags/{cls['tag']}"
+                )
+                if isinstance(data, dict):
+                    filtered = _pick(data, ("tag_name", "name", "published_at", "html_url", "body"))
+                    lines.append("```json")
+                    lines.append(json.dumps(filtered, indent=2)[:5000])
+                    lines.append("")
+                    lines.append("```")
+                else:
+                    lines.append(f"(Could not fetch release metadata for tag {cls['tag']})")
+
+            # Recent releases
+            if budget.ok():
+                data = get_releases(cls["owner"], cls["repo"])
+                if isinstance(data, list):
+                    filtered = [_pick(r, ("tag_name", "name", "published_at", "html_url")) for r in data[:8]]
+                    lines.append("### Recent Releases")
+                    lines.append("```json")
+                    lines.append(json.dumps(filtered, indent=2)[:3000])
+                    lines.append("")
+                    lines.append("```")
+
+        # GitHub compare metadata
+        if cls and cls["type"] == "github_compare":
+            lines.append("")
+            lines.append(f"### GitHub Compare Metadata: {cls['owner']}/{cls['repo']}@{cls['compare_spec']}")
+            if budget.ok():
+                data = cached_gh_api(
+                    f"repos/{cls['owner']}/{cls['repo']}/compare/{cls['compare_spec']}"
+                )
+                if isinstance(data, dict):
+                    filtered = {
+                        "html_url": data.get("html_url"),
+                        "status": data.get("status"),
+                        "ahead_by": data.get("ahead_by"),
+                        "behind_by": data.get("behind_by"),
+                        "total_commits": data.get("total_commits"),
+                        "commits": _commit_summaries(data.get("commits", [])[:20], with_author=True),
+                    }
+                    lines.append("```json")
+                    lines.append(json.dumps(filtered, indent=2)[:7000])
+                    lines.append("")
+                    lines.append("```")
+
+                    files = data.get("files", [])[:30]
+                    file_list = [
+                        _pick(f, ("filename", "status", "additions", "deletions", "changes", "patch"))
+                        for f in files
+                    ]
+                    lines.append("### GitHub Compare Files")
+                    lines.append("```json")
+                    lines.append(json.dumps(file_list, indent=2)[:7000])
+                    lines.append("")
+                    lines.append("```")
+                else:
+                    lines.append(f"(Could not fetch compare metadata for {cls['owner']}/{cls['repo']}@{cls['compare_spec']})")
+
+        # Forgejo release/compare (non-github.com hosts) — reuse forgejo_backend
+        if cls and host != "github.com" and host_allowed(normalized, allowed_hosts):
+            if cls["type"] == "forgejo_release":
+                lines.append("")
+                lines.append(f"### Forge Release Metadata: {cls['host']} {cls['owner']}/{cls['repo']}@{cls['tag']}")
+                if budget.ok():
+                    data = fetch_forge_release(cls["host"], f"{cls['owner']}/{cls['repo']}", cls["tag"])
+                    if isinstance(data, dict):
+                        lines.append("```json")
+                        lines.append(json.dumps(data, indent=2)[:6000])
+                        lines.append("")
+                        lines.append("```")
+                    else:
+                        lines.append(f"(Could not fetch release metadata from {cls['host']} for tag {cls['tag']})")
+
+            if cls["type"] == "forgejo_compare":
+                lines.append("")
+                lines.append(f"### Forge Compare Metadata: {cls['host']} {cls['owner']}/{cls['repo']}@{cls['compare_spec']}")
+                if budget.ok():
+                    data = fetch_forge_compare(cls["host"], f"{cls['owner']}/{cls['repo']}", cls["compare_spec"])
+                    if isinstance(data, dict):
+                        filtered = {
+                            "total_commits": data.get("total_commits"),
+                            "commits": _commit_summaries((data.get("commits") or [])[:20]),
+                            "files": [{k: f.get(k) for k in ("filename", "status", "additions", "deletions")} for f in (data.get("files") or [])[:30]],
+                        }
+                        lines.append("```json")
+                        lines.append(json.dumps(filtered, indent=2)[:7000])
+                        lines.append("")
+                        lines.append("```")
+                    else:
+                        lines.append(f"(Could not fetch compare metadata from {cls['host']} for {cls['compare_spec']})")
+
+        # Collect GitHub repo candidates
+        gh_match = re.match(r"https?://github\.com/([^/]+)/([^/?#]+)", normalized)
+        if gh_match:
+            repo_key = f"{gh_match.group(1)}/{gh_match.group(2)}"
+            if repo_key not in seen_repos:
+                seen_repos.add(repo_key)
+                repo_candidates.append(repo_key)
+
+        # A pure skip notice with no enrichment (nothing non-blank appended
+        # since `enrich_start`) is dropped: rewind this section's lines and
+        # record its host for the collapsed summary (#372). github.com is never
+        # `is_skip`, so its sections (and any release/compare metadata) always
+        # survive. repo candidates are collected above regardless, so Phase 3
+        # enrichment for github.com repos is unaffected.
+        if is_skip and not any(ln.strip() for ln in lines[enrich_start:]):
+            del lines[src_start:]
+            skipped_hosts.append(host)
+        else:
+            lines.append("")
+
+    if skipped_hosts:
+        # One trailing line for every collapsed source, hosts deduped + sorted.
+        n = len(skipped_hosts)
+        uniq = ", ".join(sorted(set(skipped_hosts)))
+        lines.append(
+            f"({n} source{'s' if n != 1 else ''} skipped — "
+            f"non-allowlisted or non-fetchable hosts: {uniq})"
+        )
+        lines.append("")
+
+    # Phase 3: GitHub releases enrichment for candidate repos
+    for repo_key in repo_candidates:
+        if not budget.ok():
+            break
+        owner, repo = repo_key.split("/", 1)
+
+        lines.append("")
+        lines.append(f"### GitHub Releases Enrichment: {repo_key}")
+
+        if budget.ok():
+            data = get_releases(owner, repo)
+            if isinstance(data, list):
+                filtered = [_pick(r, ("tag_name", "name", "published_at", "html_url")) for r in data]
+                lines.append("#### Recent Releases (tags)")
+                lines.append("```json")
+                lines.append(json.dumps(filtered, indent=2)[:5000])
+                lines.append("")
+                lines.append("```")
+
+                if target_version:
+                    v_lower = target_version.lower()
+                    matched = [
+                        r for r in data
+                        if (r.get("tag_name") or "").lower() == v_lower
+                        or (r.get("tag_name") or "").lower() == f"v{v_lower}"
+                        or v_lower in (r.get("tag_name") or "").lower()
+                        or v_lower in (r.get("name") or "").lower()
+                    ][:5]
+                    if matched:
+                        lines.append(f"#### Releases matching target version {target_version}")
+                        lines.append("```json")
+                        matched_filtered = [_pick(r, ("tag_name", "name", "published_at", "html_url", "body")) for r in matched]
+                        lines.append(json.dumps(matched_filtered, indent=2)[:8000])
+                        lines.append("")
+                        lines.append("```")
+                    else:
+                        lines.append(f"(No release tags matched target version {target_version} in {repo_key})")
+                        if budget.ok():
+                            tags = cached_gh_api(f"repos/{owner}/{repo}/tags?per_page=50")
+                            if isinstance(tags, list):
+                                tag_list = [_pick(t, ("name", "commit")) for t in tags]
+                                lines.append("#### Recent Tags")
+                                lines.append("```json")
+                                lines.append(json.dumps(tag_list, indent=2)[:4000])
+                                lines.append("")
+                                lines.append("```")
+                            else:
+                                lines.append(f"(Could not fetch tags list for {repo_key})")
+            else:
+                lines.append(f"(Could not fetch releases list for {repo_key})")
+
+    # Phase 4: GHCR image path lookup
+    if ghcr_images and budget.ok():
+        for img_repo in ghcr_images:
+            if not budget.ok():
+                break
+            if img_repo in seen_repos:
+                continue
+
+            owner = img_repo.split("/")[0]
+            repo = img_repo.rsplit("/", 1)[-1]
+            if not owner or not repo or owner == img_repo:
+                continue
+
+            lines.append("")
+            lines.append(f"### GitHub Release Lookup via ghcr.io Path: {owner}/{repo}")
+
+            found_release = False
+            if target_version:
+                for tag_prefix in (f"v{target_version}", target_version):
+                    if not budget.ok():
+                        break
+                    data = cached_gh_api(f"repos/{owner}/{repo}/releases/tags/{tag_prefix}")
+                    if isinstance(data, dict):
+                        lines.append(f"#### Matched via ghcr.io path: {owner}/{repo}@{tag_prefix}")
+                        filtered = _pick(data, ("tag_name", "name", "published_at", "html_url", "body"))
+                        lines.append("```json")
+                        lines.append(json.dumps(filtered, indent=2)[:8000])
+                        lines.append("")
+                        lines.append("```")
+                        found_release = True
+                        break
+
+            if not found_release:
+                if target_version:
+                    lines.append(f"(No release found for {owner}/{repo} at version {target_version} via ghcr.io path inference)")
+                else:
+                    lines.append(f"(TARGET_VERSION not set; skipping release lookup for {owner}/{repo})")
+
+            # Compare SHA fallback
+            if not found_release and compare_shas and budget.ok():
+                cmp_old, cmp_new = compare_shas
+                data = cached_gh_api(f"repos/{owner}/{repo}/compare/{cmp_old}...{cmp_new}")
+                if isinstance(data, dict) and data.get("status"):
+                    lines.append(f"#### Commit compare {cmp_old}...{cmp_new} (no release published for this version)")
+                    filtered = {
+                        "html_url": data.get("html_url"),
+                        "status": data.get("status"),
+                        "ahead_by": data.get("ahead_by"),
+                        "total_commits": data.get("total_commits"),
+                        "commits": _commit_summaries(data.get("commits", [])[:20]),
+                    }
+                    lines.append("```json")
+                    lines.append(json.dumps(filtered, indent=2)[:6000])
+                    lines.append("")
+                    lines.append("```")
+
+                    files = data.get("files", [])[:30]
+                    file_list = [{k: f.get(k) for k in ("filename", "status", "additions", "deletions", "changes")} for f in files]
+                    lines.append("#### Changed Files")
+                    lines.append("```json")
+                    lines.append(json.dumps(file_list, indent=2)[:5000])
+                    lines.append("")
+                    lines.append("```")
+
+    # Surface the repos we refused to query so reviewers see why they were
+    # skipped rather than missing context. issue #509.
+    if blocked_repos:
+        lines.append("### Not Authorized for Enrichment")
+        lines.append("")
+        lines.append(
+            "These repos were linked from the PR body but are not the repo "
+            "under review (and were not listed in "
+            "`TOOL_ALLOWED_GH_API_REPOS`), so the action did not query "
+            "them with the operator token:"
+        )
+        lines.append("")
+        for key in sorted(blocked_repos.keys()):
+            lines.append(f"- `{key}`")
+        lines.append("")
+
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _extract_host(url: str) -> str:
+    return (urlparse(url).hostname or "").lower()

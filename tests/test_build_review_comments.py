@@ -17,6 +17,7 @@ from build_review_comments import (
     FINDING_MARKER_PREFIX,
     build_comments,
     commentable_lines,
+    diff_positions,
     finding_fingerprint,
     finding_marker,
     finding_to_body,
@@ -81,6 +82,13 @@ class TestCommentableLines:
         assert commentable_lines("") == {}
 
 
+class TestDiffPositions:
+    def test_tracks_diff_relative_positions_for_forgejo(self):
+        positions = diff_positions(DIFF)
+        assert positions["app/serve.py"] == {10: 1, 11: 2, 12: 3, 13: 4, 14: 5, 32: 6, 33: 8, 34: 9}
+        assert positions["new.txt"] == {1: 1, 2: 2}
+
+
 class TestBuildComments:
     def test_anchorable_finding_becomes_comment(self):
         comments, skipped = build_comments([_finding(line=12)], DIFF)
@@ -131,6 +139,15 @@ class TestBuildComments:
     def test_non_dict_entries_skipped(self):
         comments, skipped = build_comments(["x", 5, _finding()], DIFF)
         assert len(comments) == 1 and skipped == 2
+
+    def test_forgejo_position_backend_emits_new_position(self, monkeypatch):
+        monkeypatch.setenv("REVIEW_COMMENT_POSITION_BACKEND", "forgejo")
+        comments, skipped = build_comments([_finding(line=33)], DIFF)
+        assert skipped == 0
+        assert comments[0]["path"] == "app/serve.py"
+        assert comments[0]["new_position"] == 8
+        assert "line" not in comments[0]
+        assert "side" not in comments[0]
 
 
 class TestFindingBody:
@@ -282,11 +299,13 @@ class TestActionWiring:
         assert "inline_findings_max:" in self.ACTION
 
     def test_all_publish_steps_receive_findings(self):
-        # All three publish steps (comment, review_comment, review_verdict)
-        # must receive FINDINGS so build_metadata_marker persists
-        # open_findings — without it, carry-forward never engages.
-        assert self.ACTION.count("FINDINGS: ${{ steps.review.outputs.findings }}") == 3
-        assert self.ACTION.count("INLINE_FINDINGS: ${{ inputs.inline_findings }}") == 2
+        # The single publish dispatcher (#303) carries one superset env block
+        # serving all three modes (comment, review_comment, review_verdict), so
+        # FINDINGS/INLINE_FINDINGS each appear once. FINDINGS lets
+        # build_metadata_marker persist open_findings — without it,
+        # carry-forward never engages.
+        assert self.ACTION.count("FINDINGS: ${{ steps.review.outputs.findings }}") == 1
+        assert self.ACTION.count("INLINE_FINDINGS: ${{ inputs.inline_findings }}") == 1
 
     def test_review_verdict_falls_back_on_failure(self):
         assert "falling back to plain review" in self.ACTION

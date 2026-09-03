@@ -10,14 +10,15 @@ The action collects rich PR context (diff, files, linked issues, version hints, 
 
 ### Action definition and orchestration
 
-- **`action.yml`** — Action definition with all inputs/outputs and composite run steps (precheck → CI wait → review → publish). The publish steps live inline in this file using helpers from `scripts/publish_helpers.sh`.
+- **`action.yml`** — Action definition with all inputs/outputs and composite run steps (precheck → CI wait → review → publish). Publishing is a single `Publish review` step with one superset `env:` block that dispatches on `$PUBLISH_MODE` (comment / review_comment / review_verdict), using helpers from `scripts/publish_helpers.sh`.
 - **`scripts/platform_api.sh`** — Platform seam (#221): every host-forge API call goes through `platform_*` functions (github backend = the exact pre-seam `gh` invocations; forgejo backend = `pr_reviewer/forgejo_backend.py`, rolling out across 1.4.x). `github_enrich_*` functions are for linked-source enrichment and always target github.com. `pr_reviewer/platform.py` is the Python mirror for script consumers.
 - **`scripts/check_review_needed.sh`** — Precheck: computes `git patch-id --stable` fingerprint, decides full vs. incremental scope, and skips if unchanged since last managed comment (unless `force_review=true`)
 - **Re-review trigger** — adding the `rereview_label` (default `ai-review`) to a PR forces a fresh review (`check_review_needed.sh` reads the `labeled` event from `GITHUB_EVENT_PATH`, sets `force_review`, and skips unrelated labels; the label is removed post-publish in `action.yml`). Labels are maintainer-only, so no command-auth gate is needed.
 - **`scripts/wait_for_ci.sh`** — Optional CI gating: polls the Checks API until checks reach a terminal state (`ci_status_check=true`), then renders the per-check outcomes to `CI_CHECKS_FILE` for the review corpus
-- **`scripts/run_review.sh`** — Main review orchestration script (collects context, builds corpus, classifies, routes, calls model, validates and enforces verdicts)
+- **`scripts/run_review.sh`** — Main review orchestrator: sources the section modules under `scripts/sections/` in order (collects context, builds corpus, classifies, routes, calls model, validates and enforces verdicts)
+- **`scripts/sections/`** — Review-pipeline modules sourced by `run_review.sh` (#307 split): `common.sh` (helpers/timers), `config.sh` (env defaults + validation + prompts), `context.sh`, `enrichment.sh`, `classification.sh`, `corpus.sh`, `review.sh` (model call → escalation → enforcement → outputs). Each is a verbatim in-order slice of the former monolith, so sourcing them reproduces the original top-level execution.
 - **`scripts/model_call.sh`** — Shared model-call layer: request building, streaming/SSE handling, retries, error-body preservation for both API formats
-- **`scripts/default_system_prompt.txt`** — Bundled system prompt used when no override is provided
+- **`scripts/default_system_prompt.txt`** — Bundled system prompt used when no override is provided. Carries `{{...}}` placeholders that `apply_system_prompt_fragments` (`config.sh`) substitutes from `scripts/prompt_fragments/`: the PR-kind guidance fragments are gated on the classification, `{{VERBOSITY_GUIDANCE}}` on the `review_verbosity` input. Adding a fragment means a placeholder here, a file there, and a substitution in `apply_system_prompt_fragments` — nothing else enumerates them by name (`run_tool_harness.py` strips leftovers by shape)
 
 ### Python package (`pr_reviewer/`)
 
@@ -27,16 +28,20 @@ The action collects rich PR context (diff, files, linked issues, version hints, 
 - **`escalation.py`** — Post-hoc escalation triggers for fast reviews (request_changes, low confidence, incomplete checks, blockers, dirty baseline)
 - **`carry_forward.py`** — Carried-forward open findings for incremental reviews; surviving blockers force `request_changes` (`verdict_source: carry_forward`)
 - **`metadata.py`** — Managed metadata marker (fingerprint, scope, open findings) embedded in published comments
-- **`github_context.py`** — PR metadata/linked-issue context helpers
+- **`github_context.py`** — PR metadata/GitHub and Forgejo linked-issue reference helpers
+- **`linear_context.py`** — Optional deterministic Linear adapter: recognizes configured `TEAM-123` identifiers in PR titles, fetches issue/spec context through Linear GraphQL, and normalizes it into linked-issue corpus/classification data
 - **`response_parser.py`** — Tolerant model-output parsing (JSON in fences/prose, verdict + findings extraction)
 - **`sse_reassembler.py`** — Reassembles streamed SSE responses into complete bodies (including streamed tool-call deltas; `function.arguments` is the accumulated JSON string, OpenAI non-streaming shape, per #233)
-- **`conversation.py`** — Multi-turn conversation/request builder for native tool calling (#202, 2/7 of #197 Option B): append-only neutral state, OpenAI/Anthropic wire rendering, per-API tool-schema catalogue, `truncate_oldest_tool_results` budget helper, `verdict_turn` mode that drops `tools` and switches to the strict JSON `response_format`
+- **`conversation.py`** — Multi-turn conversation/request builder for native tool calling (#202, 2/7 of #197 Option B): append-only neutral state, OpenAI/Anthropic wire rendering, per-API tool-schema catalogue, `truncate_oldest_tool_results` budget helper, `verdict_turn` mode that drops `tools` and switches to the strict JSON `response_format`. Its module docstring holds the authoritative **verdict-turn contract / bash↔Python divergence map** (#362): the shared invariants the native-loop verdict (Path B) and the bash `build_model_request` review (Path A) must keep in lockstep, pinned by `tests/test_verdict_contract_equivalence.py`
+- **`transport.py`** — Low-level model-call transport split out of `run_tool_harness.py` (#304): `run_chat_request` (curl-based chat POST + SSE handling, with the API key passed via a 0600 `--config` file, never argv) and the shared `safe_run` subprocess helper
+- **`tool_executors.py`** — Read-only tool executors split out of `run_tool_harness.py` (#304): `read_file`, `git_grep`/`git_log`/`git_blame`, `gh_api`, `web_fetch`, `web_search`, `run_command`, plus `execute_tool_request[s]` and the path/host guards (`_resolve_workspace_path`, allowlists). `scripts/run_tool_harness.py` re-imports these so existing call sites/tests are unchanged; it still owns the planner + `run_native_loop` + `main`
 
 ### Publishing and output hygiene
 
 - **`scripts/publish_helpers.sh`** — Shared publish functions: sanitize, metadata marker build, native review cleanup, finding-thread resolution
 - **`scripts/sanitize_review_markdown.py`** — Neutralizes upstream GitHub auto-links (PR/issue/commit URLs, `owner/repo#123`, bare `#123`) in review output
 - **`scripts/strip_metadata_markers.py`** — Strips reserved `<!-- ai-pr-review-*:... -->` markers from model output before publishing
+- **`scripts/strip_empty_conditional_sections.py`** — Deterministic backstop for #415: removes model-confabulated `## Linked Issue Fit` / `## Evidence Provider Findings` / `## Standards Compliance` sections when the corpus provided no such context. Presence mirrors the exact `[ -s linked-issues.md ]` / `[ -s evidence-providers.md ]` / `[ -s standards-present.txt ]` gates `corpus.sh` uses; fence-aware (won't match `#` headings inside code blocks); invoked from `sanitize_review_markdown`. Sections are matched by leading phrase with the trailing noun dropped (`linked issue`, `evidence provider`, `standards`), and an unreported signal defaults to present — never strip a section the caller forgot to report on
 - **`scripts/redact.py`** — Shared secret-redaction pipeline applied to tool and evidence-provider output
 - **`scripts/build_review_comments.py`** — Builds line-anchored inline review comments from structured findings, validated against the PR diff
 - **`scripts/resolve_finding_threads.py`** — Resolves/replies on existing finding threads by content fingerprint on re-review
@@ -45,7 +50,7 @@ The action collects rich PR context (diff, files, linked issues, version hints, 
 ### Enrichment
 
 - **`scripts/run_evidence_providers.py`** — Runs user-defined evidence provider commands from a JSON config, parses severity/findings output
-- **`scripts/run_tool_harness.py`** — Tool harness (`plan_execute_once` and `plan_execute_loop`): model plans read-only tool requests (`gh_api`, `read_file`, `web_fetch`, `git_grep`, named-only `run_command`), action executes them, appends results to corpus
+- **`scripts/run_tool_harness.py`** — Tool harness entry point (`tool_mode=native_loop`): drives the native tool-calling loop (`run_native_loop`) over the read-only tools in `tool_executors.py`; on a model that issues no tool calls it degrades to a corpus-only review. (The `plan_execute_*` planner modes were removed in 2.0/#304.)
 - **`scripts/image_digest_analysis.py`** — Analyzes image digests from the diff for provenance context
 
 ### Tests
@@ -84,7 +89,7 @@ publish (action.yml steps)      → sanitize markdown → strip markers → buil
 2. PR Metadata (JSON from `gh pr view`)
 3. PR Classification (deterministic classifier output)
 4. Incremental Review Delta + Carried-Forward Open Findings (incremental scope only)
-5. Linked Issue Context (from Fixes/Closes references in PR body)
+5. Linked Issue Context (from Fixes/Closes references in PR body and optional configured Linear identifiers in PR titles; Linear context is retained for incremental reviews)
 6. PR Files (truncated JSON with patches)
 7. Version Hints from Diff
 8. PR Diff (truncated)
@@ -97,6 +102,8 @@ publish (action.yml steps)      → sanitize markdown → strip markers → buil
 15. Repository Standards and Conventions (from AGENTS.md, CLAUDE.md, etc.)
 
 Note: `MAX_CORPUS` truncation applies to sections 1–14; the standards section is always preserved in full.
+
+The standards section is always *emitted* — it carries an explicit "standards context unavailable" note when nothing resolved — so `[ -s standards-context.md ]` cannot tell the publish step whether a standards file existed. `corpus.sh` writes `standards-present.txt` (the resolved path, or truncated) as that signal, and the publish step turns it into `STANDARDS_PRESENT` for the section stripper.
 
 ## Running tests
 
@@ -122,13 +129,40 @@ The smoke test validates: GitHub PR data collection, corpus assembly, OpenAI/Ant
 - Model responses are parsed by extracting JSON from markdown code blocks or scanning for the first valid JSON object (`pr_reviewer/response_parser.py`)
 - Verdict must be `"approve"` or `"request_changes"` with a non-empty `review_markdown` string; an optional `findings` array is normalized (severities mapped to `blocker`/`major`/`minor`/`info`, malformed entries dropped)
 - Context limit modes: `normal` (140k/70k/220k), `low` (80k/40k/120k), `minimal` (40k/20k/60k) — controls MAX_DIFF, MAX_FILES, MAX_CORPUS byte limits. `model_context_tokens` overrides these by deriving budgets from the real context window
-- Evidence providers and tool harness are disabled by default on cross-repository PRs (`*_enable_for_forks=false`)
+- Evidence providers, tool harness, and Linear issue fetching are disabled by default on cross-repository PRs (`*_enable_for_forks=false`)
 - Native approvals are off by default (`allow_approve=false`); fork approvals additionally require `approve_forks=true`
 - Standards file resolution: explicit `standards_file` → first found from `standards_file_candidates` list (default: AGENTS.md, agents.md, CLAUDE.md, claude.md, .github/ai-review-rules.md, .github/ai-review-rules.txt). Candidates support glob patterns (e.g. `.agents/*.md`); first match wins.
 - System prompt priority: inline `system_prompt` > file `system_prompt_file` > bundled default
+- `review_verbosity` (`normal` / `concise`) dials the bundled default's output length via `{{VERBOSITY_GUIDANCE}}`. It only applies to the assembled default, so a `replace`-mode override ignores it; `normal` substitutes nothing and contributes nothing to the config fingerprint, keeping upgrades free of forced re-reviews
 - Reserved metadata markers (`<!-- ai-pr-review-fingerprint:... -->`, `<!-- ai-pr-review-sha:... -->`) are stripped from model output before publishing; the precheck reads only the first occurrence of each
 - The `run_command` tool never executes model-supplied shell text — only named argv definitions from a fixed read-only catalog (`git_status_short`, `git_diff_stat`, `git_diff_name_only`)
-- Versioning: `v1.x.y` semver tags; feature releases stay on `1.2.x` (`v1.3.0` is reserved for the tool-calling milestone, issue #197)
+- Adversarial fixtures for security boundaries (#252): any sanitizer or fence (untrusted-data delimiters, secret redaction, exfil guards) must have a test that feeds the boundary token / hostile delimiter *itself*, not just benign input — a mock that omits the attack encodes the same blind spot as the code (the #250 fence was escapable by content containing its own closing delimiter). See `tests/test_native_loop_exfil_redteam.py` and the outbound-UA guard (`tests/test_outbound_user_agent.py`) for the pattern; add one when introducing a new fence.
+- Versioning: `vX.Y.Z` semver tags with floating major tags (`v1`, `v2`, …). The patch/minor/major criteria, deprecation policy, and pre-release conventions are documented in the README's "Versioning policy" section — follow it when picking a version. To release after CI is green on `main`, run **Actions → Manual Release** with the target version; it creates the immutable tag, advances the floating major tag (stable releases only), and publishes the release.
+
+## Label taxonomy (`agent/*` and Dispatch workflow labels)
+
+Workflow labels are defined in `.github/labels.yaml`; agent identity labels are created ad hoc (see below). There are two distinct groups that agents interact with:
+
+### Dispatch / operational labels
+These are managed by the Dispatch system (dispatch.jory.dev) and are the source of truth for issue workflow state. Agents read and set these to claim and advance work.
+
+| Label | Purpose |
+|---|---|
+| `status/backlog` | Not yet ready for pickup |
+| `status/ready` | Ready for a Dispatch worker to claim |
+| `status/in-progress` | Issue is claimed/actively worked |
+| `status/in-review` | PR or human review in progress |
+| `status/done` | Work complete |
+| `needs-escalation` | Routes to the escalated model lane (GPT-5.5 equivalent) |
+| `needs-info` | Blocked on information; agent should not pick up |
+| `needs-human` | Blocked on human decision; agent should not pick up |
+| `blocked` | Externally blocked; agent should not pick up |
+
+### Agent identity labels
+`agent/<name>` labels tag which agent or operator holds the claim on an issue (for example `agent/foreman-coder`, `agent/joryirving`, `agent/saffron`). They are created ad hoc at claim time by Dispatch or by the claiming agent, not enumerated in `.github/labels.yaml`. An issue in `status/in-progress` carries exactly one `agent/*` label; reassigning work means swapping it.
+
+### Re-review label
+`ai-review` is a repo-internal label: adding it to an open PR triggers a fresh AI review run regardless of fingerprint. It is removed automatically by the action after publishing. This label is **not** a Dispatch workflow label.
 
 ## Inputs summary
 
@@ -149,3 +183,80 @@ See `action.yml` (the source of truth) or the README's grouped input tables for 
 - `should_review` / `skip_reason` / `diff_fingerprint`: precheck results
 - `ci_status_skipped` / `ci_status_final`: CI gating results
 - `effective_review_scope` / `previous_head_sha` / `baseline_clean`: incremental-review state
+
+## Filing issues for the autonomous loop
+
+Issues here are picked up by an autonomous coding loop (dispatch → foreman), and two
+parts of the body feed deterministic reviewer rails. Agents filing issues in this repo
+must include both.
+
+**1. State the ask in one imperative sentence.** The reviewer quotes it verbatim to
+prove it actually read the issue. If it can only paraphrase, its GO is demoted to NO-GO
+unless the rail below vouches — costing a revision cycle and an escalation review.
+
+**2. Name the concrete file paths the fix is expected to touch** (backticks are fine).
+The scope-overlap rail vouches for a diff that touches a named file, and that vouch is
+what survives a paraphrased ask.
+
+Name only paths you are confident about. An issue that names files the diff does *not*
+touch is read as scope drift and also gets the change rejected — so when unsure, name
+none rather than guessing.
+
+## Eval harness runbook
+
+The evaluation harness (`scripts/eval_harness.py`) and its graded corpus
+(`evals/corpus-agentic.json`) are wired into CI by the `eval-harness`
+workflow (`.github/workflows/eval-harness.yaml`). Use this runbook for manual
+runs or when triaging a failing scheduled regression sweep.
+
+### Prerequisites
+
+| What | Why |
+|---|---|
+| Python 3.12+ | Runs `scripts/eval_harness.py` |
+| `AI_MODEL`, `AI_BASE_URL`, `AI_API_KEY` (env or repo secrets) | Target model endpoint for the review pass |
+| `GITHUB_TOKEN` (env or repo secrets) | Lets the harness fetch PR diffs from the corpus |
+| A writable directory for `eval-report/eval-report.json` | Holds the JSON report (also uploaded as an Actions artifact) |
+
+### Run locally
+
+```bash
+python scripts/eval_harness.py \
+    --corpus evals/corpus-agentic.json \
+    --modes tools_off native_loop \
+    --runs-per-mode 10 \
+    --model "$AI_MODEL" \
+    --base-url "$AI_BASE_URL" \
+    --api-key "$AI_API_KEY" \
+    --github-token "$GITHUB_TOKEN" \
+    --output eval-report/eval-report.json
+```
+
+The `--modes` flag accepts one or more modes (space-separated on the shell
+line, repeated `--modes x --modes y` works too). The default is
+`tools_off native_loop`.
+
+### Run via CI
+
+The `eval-harness` workflow has two triggers:
+
+- **`workflow_dispatch`** — runs on demand from the Actions tab. Inputs:
+  `corpus` (default `evals/corpus-agentic.json`), `modes` (default
+  `tools_off native_loop`), `runs-per-mode` (default `10`), `max-prs`
+  (blank = corpus default).
+- **`schedule`** — weekly Monday 06:00 UTC sweep against `main`. The
+  scheduled run additionally posts a Markdown summary to
+  `GITHUB_STEP_SUMMARY` and as a comment on issue #472 so regressions are
+  discoverable from the issue tracker.
+
+The JSON report is uploaded as the `eval-report` artifact on every run
+(including failed runs) so regressions can be diffed week-over-week.
+
+### Interpreting the report
+
+The harness prints per-mode `pass_rate` (fraction of expected-evidence
+checks that fired) and a `regressions` list naming checks that newly
+failed vs. the previous baseline. A pass rate below `0.95` or any
+non-empty `regressions` list should block the release; inspect the
+artifact, reproduce locally with the command above, then fix the prompt or
+routing regression in the action before re-running.

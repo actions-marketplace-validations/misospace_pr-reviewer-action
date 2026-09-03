@@ -32,7 +32,6 @@ def _import_tool(name):
     if str(_SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(_SCRIPTS_DIR))
     from run_tool_harness import (  # noqa: F401
-        fetch_url,
         gh_api,
         git_grep,
         read_file,
@@ -215,9 +214,12 @@ def test_all_fail_fixture():
 # ---------------------------------------------------------------------------
 
 def test_run_review_uses_correct_path():
-    """Confirm run_review.sh delegates enforcement to pr_reviewer.enforcement."""
-    script = Path(__file__).resolve().parent.parent / "scripts" / "run_review.sh"
-    content = script.read_text(encoding="utf-8", errors="replace")
+    """Confirm the review driver delegates enforcement to pr_reviewer.enforcement."""
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    # The driver was split into an orchestrator + sourced section modules (#307);
+    # read the orchestrator and every section so this check is split-agnostic.
+    sources = [scripts_dir / "run_review.sh", *sorted((scripts_dir / "sections").glob("*.sh"))]
+    content = "\n".join(s.read_text(encoding="utf-8", errors="replace") for s in sources)
 
     # The buggy pattern should NOT be present anywhere:
     assert ".tool_results[]?.result.status" not in content, (
@@ -435,45 +437,44 @@ def test_gh_api_uses_custom_timeout():
 
 
 def test_web_fetch_uses_custom_timeout():
-    """web_fetch passes the timeout value to urllib.request.urlopen."""
+    """web_fetch passes the timeout value to opener.open()."""
     web_fetch = _import_tool("web_fetch")
 
     fake_response = mock.Mock()
     fake_response.read.return_value = b"content"
-    with mock.patch("urllib.request.urlopen", return_value=fake_response) as mock_urlopen:
+    fake_response.__enter__ = mock.Mock(return_value=fake_response)
+    fake_response.__exit__ = mock.Mock(return_value=False)
+
+    mock_opener = mock.Mock()
+    mock_opener.open.return_value.__enter__ = mock.Mock(return_value=fake_response)
+    mock_opener.open.return_value.__exit__ = mock.Mock(return_value=False)
+
+    with mock.patch("urllib.request.build_opener", return_value=mock_opener):
         web_fetch("https://github.com/test", ["github.com"], request_timeout=42)
-    mock_urlopen.assert_called_once()
-    args, kwargs = mock_urlopen.call_args
+    mock_opener.open.assert_called_once()
+    args, kwargs = mock_opener.open.call_args
     assert kwargs.get("timeout") == 42, (
         f"Expected timeout=42, got {kwargs}"
     )
 
 
-def test_fetch_url_uses_custom_timeout():
-    """fetch_url passes the timeout value to urllib.request.urlopen."""
-    fetch_url = _import_tool("fetch_url")
+def test_web_fetch_default_timeout():
+    """web_fetch uses 25s default when no timeout is specified."""
+    web_fetch = _import_tool("web_fetch")
 
     fake_response = mock.Mock()
     fake_response.read.return_value = b"content"
-    with mock.patch("urllib.request.urlopen", return_value=fake_response) as mock_urlopen:
-        result = fetch_url("https://github.com/test", ["github.com"], request_timeout=35)
-    mock_urlopen.assert_called_once()
-    args, kwargs = mock_urlopen.call_args
-    assert kwargs.get("timeout") == 35, (
-        f"Expected timeout=35, got {kwargs}"
-    )
+    fake_response.__enter__ = mock.Mock(return_value=fake_response)
+    fake_response.__exit__ = mock.Mock(return_value=False)
 
+    mock_opener = mock.Mock()
+    mock_opener.open.return_value.__enter__ = mock.Mock(return_value=fake_response)
+    mock_opener.open.return_value.__exit__ = mock.Mock(return_value=False)
 
-def test_fetch_url_default_timeout():
-    """fetch_url uses 25s default when no timeout is specified."""
-    fetch_url = _import_tool("fetch_url")
-
-    fake_response = mock.Mock()
-    fake_response.read.return_value = b"content"
-    with mock.patch("urllib.request.urlopen", return_value=fake_response) as mock_urlopen:
-        result = fetch_url("https://github.com/test", ["github.com"])
-    mock_urlopen.assert_called_once()
-    args, kwargs = mock_urlopen.call_args
+    with mock.patch("urllib.request.build_opener", return_value=mock_opener):
+        web_fetch("https://github.com/test", ["github.com"])
+    mock_opener.open.assert_called_once()
+    args, kwargs = mock_opener.open.call_args
     assert kwargs.get("timeout") == 25, (
         f"Expected timeout=25, got {kwargs}"
     )
@@ -592,147 +593,207 @@ def test_enforcement_fixture_no_successes():
 
 
 # ---------------------------------------------------------------------------
-# Integration test: end-to-end execution loop with error-producing tool calls
+# NOTE: the end-to-end integration tests for the file-based planner
+# (test_integration_all_tools_fail / _mixed_success_and_failure) were removed
+# in 2.0 (#304) along with that planning path. The executor's per-request
+# ok/error status behaviour is covered directly by
+# test_tool_parallel_execution.py::test_real_executor_errors_stay_per_request.
 # ---------------------------------------------------------------------------
 
-def test_integration_all_tools_fail():
-    """run_tool_harness.py produces status: error for all tools when helpers return errors.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# resolve_review_system_prompt — env-first assembled prompt, defensive fallback
+# ---------------------------------------------------------------------------
 
-    This exercises the actual try/except execution loop in main() by writing
-    a planning response with two tool calls that will fail, then verifying
-    the output JSON has status: error for both results and executed_request_count=0.
+def test_system_prompt_env_first_no_double_compose(tmp_path):
+    """When bash exports an assembled SYSTEM_PROMPT, Python trusts it verbatim.
+
+    The production double-composition bug: both SYSTEM_PROMPT and
+    SYSTEM_PROMPT_FILE were set, but Python re-read the file and concatenated
+    inline on top — producing a prompt that contained the file content twice
+    (once from bash's assembly, once from Python's re-read).
+
+    The fix is env-first: if SYSTEM_PROMPT is non-empty, return it immediately.
+    Only fall back to file+inline when SYSTEM_PROMPT is absent (defensive direct
+    invocation for standalone tests).
     """
-    # Write a planning input file
-    planning_input = {
-        "repository": "test-org/test-repo",
-        "diff_hunk": "--- a/README\\n+++ b/README\\n@@ -1,3 +1,3 @@\\n-Old content\\n+New content\\n",
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    from run_tool_harness import resolve_review_system_prompt
+
+    file_path = tmp_path / "system_prompt.txt"
+    file_path.write_text("FILE CONTENT HERE")
+
+    # Case 1: SYSTEM_PROMPT set alone → returned verbatim
+    env = {"SYSTEM_PROMPT": "ASSEMBLED BY BASH", "SYSTEM_PROMPT_FILE": ""}
+    with mock.patch.dict(os.environ, env, clear=False):
+        result = resolve_review_system_prompt()
+    assert result == "ASSEMBLED BY BASH"
+
+    # Case 2: Both SYSTEM_PROMPT and SYSTEM_PROMPT_FILE set → SYSTEM_PROMPT wins
+    # (no file re-read, no concatenation)
+    env = {
+        "SYSTEM_PROMPT": "ASSEMBLED BY BASH",
+        "SYSTEM_PROMPT_FILE": str(file_path),
     }
-    # The file-based planning path expects OpenAI-style response format
-    planning_response = {
-        "choices": [
-            {
-                "message": {
-                    "content": json.dumps([
-                        {"tool": "read_file", "args": {"path": "../../etc/passwd"}},
-                        {"tool": "gh_api", "args": {"endpoint": "other-owner/other-repo/pulls/1"}},
-                    ])
-                }
-            }
-        ]
+    with mock.patch.dict(os.environ, env, clear=False):
+        result = resolve_review_system_prompt()
+    assert result == "ASSEMBLED BY BASH"
+    assert file_path.read_text() not in result
+
+    # Case 3: Only SYSTEM_PROMPT_FILE set (defensive direct invocation) → file read
+    env = {"SYSTEM_PROMPT": "", "SYSTEM_PROMPT_FILE": str(file_path)}
+    with mock.patch.dict(os.environ, env, clear=False):
+        result = resolve_review_system_prompt()
+    assert result == "FILE CONTENT HERE"
+
+    # Case 4: Only SYSTEM_PROMPT set (defensive direct invocation) → inline returned
+    env = {"SYSTEM_PROMPT": "INLINE ONLY", "SYSTEM_PROMPT_FILE": ""}
+    with mock.patch.dict(os.environ, env, clear=False):
+        result = resolve_review_system_prompt()
+    assert result == "INLINE ONLY"
+
+    # Case 5: Neither set → falls back to bundled default (non-empty)
+    env = {"SYSTEM_PROMPT": "", "SYSTEM_PROMPT_FILE": ""}
+    with mock.patch.dict(os.environ, env, clear=False):
+        result = resolve_review_system_prompt()
+    assert isinstance(result, str)
+    assert len(result) > 0
+
+
+def test_system_prompt_preserves_raw_whitespace(tmp_path):
+    """SYSTEM_PROMPT with leading/trailing whitespace must be returned verbatim.
+
+    Bash's resolve_system_prompt() uses SYSTEM_PROMPT verbatim (no strip) when
+    composing the user prompt (config.sh:360, :357), so an operator who sets
+    ``SYSTEM_PROMPT="  hello  \""` intends those spaces to reach the model.
+    Returning stripped would silently alter the review contract — a regression
+    if Python ever re-strips the value.
+    """
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    from run_tool_harness import resolve_review_system_prompt
+
+    # Case 1: leading + trailing whitespace preserved verbatim
+    env = {"SYSTEM_PROMPT": "  hello  ", "SYSTEM_PROMPT_FILE": ""}
+    with mock.patch.dict(os.environ, env, clear=False):
+        result = resolve_review_system_prompt()
+    assert result == "  hello  ", f"Expected raw whitespace preserved, got: {result!r}"
+
+    # Case 2: file + inline where inline has leading whitespace → SYSTEM_PROMPT wins verbatim
+    file_path = tmp_path / "system_prompt.txt"
+    file_path.write_text("FILE CONTENT")
+    env = {
+        "SYSTEM_PROMPT": "  INLINE  ",
+        "SYSTEM_PROMPT_FILE": str(file_path),
     }
+    with mock.patch.dict(os.environ, env, clear=False):
+        result = resolve_review_system_prompt()
+    assert result == "  INLINE  ", f"Expected raw SYSTEM_PROMPT preserved, got: {result!r}"
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = Path(tmpdir) / "tool-planning-input.json"
-        response_path = Path(tmpdir) / "tool-planning-response.json"
-        output_path = Path(tmpdir) / "tool-harness.json"
-
-        input_path.write_text(json.dumps(planning_input), encoding="utf-8")
-        response_path.write_text(json.dumps(planning_response), encoding="utf-8")
-
-        env = os.environ.copy()
-        env["REPO"] = "test-org/test-repo"
-        env["GH_TOKEN"] = ""  # No token so gh_api fails immediately
-
-        result = subprocess.run(
-            [sys.executable, str(_SCRIPTS_DIR / "run_tool_harness.py")],
-            cwd=tmpdir,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-
-        assert output_path.exists(), (
-            f"tool-harness.json should be written. stderr: {result.stderr}"
-        )
-
-        with open(output_path) as f:
-            output = json.load(f)
-
-    # Both tools should have status: error
-    tool_results = output["tool_results"]
-    assert len(tool_results) == 2, f"Expected 2 results, got {len(tool_results)}"
-
-    for tr in tool_results:
-        assert tr["status"] == "error", (
-            f"Expected status='error' for {tr['tool']}, got '{tr['status']}'"
-        )
-        assert "error" in tr.get("result", {}), (
-            f"Expected error in result for {tr['tool']}"
-        )
-
-    # executed_request_count should be 0 (no successful calls)
-    assert output["executed_request_count"] == 0, (
-        f"Expected 0 successes, got {output['executed_request_count']}"
-    )
-
-
-def test_integration_mixed_success_and_failure():
-    """run_tool_harness.py produces correct mixed status when some tools succeed and others fail."""
-    planning_response = {
-        "choices": [
-            {
-                "message": {
-                    "content": json.dumps([
-                        {"tool": "read_file", "args": {"path": "tool-planning-input.json"}},
-                        {"tool": "gh_api", "args": {"endpoint": "other-owner/other-repo/pulls/1"}},
-                    ])
-                }
-            }
-        ]
-    }
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = Path(tmpdir) / "tool-planning-input.json"
-        response_path = Path(tmpdir) / "tool-planning-response.json"
-        output_path = Path(tmpdir) / "tool-harness.json"
-
-        # Create a file that read_file can successfully read
-        input_path.write_text(json.dumps({}), encoding="utf-8")
-        response_path.write_text(json.dumps(planning_response), encoding="utf-8")
-
-        env = os.environ.copy()
-        env["REPO"] = "test-org/test-repo"
-        env["GH_TOKEN"] = ""
-
-        result = subprocess.run(
-            [sys.executable, str(_SCRIPTS_DIR / "run_tool_harness.py")],
-            cwd=tmpdir,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-
-        assert output_path.exists(), (
-            f"tool-harness.json should be written. stderr: {result.stderr}"
-        )
-
-        with open(output_path) as f:
-            output = json.load(f)
-
-    tool_results = output["tool_results"]
-    assert len(tool_results) == 2
-
-    # First tool (read_file) should succeed
-    assert tool_results[0]["status"] == "ok", (
-        f"read_file should succeed, got '{tool_results[0]['status']}'"
-    )
-
-    # Second tool (gh_api) should fail (repo not allowed)
-    assert tool_results[1]["status"] == "error", (
-        f"gh_api should fail for disallowed repo, got '{tool_results[1]['status']}'"
-    )
-
-    # executed_request_count should be 1
-    assert output["executed_request_count"] == 1, (
-        f"Expected 1 success, got {output['executed_request_count']}"
-    )
+    # Case 3: blank-only value (e.g. "   ") must NOT be treated as set — falls through to file
+    env = {"SYSTEM_PROMPT": "   ", "SYSTEM_PROMPT_FILE": str(file_path)}
+    with mock.patch.dict(os.environ, env, clear=False):
+        result = resolve_review_system_prompt()
+    assert result == "FILE CONTENT", f"Expected file-only for blank-only SYSTEM_PROMPT, got: {result!r}"
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Tests for issue #468: restrict web_fetch URL scheme to http/https
 # ---------------------------------------------------------------------------
+
+
+def test_web_fetch_rejects_file_scheme():
+    """web_fetch rejects file:// URLs even with wildcard allowlist."""
+    web_fetch = _import_tool("web_fetch")
+
+    result = web_fetch("file:///etc/hostname", ["*"])
+    assert "error" in result, f"Expected error for file:// scheme, got: {result}"
+    assert "scheme" in result["error"].lower(), f"Error should mention scheme: {result['error']}"
+
+
+def test_web_fetch_rejects_ftp_scheme():
+    """web_fetch rejects ftp:// URLs even with wildcard allowlist."""
+    web_fetch = _import_tool("web_fetch")
+
+    result = web_fetch("ftp://example.com/file.txt", ["*"])
+    assert "error" in result, f"Expected error for ftp:// scheme, got: {result}"
+    assert "scheme" in result["error"].lower(), f"Error should mention scheme: {result['error']}"
+
+
+def test_web_fetch_rejects_gopher_scheme():
+    """web_fetch rejects gopher:// URLs even with wildcard allowlist."""
+    web_fetch = _import_tool("web_fetch")
+
+    result = web_fetch("gopher://example.com/", ["*"])
+    assert "error" in result, f"Expected error for gopher:// scheme, got: {result}"
+    assert "scheme" in result["error"].lower(), f"Error should mention scheme: {result['error']}"
+
+
+def test_web_fetch_allows_http_scheme():
+    """web_fetch allows http:// URLs under wildcard allowlist."""
+    web_fetch = _import_tool("web_fetch")
+
+    fake_response = mock.Mock()
+    fake_response.read.return_value = b"<html>ok</html>"
+    fake_response.__enter__ = mock.Mock(return_value=fake_response)
+    fake_response.__exit__ = mock.Mock(return_value=False)
+
+    mock_opener = mock.Mock()
+    mock_opener.open.return_value.__enter__ = mock.Mock(return_value=fake_response)
+    mock_opener.open.return_value.__exit__ = mock.Mock(return_value=False)
+
+    with mock.patch("urllib.request.build_opener", return_value=mock_opener):
+        result = web_fetch("http://example.com/page", ["*"])
+    assert "error" not in result, f"Expected success for http:// scheme, got: {result}"
+    mock_opener.open.assert_called_once()
+
+
+def test_web_fetch_allows_https_scheme():
+    """web_fetch allows https:// URLs under wildcard allowlist."""
+    web_fetch = _import_tool("web_fetch")
+
+    fake_response = mock.Mock()
+    fake_response.read.return_value = b"<html>ok</html>"
+    fake_response.__enter__ = mock.Mock(return_value=fake_response)
+    fake_response.__exit__ = mock.Mock(return_value=False)
+
+    mock_opener = mock.Mock()
+    mock_opener.open.return_value.__enter__ = mock.Mock(return_value=fake_response)
+    mock_opener.open.return_value.__exit__ = mock.Mock(return_value=False)
+
+    with mock.patch("urllib.request.build_opener", return_value=mock_opener):
+        result = web_fetch("https://example.com/page", ["*"])
+    assert "error" not in result, f"Expected success for https:// scheme, got: {result}"
+    mock_opener.open.assert_called_once()
+
+
+def test_web_search_strips_non_http_results():
+    """web_search strips non-http(s) URLs from search results."""
+    # Import directly from tool_executors since web_search is not exported by run_tool_harness
+    if str(_SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(_SCRIPTS_DIR))
+    from pr_reviewer.tool_executors import web_search
+
+    fake_response = mock.Mock()
+    fake_response.read.return_value = json.dumps({
+        "results": [
+            {"title": "Safe", "url": "https://example.com/safe", "content": "ok"},
+            {"title": "File LFI", "url": "file:///etc/passwd", "content": "bad"},
+            {"title": "FTP", "url": "ftp://evil.com/malware", "content": "bad"},
+        ]
+    }).encode()
+    fake_response.__enter__ = mock.Mock(return_value=fake_response)
+    fake_response.__exit__ = mock.Mock(return_value=False)
+    with mock.patch("urllib.request.urlopen", return_value=fake_response):
+        result = web_search("test query", "https://search.example.com/search")
+    assert "error" not in result, f"Expected success, got: {result}"
+    results = result["results"]
+    assert len(results) == 3
+    assert results[0]["url"] == "https://example.com/safe"
+    assert results[1]["url"] == "", f"file:// URL should be stripped, got: {results[1]['url']}"
+    assert results[2]["url"] == "", f"ftp:// URL should be stripped, got: {results[2]['url']}"
+
 
 def main():
     tests = [
@@ -756,8 +817,7 @@ def main():
         ("git_grep timeout error message", test_git_grep_timeout_error_message),
         ("gh_api uses custom timeout", test_gh_api_uses_custom_timeout),
         ("web_fetch uses custom timeout", test_web_fetch_uses_custom_timeout),
-        ("fetch_url uses custom timeout", test_fetch_url_uses_custom_timeout),
-        ("fetch_url default timeout", test_fetch_url_default_timeout),
+        ("web_fetch default timeout", test_web_fetch_default_timeout),
         ("run_command uses custom timeout", test_run_command_uses_custom_timeout),
         ("run_command timeout error message", test_run_command_timeout_error_message),
         ("env_int_bounded defaults", test_env_int_bounded_defaults),
@@ -768,6 +828,14 @@ def main():
         ("enforcement fixture no successes", test_enforcement_fixture_no_successes),
         ("integration all tools fail", test_integration_all_tools_fail),
         ("integration mixed success/failure", test_integration_mixed_success_and_failure),
+        ("system_prompt env-first no double compose", test_system_prompt_env_first_no_double_compose),
+        ("system_prompt preserves raw whitespace", test_system_prompt_preserves_raw_whitespace),
+        ("web_fetch rejects file scheme", test_web_fetch_rejects_file_scheme),
+        ("web_fetch rejects ftp scheme", test_web_fetch_rejects_ftp_scheme),
+        ("web_fetch rejects gopher scheme", test_web_fetch_rejects_gopher_scheme),
+        ("web_fetch allows http scheme", test_web_fetch_allows_http_scheme),
+        ("web_fetch allows https scheme", test_web_fetch_allows_https_scheme),
+        ("web_search strips non-http results", test_web_search_strips_non_http_results),
     ]
 
     passed = 0

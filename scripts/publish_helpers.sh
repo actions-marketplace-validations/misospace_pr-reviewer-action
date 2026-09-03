@@ -15,6 +15,23 @@ sanitize_review_markdown() {
   printf '%s\n' "$REVIEW_MARKDOWN" > "$output_file"
   python3 "${GITHUB_ACTION_PATH}/scripts/strip_metadata_markers.py" "$output_file"
   python3 "${GITHUB_ACTION_PATH}/scripts/sanitize_review_markdown.py" "$output_file"
+
+  # Deterministic backstop for #415: even with a clean, header-free corpus the
+  # model confabulates "## Linked Issue Fit" / "## Evidence Provider Findings" /
+  # "## Standards Compliance" sections padded with "nothing was found" filler.
+  # Presence mirrors the exact [ -s file ] gates scripts/sections/corpus.sh uses
+  # to emit (or omit) those section headers, so this only ever strips sections
+  # the corpus never offered. corpus.sh writes standards-present.txt on both
+  # paths (resolved path, or truncated), so its absence means the corpus was
+  # never built — in which case there is no review markdown to strip either.
+  local linked_present=false evidence_present=false standards_present=false
+  if [ -s linked-issues.md ]; then linked_present=true; fi
+  if [ -s evidence-providers.md ]; then evidence_present=true; fi
+  if [ -s standards-present.txt ]; then standards_present=true; fi
+  LINKED_ISSUE_PRESENT="$linked_present" \
+  EVIDENCE_PROVIDER_PRESENT="$evidence_present" \
+  STANDARDS_PRESENT="$standards_present" \
+    python3 "${GITHUB_ACTION_PATH}/scripts/strip_empty_conditional_sections.py" "$output_file"
 }
 
 # Resolve cleanup flag based on input value and publish mode.
@@ -179,6 +196,13 @@ build_metadata_marker() {
   # appending previous_head_sha cut at the LAST comma, silently dropping
   # review_result and the closing " -->" — which made incremental markers
   # unparseable and degraded the next run back to a full review.
+  # Cross-run evidence memory (#265): the native_loop's gathered-evidence
+  # digest, persisted so the next incremental review can reuse it. Omitted when
+  # evidence memory is disabled or no digest was produced; capped defensively
+  # (the producer already capped it, but the marker stays small regardless).
+  local evmem
+  evmem="$(printf '%s' "${TOOL_EVIDENCE_MEMORY:-true}" | tr '[:upper:]' '[:lower:]')"
+
   local marker_json
   marker_json="$(jq -nc \
     --arg head "${HEAD_SHA:-unknown}" \
@@ -189,19 +213,47 @@ build_metadata_marker() {
     --arg route "${REVIEW_ROUTE:-}" \
     --arg esc "${ESCALATION_REASON:-}" \
     --arg prev "$previous_head_sha" \
+    --arg evidence "${EVIDENCE_DIGEST:-}" \
+    --arg evmem "$evmem" \
     --argjson findings "$findings_json" \
+    --arg chr "${CACHE_HIT_RATIO:-}" \
     '{version: 1, head_sha: $head, base_sha: $base, review_scope: $scope, review_result: $result}
      + (if $checks == "" or $checks == "none" then {} else {required_checks: $checks} end)
      + (if $route == "" or $route == "legacy" then {} else {review_route: $route} end)
      + (if $esc == "" then {} else {escalation_reason: ($esc | split(","))} end)
      + (if $scope == "incremental" and $prev != "" then {previous_head_sha: $prev} else {} end)
+     + (if $evmem != "false" and $evidence != "" then {evidence_digest: ($evidence | .[0:2000])} else {} end)
      + (if $result == "issues" and ($findings | length) > 0
         then {open_findings: ($findings
           | map(select(type == "object" and (.resolution // "") != "resolved")
               | {severity, category, file, line, message: ((.message // "") | tostring | .[0:200])})
           | .[0:20])}
-        else {} end)')"
+        else {} end)
+     + (if $chr != "" and $chr != "-" then {cache_hit_ratio: ($chr | tonumber)} else {} end)')"
   printf '<!-- ai-pr-reviewer:%s -->' "$marker_json"
+}
+
+# Emit the managed review-comment marker preamble to stdout: the sticky
+# comment marker, the metadata marker, and (when set) the head-sha and
+# fingerprint markers. Centralizes the strip-then-append discipline so a
+# publish step cannot silently drop the markers that skip-on-unchanged
+# (check_review_needed.sh) and managed-comment cleanup depend on. The two
+# required markers are guarded so a future refactor that forgets to set them
+# fails loudly under `set -e` rather than publishing an unmatchable comment.
+# Reads env/globals: COMMENT_MARKER, METADATA_MARKER, HEAD_SHA (optional),
+# BROAD_FINGERPRINT (optional).
+emit_review_markers() {
+  : "${COMMENT_MARKER:?emit_review_markers: COMMENT_MARKER must be set}"
+  : "${METADATA_MARKER:?emit_review_markers: METADATA_MARKER must be set}"
+  echo "$COMMENT_MARKER"
+  echo "$METADATA_MARKER"
+  if [ -n "${HEAD_SHA:-}" ]; then
+    # The value is the PR head SHA (a git commit hash), not a fingerprint.
+    echo "<!-- ai-pr-review-sha:${HEAD_SHA} -->"
+  fi
+  if [ -n "${BROAD_FINGERPRINT:-}" ]; then
+    echo "<!-- ai-pr-review-fingerprint:${BROAD_FINGERPRINT} -->"
+  fi
 }
 
 # Validate that PR_NUMBER is set.

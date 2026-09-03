@@ -17,6 +17,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
 import run_tool_harness as rth  # noqa: E402
+from pr_reviewer import transport  # noqa: E402
 
 
 def _openai_call(call_id, name, args):
@@ -118,6 +119,11 @@ def test_native_loop_two_hops_writes_outputs(monkeypatch, tmp_path):
     assert "v1.13.4" in md
     assert "v1.36.2" in md
 
+    # Cross-run evidence memory: the loop's closing summary becomes the digest
+    # carried into tool-harness.json (which run_review.sh folds into the marker).
+    assert result["evidence_digest"] == "Talos v1.13.4 with k8s v1.36.2."
+    assert harness["evidence_digest"] == "Talos v1.13.4 with k8s v1.36.2."
+
 
 def _make_sse_line(data):
     return f"data: {json.dumps(data)}"
@@ -189,7 +195,9 @@ def test_run_chat_request_streams_and_reassembles(monkeypatch):
         captured["args"] = args
         return types.SimpleNamespace(returncode=0, stdout=sse, stderr="")
 
-    monkeypatch.setattr(rth, "safe_run", fake_safe_run)
+    # safe_run + run_chat_request live in pr_reviewer.transport (#304 split);
+    # run_chat_request calls the module-local safe_run, so patch it there.
+    monkeypatch.setattr(transport, "safe_run", fake_safe_run)
 
     payload = {"model": "m", "stream": True, "stream_options": {"include_usage": True}}
     parsed = rth.run_chat_request("http://model.local/v1", "openai", payload, "", 30)
@@ -277,6 +285,118 @@ def test_native_loop_degrades_writes_nothing(monkeypatch, tmp_path):
     assert not (tmp_path / "tool-harness.md").exists()
 
 
+def _capture_summarize_fn(monkeypatch, tmp_path, *, enabled):
+    """Run run_native_loop with drive_tool_loop stubbed to capture the
+    summarize_fn kwarg, so we can assert the result-summarization wiring
+    without forcing a real 24k-token conversation overflow."""
+    import pr_reviewer.tool_loop as tl
+
+    captured = {}
+
+    def fake_drive(conversation, post_fn, execute_fn, **kwargs):
+        captured["summarize_fn"] = kwargs.get("summarize_fn")
+        out = tl.LoopOutcome()
+        out.degraded = True
+        out.stop_reason = "no-tool-calls"
+        return out
+
+    monkeypatch.setattr(tl, "drive_tool_loop", fake_drive)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("EFFECTIVE_SCOPE", "full")
+    if enabled:
+        monkeypatch.setenv("TOOL_LOOP_SUMMARIZE", "true")
+    else:
+        monkeypatch.delenv("TOOL_LOOP_SUMMARIZE", raising=False)
+    result = {
+        "mode": "plan_execute_once",
+        "planned_request_count": 0,
+        "executed_request_count": 0,
+        "tool_results": [],
+    }
+    handled = rth.run_native_loop(
+        "owner/repo", "http://model.local/v1", "openai", "mock-model", "key",
+        "# PR Corpus\nbumps kubelet image",
+        {"owner/repo"}, ["talos.dev"], str(tmp_path),
+        12000, 15, 4, 45, 400, result,
+    )
+    assert handled is False  # the stub degraded
+    return captured["summarize_fn"]
+
+
+def test_summarize_fn_wired_when_enabled(monkeypatch, tmp_path):
+    summarize_fn = _capture_summarize_fn(monkeypatch, tmp_path, enabled=True)
+    assert callable(summarize_fn)
+
+
+def test_summarize_fn_absent_by_default(monkeypatch, tmp_path):
+    summarize_fn = _capture_summarize_fn(monkeypatch, tmp_path, enabled=False)
+    assert summarize_fn is None
+
+
+def _openai_text_with_usage(text, *, prompt, completion, cached=0):
+    resp = _openai_text(text)
+    resp["usage"] = {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "prompt_tokens_details": {"cached_tokens": cached},
+    }
+    return resp
+
+
+def test_native_loop_degrade_records_native_usage(monkeypatch, tmp_path):
+    """A turn that burns tokens then declines tools still records its spend.
+
+    Before the fix the no-tool-calls degrade returned without stamping usage,
+    so the (real) cost of the reasoning turn that declined tools vanished and
+    the fallback's plan_execute mode carried no record of it.
+    """
+    handled, result = _run(
+        monkeypatch,
+        tmp_path,
+        [_openai_text_with_usage(
+            "Approve.", prompt=1000, completion=400, cached=600
+        )],
+    )
+    assert handled is False
+    assert result["native_loop_degraded"] == "no-tool-calls"
+    usage = result["native_loop_usage"]
+    assert usage["prompt_tokens"] == 1000
+    assert usage["completion_tokens"] == 400
+    assert usage["cached_prompt_tokens"] == 600
+    assert usage["cache_hit_ratio"] == 0.6
+
+
+def test_native_loop_request_error_records_usage_and_error(monkeypatch, tmp_path):
+    """A first-turn transport error degrades to the planner, but the native
+    attempt's stop reason + (zeroed) usage are still recorded — no silent
+    'mode present, usage absent' tool-harness.json."""
+    def boom(base_url, api_format, payload, api_key, timeout_sec):
+        raise RuntimeError("upstream 524")
+
+    monkeypatch.setattr(rth, "run_chat_request", boom)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("EFFECTIVE_SCOPE", "full")
+    monkeypatch.setenv("AI_STREAM", "false")
+    result = {
+        "mode": "plan_execute_once",
+        "planned_request_count": 0,
+        "executed_request_count": 0,
+        "tool_results": [],
+    }
+    handled = rth.run_native_loop(
+        "owner/repo", "http://model.local/v1", "openai", "mock-model", "key",
+        "# PR Corpus\nbumps kubelet image",
+        {"owner/repo"}, ["talos.dev"], str(tmp_path),
+        12000, 15, 4, 45, 400, result,
+    )
+    assert handled is False
+    assert result["native_loop_degraded"] == "request-error"
+    assert "upstream 524" in result["native_loop_error"]
+    # Usage block is present (zeroed — the request never returned a body).
+    assert result["native_loop_usage"]["prompt_tokens"] == 0
+    assert result["native_loop_usage"]["cache_hit_ratio"] == 0.0
+
+
 def _run_capturing(monkeypatch, tmp_path, api_format, responses):
     """Like _run but records every payload sent, for the verdict-turn tests."""
     queue = list(responses)
@@ -362,3 +482,297 @@ def test_native_loop_skips_verdict_for_anthropic(monkeypatch, tmp_path):
     assert handled is True
     assert result.get("native_loop_verdict_produced") is not True
     assert not (tmp_path / "ai-response.primary.json").exists()
+
+
+def _openai_system(payload):
+    return next((m["content"] for m in payload["messages"] if m["role"] == "system"), None)
+
+
+def test_native_loop_system_is_stable_across_verdict_turn(monkeypatch, tmp_path):
+    """Prompt-cache preservation (#263): one unified reviewer+tools system for the
+    whole review — the verdict turn must NOT swap it, or llama.cpp/OpenAI lose the
+    cached prefix at token 0. Every turn (loop + verdict) carries the same system,
+    and it includes the tool-use preamble."""
+    (tmp_path / "review-corpus.truncated.md").write_text("# corpus\nfull diff\n", encoding="utf-8")
+    (tmp_path / "machineconfig.yaml.j2").write_text("install: v1.13.4\n", encoding="utf-8")
+    verdict_json = '{"verdict": "approve", "review_markdown": "ok", "findings": []}'
+    handled, result, payloads = _run_capturing(
+        monkeypatch, tmp_path, "openai",
+        [
+            _openai_call("c1", "read_file", '{"path": "machineconfig.yaml.j2"}'),
+            _openai_text("done"),  # ends the loop
+            {"choices": [{"finish_reason": "stop", "message": {"content": verdict_json}}]},
+        ],
+    )
+    assert handled is True
+    assert result.get("native_loop_verdict_produced") is True
+    systems = [_openai_system(p) for p in payloads]
+    # Loop turns and the verdict turn all share one stable system (no swap).
+    assert systems[0] is not None
+    assert len(set(systems)) == 1
+    assert "Gathering evidence with tools" in systems[0]
+
+
+def test_native_loop_honors_max_completion_tokens(monkeypatch, tmp_path):
+    """AI_TOKENS_PARAM=max_completion_tokens must reach every native_loop request
+    — the loop turns and the verdict turn — for parity with the bash review path
+    (newer OpenAI models reject max_tokens)."""
+    monkeypatch.setenv("AI_TOKENS_PARAM", "max_completion_tokens")
+    (tmp_path / "review-corpus.truncated.md").write_text("# corpus\n", encoding="utf-8")
+    (tmp_path / "machineconfig.yaml.j2").write_text("install: v1.13.4\n", encoding="utf-8")
+    verdict_json = '{"verdict": "approve", "review_markdown": "ok", "findings": []}'
+    handled, _result, payloads = _run_capturing(
+        monkeypatch, tmp_path, "openai",
+        [
+            _openai_call("c1", "read_file", '{"path": "machineconfig.yaml.j2"}'),
+            _openai_text("done"),  # ends the loop
+            {"choices": [{"finish_reason": "stop", "message": {"content": verdict_json}}]},
+        ],
+    )
+    assert handled is True
+    assert len(payloads) >= 2  # loop turn(s) + the verdict turn
+    for payload in payloads:
+        assert "max_completion_tokens" in payload
+        assert "max_tokens" not in payload
+
+
+def test_native_loop_accumulates_token_usage(monkeypatch, tmp_path):
+    """Token/cost telemetry: per-turn usage (loop + verdict) is summed into
+    result['usage'], including cached prompt tokens → cache_hit_ratio."""
+    (tmp_path / "review-corpus.truncated.md").write_text("# corpus\n", encoding="utf-8")
+    (tmp_path / "machineconfig.yaml.j2").write_text("install: v1.13.4\n", encoding="utf-8")
+
+    def with_usage(resp, p, c, cached):
+        resp["usage"] = {"prompt_tokens": p, "completion_tokens": c,
+                         "prompt_tokens_details": {"cached_tokens": cached}}
+        return resp
+
+    verdict = {"choices": [{"finish_reason": "stop",
+               "message": {"content": '{"verdict":"approve","review_markdown":"ok","findings":[]}'}}]}
+    handled, result, _ = _run_capturing(
+        monkeypatch, tmp_path, "openai",
+        [
+            with_usage(_openai_call("c1", "read_file", '{"path": "machineconfig.yaml.j2"}'), 100, 20, 40),
+            with_usage(_openai_text("done"), 150, 10, 120),
+            with_usage(verdict, 200, 30, 180),
+        ],
+    )
+    assert handled is True
+    u = result["usage"]
+    assert u["requests"] == 3
+    assert u["prompt_tokens"] == 450
+    assert u["completion_tokens"] == 60
+    assert u["cached_prompt_tokens"] == 340
+    assert u["cache_hit_ratio"] == round(340 / 450, 3)
+
+
+def test_native_loop_advertises_and_routes_mcp_tool(monkeypatch, tmp_path):
+    """#245: an allowlisted read-only MCP tool is advertised in the loop request
+    and routed to the MCP client; its result folds into the harness output."""
+    import pr_reviewer.mcp_client as mcp
+
+    monkeypatch.setenv("TOOL_MCP_SERVERS", "konflate=http://x/mcp")
+    tools = [{"name": "get_pr_diff", "description": "rendered diff",
+              "inputSchema": {"type": "object", "properties": {"number": {"type": "integer"}}}}]
+
+    def mcp_post(url, payload, session_id, token, timeout):
+        method = payload.get("method")
+        if method == "initialize":
+            return {"result": {"capabilities": {}}}, "s1", None
+        if method == "tools/list":
+            return {"result": {"tools": tools}}, session_id, None
+        if method == "tools/call":
+            return ({"result": {"content": [{"type": "text", "text": "version: v1.36.1 -> v1.36.2"}]}},
+                    session_id, None)
+        return None, session_id, None
+
+    monkeypatch.setattr(mcp, "_default_post", mcp_post)
+    handled, result, payloads = _run_capturing(
+        monkeypatch, tmp_path, "openai",
+        [
+            _openai_call("c1", "mcp__konflate__get_pr_diff", '{"number": 7462}'),
+            _openai_text("done"),
+        ],
+    )
+    assert handled is True
+    # advertised in the (first) loop request
+    advertised = [t["function"]["name"] for t in payloads[0]["tools"]]
+    assert "mcp__konflate__get_pr_diff" in advertised
+    # executed + folded into the harness trace
+    harness = json.loads((tmp_path / "tool-harness.json").read_text())
+    mcp_calls = [tc for tc in harness.get("tool_calls", []) if tc["tool"] == "mcp__konflate__get_pr_diff"]
+    assert mcp_calls and mcp_calls[0]["status"] == "ok"
+
+
+class TestResolveMcpToolName:
+    """Separator-tolerant MCP tool-name resolution (#245 follow-up).
+
+    Steering prompts written against the pre-fix action.yml docs used
+    single-underscore names (mcp_server_tool); the loop resolves those to the
+    advertised mcp__server__tool route when unambiguous, and never invents a
+    route outside the allowlisted set.
+    """
+
+    ROUTES = {
+        "mcp__konflate__get_pr_summary": object(),
+        "mcp__konflate__get_pr_diff": object(),
+    }
+
+    def test_exact_name_passes_through(self):
+        assert (
+            rth.resolve_mcp_tool_name("mcp__konflate__get_pr_diff", self.ROUTES)
+            == "mcp__konflate__get_pr_diff"
+        )
+
+    def test_single_underscore_alias_resolves(self):
+        assert (
+            rth.resolve_mcp_tool_name("mcp_konflate_get_pr_summary", self.ROUTES)
+            == "mcp__konflate__get_pr_summary"
+        )
+
+    def test_case_and_hyphen_variants_resolve(self):
+        assert (
+            rth.resolve_mcp_tool_name("MCP__Konflate__get-pr-diff", self.ROUTES)
+            == "mcp__konflate__get_pr_diff"
+        )
+
+    def test_unknown_name_returns_none(self):
+        assert rth.resolve_mcp_tool_name("mcp__konflate__render_diff", self.ROUTES) is None
+
+    def test_ambiguous_collapse_returns_none(self):
+        routes = {
+            "mcp__srv__get_x": object(),
+            "mcp__srv__getx": object(),  # collapses identically
+        }
+        assert rth.resolve_mcp_tool_name("mcp_srv_get_x", routes) is None
+
+    def test_empty_routes_returns_none(self):
+        assert rth.resolve_mcp_tool_name("mcp_konflate_get_pr_diff", {}) is None
+
+
+# ── Verdict-corpus Tool Harness Findings section ──────────────────────────────
+# The corpus the verdict turn re-sends is built BEFORE the harness runs, so its
+# Tool Harness Findings section holds the pre-harness scaffold placeholder.
+# run_review.sh rebuilds the corpus afterwards, but that rebuild only feeds the
+# separate review call the in-conversation verdict replaces — so without a
+# substitution the verdict reads "Tool harness planning pending." on every
+# successful native_loop review and reports that no evidence was gathered
+# (observed on misospace/llmkube-images#216).
+
+_PLACEHOLDER_CORPUS = (
+    "# PR Diff (truncated)\n"
+    "```diff\n+bump\n```\n"
+    "\n"
+    "# Tool Harness Findings\n"
+    "Tool harness planning pending.\n"
+    "\n"
+    "# Image Digest Provenance\n"
+    "(none)\n"
+)
+
+
+def _verdict_user_text(payloads):
+    return "\n".join(
+        m.get("content") or "" for m in payloads[-1]["messages"] if m["role"] == "user"
+    )
+
+
+def test_verdict_corpus_reports_real_harness_findings(monkeypatch, tmp_path):
+    """A successful loop must not hand the verdict turn the pending placeholder."""
+    monkeypatch.setenv("AI_RESPONSE_FORMAT", "json_object")
+    (tmp_path / "review-corpus.truncated.md").write_text(
+        _PLACEHOLDER_CORPUS, encoding="utf-8"
+    )
+    (tmp_path / "machineconfig.yaml.j2").write_text(
+        "install: factory.talos.dev/installer:v1.13.4\n", encoding="utf-8"
+    )
+    verdict_json = '{"verdict": "approve", "review_markdown": "ok", "findings": []}'
+    handled, result, payloads = _run_capturing(
+        monkeypatch, tmp_path, "openai",
+        [
+            _openai_call("c1", "read_file", '{"path": "machineconfig.yaml.j2"}'),
+            _openai_text("Evidence gathered: Talos v1.13.4."),
+            {"choices": [{"finish_reason": "stop", "message": {"content": verdict_json}}]},
+        ],
+    )
+    assert handled is True
+    assert result.get("native_loop_verdict_produced") is True
+
+    user_text = _verdict_user_text(payloads)
+    assert "Tool harness planning pending." not in user_text
+    assert "1 tool call(s) executed" in user_text
+    assert "`read_file`" in user_text
+    # The surrounding corpus sections are untouched by the substitution.
+    assert "# Image Digest Provenance" in user_text
+    assert "+bump" in user_text
+
+
+def test_verdict_path_still_writes_real_harness_outputs(monkeypatch, tmp_path):
+    """Moving the summary ahead of the verdict turn must not lose the outputs:
+    tool-harness.md/json still carry the real findings and counts afterwards."""
+    monkeypatch.setenv("AI_RESPONSE_FORMAT", "json_object")
+    (tmp_path / "review-corpus.truncated.md").write_text(
+        _PLACEHOLDER_CORPUS, encoding="utf-8"
+    )
+    (tmp_path / "machineconfig.yaml.j2").write_text(
+        "install: factory.talos.dev/installer:v1.13.4\n", encoding="utf-8"
+    )
+    verdict_json = '{"verdict": "approve", "review_markdown": "ok", "findings": []}'
+    _run_capturing(
+        monkeypatch, tmp_path, "openai",
+        [
+            _openai_call("c1", "read_file", '{"path": "machineconfig.yaml.j2"}'),
+            _openai_text("Evidence gathered: Talos v1.13.4."),
+            {"choices": [{"finish_reason": "stop", "message": {"content": verdict_json}}]},
+        ],
+    )
+    harness = json.loads((tmp_path / "tool-harness.json").read_text())
+    assert harness["mode"] == "native_loop"
+    assert harness["executed_request_count"] == 1
+    assert harness["planned_request_count"] == 1
+    assert harness["usage"]["cache_hit_ratio"] == 0.0
+    md = (tmp_path / "tool-harness.md").read_text()
+    assert "read_file" in md
+    assert "v1.13.4" in md
+    assert "Evidence summary" in md
+
+
+class TestReplaceHarnessFindingsSection:
+    def test_replaces_body_and_keeps_header(self):
+        out = rth.replace_harness_findings_section(_PLACEHOLDER_CORPUS, "real body\n")
+        assert "# Tool Harness Findings\nreal body\n\n# Image Digest Provenance" in out
+        assert "planning pending" not in out
+
+    def test_incremental_header_suffix_is_preserved(self):
+        corpus = "# Tool Harness Findings (incremental review)\nplaceholder\n\n# Next\nx\n"
+        out = rth.replace_harness_findings_section(corpus, "real body\n")
+        assert out.startswith("# Tool Harness Findings (incremental review)\nreal body")
+        assert out.endswith("# Next\nx\n")
+
+    def test_absent_section_returns_corpus_unchanged(self):
+        corpus = "# PR Diff\n```diff\n+x\n```\n"
+        assert rth.replace_harness_findings_section(corpus, "body") == corpus
+
+    def test_headerless_corpus_returns_unchanged(self):
+        assert rth.replace_harness_findings_section("no headers here", "body") == "no headers here"
+
+
+def test_verdict_harness_body_indexes_every_executed_call():
+    class _R:
+        def __init__(self, tool, args, status):
+            self.tool = tool
+            self.args = args
+            self.result = {"status": status}
+
+    class _Outcome:
+        executed = [_R("read_file", {"path": "a.yaml"}, "ok"),
+                    _R("web_fetch", {"url": "https://x.test/y"}, "error")]
+        rounds = 2
+        tool_calls_issued = 3
+        stop_reason = "tool-call-budget-exhausted"
+
+    body = rth.verdict_harness_findings_body(_Outcome())
+    assert "2 tool call(s) executed across 2 round(s)" in body
+    assert "3 issued; stop reason: tool-call-budget-exhausted" in body
+    assert "1. `read_file` (ok)" in body
+    assert "2. `web_fetch` (error)" in body

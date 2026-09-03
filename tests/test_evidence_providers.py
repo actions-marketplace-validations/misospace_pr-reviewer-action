@@ -19,9 +19,49 @@ from run_evidence_providers import (  # noqa: E402
     parse_findings,
     severity_rank,
     env_int,
+    run_provider,
 )
 
 EVIDENCE_SCRIPT = _SCRIPTS_DIR / "run_evidence_providers.py"
+
+
+def test_run_provider_argv_json_and_truncation():
+    entry = run_provider(
+        1,
+        {"id": "argv", "command": [sys.executable, "-c", "print('x' * 300)"], "max_output_bytes": 256},
+        default_timeout=5,
+        default_max_output=1024,
+    )
+    assert entry["status"] == "ok"
+    assert entry["exit_code"] == 0
+    assert entry["output_format"] == "text"
+    assert entry["stdout_truncated"] is True
+
+
+def test_run_provider_shell_string_json():
+    entry = run_provider(
+        2,
+        {"id": "shell", "command": "printf '{\\\"severity\\\":\\\"warning\\\"}'", "output_format": "json"},
+        default_timeout=5,
+        default_max_output=1024,
+    )
+    assert entry["status"] == "ok"
+    assert entry["exit_code"] == 0
+    assert entry["output_format"] == "json"
+    assert entry["provider_severity"] == "warning"
+
+
+def test_run_provider_timeout_shape():
+    entry = run_provider(
+        3,
+        {"id": "timeout", "command": [sys.executable, "-c", "import time; time.sleep(2)"], "timeout_sec": 1},
+        default_timeout=1,
+        default_max_output=1024,
+    )
+    assert entry["status"] == "timeout"
+    assert entry["exit_code"] is None
+    assert entry["stdout_truncated"] is False
+    assert entry["output_format"] == "text"
 
 HELPER_JSON_FINDINGS = """\
 #!/usr/bin/env python3
@@ -477,6 +517,48 @@ class TestMarkdownOutput:
         assert "super_secret_value_xyz123" not in content
         assert "[REDACTED]" in content
 
+    def test_not_configured_writes_empty_markdown(self, tmp_path: Path):
+        """No EVIDENCE_PROVIDERS_FILE set: evidence-providers.md must be truly
+        empty (0 bytes) so corpus.sh's `[ -s evidence-providers.md ]` gate
+        omits the "# Evidence Providers" header entirely, rather than the
+        model reacting to a "not configured" placeholder (#399/#409)."""
+        env = os.environ.copy()
+        env.pop("EVIDENCE_PROVIDERS_FILE", None)
+        result = subprocess.run(
+            [sys.executable, str(EVIDENCE_SCRIPT)],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        md_file = tmp_path / "evidence-providers.md"
+        assert md_file.exists()
+        assert md_file.read_text(encoding="utf-8") == ""
+        data = _load_json_output(tmp_path)
+        assert data["configured"] is False
+
+    def test_config_not_found_still_reports_error(self, tmp_path: Path):
+        """A misconfigured (nonexistent) path is a real error, unlike the
+        "not configured at all" case above — it must stay visible in the
+        corpus, not be silenced by the same empty-markdown treatment."""
+        env = os.environ.copy()
+        env["EVIDENCE_PROVIDERS_FILE"] = str(tmp_path / "does-not-exist.json")
+        result = subprocess.run(
+            [sys.executable, str(EVIDENCE_SCRIPT)],
+            cwd=str(tmp_path),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        md_file = tmp_path / "evidence-providers.md"
+        content = md_file.read_text(encoding="utf-8")
+        assert content.strip() != ""
+        assert "not found" in content.lower()
+
 
 # ── Integration tests: command format (argv vs shell string) ───────
 
@@ -522,6 +604,35 @@ class TestCommandFormat:
         data = _load_json_output(tmp_path)
         p = data["providers"][0]
         assert p["command"] == 'echo "verbatim"'
+
+
+# ── Unit tests: shell-string trust-boundary WARN log ───────────────
+
+class TestShellStringWarnLog:
+    """Verify that run_provider emits a WARNING for shell-string commands.
+
+    The warning is the sole observability hook for the string→bash trust
+    boundary documented in SECURITY.md ("Prefer argv arrays … over shell
+    strings … to avoid shell injection risks from `bash -lc` execution").
+    Execution behaviour is unchanged by this test.
+    """
+
+    def test_warn_fires_for_shell_string_command(self):
+        """A string command triggers a WARNING containing 'bash -lc'."""
+        provider = {"id": "shell-warn-probe", "command": "true"}
+        with mock.patch("run_evidence_providers.logger") as mock_logger:
+            run_provider(1, provider, default_timeout=5, default_max_output=4096)
+        # Exactly one warning call, mentioning the bash trust boundary.
+        assert mock_logger.warning.call_count == 1
+        warn_msg = mock_logger.warning.call_args[0][0]
+        assert "bash -lc" in warn_msg
+
+    def test_no_warn_for_argv_list_command(self):
+        """An argv-list command must NOT trigger the shell-string WARNING."""
+        provider = {"id": "argv-no-warn-probe", "command": ["true"]}
+        with mock.patch("run_evidence_providers.logger") as mock_logger:
+            run_provider(1, provider, default_timeout=5, default_max_output=4096)
+        assert mock_logger.warning.call_count == 0
 
 
 # ── Integration tests: fork enablement skip behavior ────────────────
@@ -630,7 +741,7 @@ class TestParallelExecution:
     def test_model_api_keys_scrubbed_from_provider_env(self, tmp_path: Path):
         config = {
             "providers": [
-                {"id": "env-probe", "command": "echo \"key=[${AI_API_KEY:-}] fb=[${AI_FALLBACK_API_KEY:-}] gh=[${GH_TOKEN:-}]\""}
+                {"id": "env-probe", "command": "echo \"key=[${AI_API_KEY:-}] fb=[${AI_FALLBACK_API_KEY:-}] primary=[${AI_PRIMARY_API_KEY:-}] smart=[${AI_SMART_API_KEY:-}] linear=[${LINEAR_API_KEY:-}] gh=[${GH_TOKEN:-}]\""}
             ]
         }
         result = _run_caps(
@@ -639,17 +750,49 @@ class TestParallelExecution:
             {
                 "AI_API_KEY": "sk-should-never-leak",
                 "AI_FALLBACK_API_KEY": "sk-fallback-never-leak",
+                "AI_PRIMARY_API_KEY": "sk-primary-never-leak",
+                "AI_SMART_API_KEY": "sk-smart-never-leak",
+                "LINEAR_API_KEY": "lin_api_never_leak",
                 "GH_TOKEN": "gh-token-ok",
             },
         )
         assert result.returncode == 0, f"stderr: {result.stderr}"
         data = _load_json_output(tmp_path)
         stdout = data["providers"][0]["stdout"]
-        # Model keys are scrubbed before the provider runs (not just redacted
-        # after); GH_TOKEN stays available for gh-based providers.
+        # Model keys and the Linear PAT are scrubbed before the provider runs
+        # (not just redacted after); GH_TOKEN stays available for gh-based
+        # providers.
         assert "key=[]" in stdout
         assert "fb=[]" in stdout
+        assert "primary=[]" in stdout
+        assert "smart=[]" in stdout
+        assert "linear=[]" in stdout
         assert "gh-token-ok" not in stdout or "gh=[" in stdout
+
+    def test_provider_env_drops_injected_credentials(self):
+        from run_evidence_providers import provider_env
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AI_API_KEY": "sk-a",
+                "AI_FALLBACK_API_KEY": "sk-b",
+                "AI_PRIMARY_API_KEY": "sk-c",
+                "AI_SMART_API_KEY": "sk-d",
+                "LINEAR_API_KEY": "lin-e",
+                "GH_TOKEN": "gh-token-ok",
+            },
+        ):
+            env = provider_env()
+        for key in (
+            "AI_API_KEY",
+            "AI_FALLBACK_API_KEY",
+            "AI_PRIMARY_API_KEY",
+            "AI_SMART_API_KEY",
+            "LINEAR_API_KEY",
+        ):
+            assert key not in env, f"{key} leaked into provider env"
+        assert env.get("GH_TOKEN") == "gh-token-ok"
 
     def test_blocker_flag_still_aggregates(self, tmp_path: Path):
         helper = tmp_path / "blocker.py"

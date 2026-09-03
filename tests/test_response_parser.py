@@ -13,6 +13,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from pr_reviewer.response_parser import (  # noqa: E402
+    _escape_raw_newlines_in_strings,
     _extract_content,
     _strip_markdown_code_block,
     _try_decode_json,
@@ -122,6 +123,48 @@ class TestStripMarkdownCodeBlock(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# _escape_raw_newlines_in_strings
+# ---------------------------------------------------------------------------
+
+class TestEscapeRawNewlinesInStrings(TestCase):
+    def test_escapes_newline_inside_string(self):
+        self.assertEqual(
+            _escape_raw_newlines_in_strings('{"a": "x\ny"}'),
+            '{"a": "x\\ny"}',
+        )
+
+    def test_leaves_newlines_outside_string_alone(self):
+        # Structural newlines between tokens must stay raw so the parser
+        # can still see the object boundaries.
+        self.assertEqual(
+            _escape_raw_newlines_in_strings('{\n  "a": "x"\n}'),
+            '{\n  "a": "x"\n}',
+        )
+
+    def test_preserves_existing_escapes(self):
+        # ``\\n``, ``\\"``, ``\\u00XX`` are valid JSON escapes — the pass
+        # must not double-escape them.
+        self.assertEqual(
+            _escape_raw_newlines_in_strings(r'{"a": "kept\nhere", "b": "\""}'),
+            r'{"a": "kept\nhere", "b": "\""}',
+        )
+
+    def test_preserves_escaped_backslash_before_quote(self):
+        # ``\\"`` inside a string keeps the string open; the trailing
+        # raw newline should still be escaped.
+        self.assertEqual(
+            _escape_raw_newlines_in_strings(r'{"a": "with \"quote\"\nrest"}'),
+            r'{"a": "with \"quote\"\nrest"}',
+        )
+
+    def test_no_op_on_text_without_strings(self):
+        self.assertEqual(
+            _escape_raw_newlines_in_strings("no strings here\njust text"),
+            "no strings here\njust text",
+        )
+
+
+# ---------------------------------------------------------------------------
 # _try_decode_json
 # ---------------------------------------------------------------------------
 
@@ -136,11 +179,133 @@ class TestTryDecodeJson(TestCase):
         result = _try_decode_json("Here is the answer: {\"key\": \"value\"}")
         self.assertEqual(result, {"key": "value"})
 
+    def test_reasoning_array_before_object(self):
+        """A reasoning model (e.g. dsv4f via litellm) folds thinking prose
+        into ``content``. That prose may contain a valid JSON array ahead
+        of the verdict object. The scanner must skip the array and recover
+        the verdict object rather than returning the array (#dsv4f)."""
+        src = (
+            'Let me weigh the verdicts: ["approve", "request_changes"]. '
+            'Now the answer: {"verdict": "approve", "review_markdown": "# OK"}'
+        )
+        result = _try_decode_json(src)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["verdict"], "approve")
+
+    def test_findings_array_before_object(self):
+        """Thinking that drafts a findings list (a JSON array of dicts)
+        must not shadow the verdict object that follows."""
+        src = (
+            'Draft findings: [{"message": "x"}, {"message": "y"}] '
+            'Final: {"verdict": "request_changes", "review_markdown": "fix"}'
+        )
+        result = _try_decode_json(src)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["verdict"], "request_changes")
+
+    def test_array_containing_verdict_dict_not_peeked(self):
+        """Hardest skip-past case: a preamble array that itself holds a
+        verdict-shaped dict, followed by the real verdict. The scanner must
+        treat the array as opaque (advance past it) and NOT pluck the
+        interior verdict dict out of the array."""
+        src = (
+            'Draft: [{"verdict": "approve", "review_markdown": "draft"}] '
+            'Real: {"verdict": "request_changes", "review_markdown": "real"}'
+        )
+        result = _try_decode_json(src)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["verdict"], "request_changes")
+        self.assertEqual(result["review_markdown"], "real")
+
+    def test_stray_dict_before_verdict_dict(self):
+        """Preamble that drafts a non-verdict object must lose to the
+        verdict-shaped object that follows."""
+        src = (
+            'Notes: {"analysis": "diff is small and safe"} '
+            'Real answer: {"verdict": "approve", "review_markdown": "# OK"}'
+        )
+        result = _try_decode_json(src)
+        self.assertEqual(result.get("review_markdown"), "# OK")
+
+    def test_partial_verdict_draft_skipped_for_complete(self):
+        """A reasoning preamble drafting a *partial* verdict (``verdict``
+        only, no ``review_markdown``) ahead of the real complete verdict
+        must not be picked — the complete one wins. This is the dsv4f
+        dogfood failure: after arrays were handled, the model's partial
+        draft was returned, yielding 'missing required key review_markdown'.
+        """
+        src = (
+            'Schema check: {"verdict": "approve"} '
+            'Final answer: {"verdict": "approve", "review_markdown": "# OK"}'
+        )
+        result = _try_decode_json(src)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["verdict"], "approve")
+        self.assertEqual(result["review_markdown"], "# OK")
+
+    def test_sample_complete_verdict_loses_to_last_real_one(self):
+        """Where two *complete* verdicts appear, the LAST one wins — the
+        real answer is conventionally the final JSON the model emits, so
+        an earlier sample draft must not shadow it."""
+        src = (
+            'Sample: {"verdict": "request_changes", "review_markdown": "draft"} '
+            'Real: {"verdict": "approve", "review_markdown": "# Looks good"}'
+        )
+        result = _try_decode_json(src)
+        self.assertEqual(result["verdict"], "approve")
+        self.assertEqual(result["review_markdown"], "# Looks good")
+
     def test_no_json(self):
         self.assertIsNone(_try_decode_json("just text"))
 
     def test_empty_string(self):
         self.assertIsNone(_try_decode_json(""))
+
+    def test_raw_newlines_inside_string(self):
+        """Models without structured-output often emit unescaped newlines
+        inside JSON string values — see issue #449.  The lenient pass
+        should repair them rather than return None."""
+        broken = '{\n  "verdict": "request_changes",\n  "review_markdown": "line1\n\nline2"\n}'
+        result = _try_decode_json(broken)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["verdict"], "request_changes")
+        self.assertEqual(result["review_markdown"], "line1\n\nline2")
+
+    def test_raw_newlines_inside_nested_string(self):
+        broken = '{"a": "first\nsecond", "b": {"c": "third\nfourth"}}'
+        result = _try_decode_json(broken)
+        self.assertEqual(result, {"a": "first\nsecond", "b": {"c": "third\nfourth"}})
+
+    def test_raw_newlines_preserve_escaped_sequences(self):
+        """Pre-existing escape sequences (``\\n``, ``\\"``, ``\\t``) must
+        survive the lenient pass — they signal a JSON escape, not a raw
+        control char.
+        """
+        # Raw string keeps the backslash literal so JSON sees ``\n``, ``\t``
+        # and ``\"`` as escape sequences; the lenient pass must leave them
+        # alone.
+        ok = r'{"a": "kept\nhere", "b": "tab\there", "c": "quote\"inside"}'
+        result = _try_decode_json(ok)
+        self.assertEqual(result["a"], "kept\nhere")
+        self.assertEqual(result["b"], "tab\there")
+        self.assertEqual(result["c"], 'quote"inside')
+
+    def test_raw_newlines_outside_string_unchanged(self):
+        """Newlines that appear between tokens (structural whitespace) must
+        be left alone so the parser can still recognise object boundaries."""
+        ok = '{\n  "a": "x",\n  "b": "y"\n}'
+        result = _try_decode_json(ok)
+        self.assertEqual(result, {"a": "x", "b": "y"})
+
+    def test_raw_newlines_in_single_item_list(self):
+        """A list wrapper whose sole item contains raw newlines should be
+        decodable so the caller can unwrap it."""
+        broken = '[\n  {"verdict": "request_changes", "review_markdown": "fix\nme"}\n]'
+        result = _try_decode_json(broken)
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["verdict"], "request_changes")
+        self.assertEqual(result[0]["review_markdown"], "fix\nme")
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +343,29 @@ class TestParseResponse(TestCase):
         result = parse_response(resp)
         self.assertEqual(result["verdict"], "approve")
 
+    def test_markdown_fence_with_raw_newlines(self):
+        """Regression for issue #449: a model that wraps its verdict in a
+        triple-backtick json fence AND embeds raw (unescaped) newlines
+        inside a string value must still parse to a complete verdict
+        instead of burning a parse-failure retry."""
+        # Build the content the way the failing model actually emitted it:
+        # fenced JSON, with literal newlines inside the markdown string.
+        content = (
+            '```json\n'
+            '{\n'
+            '  "verdict": "request_changes",\n'
+            '  "review_markdown": "## Recommendation\n'
+            '\n'
+            'Request changes — fix the bug."\n'
+            '}\n'
+            '```'
+        )
+        resp = {"choices": [{"message": {"content": content}}]}
+        result = parse_response(resp)
+        self.assertEqual(result["verdict"], "request_changes")
+        self.assertIn("## Recommendation", result["review_markdown"])
+        self.assertIn("Request changes", result["review_markdown"])
+
     def test_single_item_list_wrapped(self):
         """[{"verdict": ...}] should be unwrapped to {...}."""
         inner = json.dumps([{"verdict": "approve", "review_markdown": "# OK"}])
@@ -192,6 +380,39 @@ class TestParseResponse(TestCase):
         resp = {"choices": [{"message": {"content": f"Sure thing:\n{inner}\n\nThanks!"}}]}
         result = parse_response(resp)
         self.assertEqual(result["verdict"], "approve")
+
+    def test_reasoning_model_array_before_verdict(self):
+        """Regression for dsv4f: a reasoning model folds thinking into
+        ``content`` (the OpenAI SSE path has no reasoning_content channel,
+        unlike Anthropic). The thinking contains a valid JSON array ahead
+        of the real verdict object. Previously this raised "Expected JSON
+        object but got list"; now the verdict object is recovered."""
+        content = (
+            "We need answer JSON review. Need decide approve vs "
+            'request_changes. Candidates: ["approve", "request_changes"]. '
+            "Now the verdict: "
+            + json.dumps({"verdict": "approve", "review_markdown": "# Looks good"})
+        )
+        resp = {"choices": [{"message": {"content": content}}]}
+        result = parse_response(resp)
+        self.assertEqual(result["verdict"], "approve")
+        self.assertEqual(result["review_markdown"], "# Looks good")
+
+    def test_reasoning_model_partial_draft_then_complete(self):
+        """Regression for the dsv4f dogfood follow-up: thinking drafts a
+        *partial* verdict (``verdict`` only) before the complete one.
+        Previously raised 'missing required key review_markdown'; now the
+        complete verdict wins."""
+        content = (
+            "Let me set the shape: "
+            + json.dumps({"verdict": "approve"})
+            + " Now the full review: "
+            + json.dumps({"verdict": "approve", "review_markdown": "# Ship it"})
+        )
+        resp = {"choices": [{"message": {"content": content}}]}
+        result = parse_response(resp)
+        self.assertEqual(result["verdict"], "approve")
+        self.assertEqual(result["review_markdown"], "# Ship it")
 
     # --- Error cases ---
 
@@ -235,6 +456,51 @@ class TestParseResponse(TestCase):
         with self.assertRaises(SystemExit) as ctx:
             parse_response(resp)
         self.assertIn("empty or missing", str(ctx.exception))
+
+    def test_flattened_review_markdown_multiple_headings_no_newlines(self):
+        # Issue #447: grammar-constrained decoding under
+        # ai_response_format: json_schema (e.g. Fireworks) can strip the
+        # "\\n" escapes that markdown requires, yielding a wall of bolded
+        # headings on a single line. Such a payload is not publishable.
+        inner = json.dumps({
+            "verdict": "request_changes",
+            "review_markdown": (
+                "## Summary This PR looks great overall ## Strengths "
+                "Clean code and good tests ## Concerns Possible "
+                "race condition in worker startup"
+            ),
+        })
+        resp = {"choices": [{"message": {"content": inner}}]}
+        with self.assertRaises(SystemExit) as ctx:
+            parse_response(resp)
+        msg = str(ctx.exception)
+        self.assertIn("flattened", msg)
+        self.assertIn("## ", msg)
+        self.assertIn("json_object", msg)
+
+    def test_single_heading_no_newlines_still_accepted(self):
+        # Only one heading marker -> not flattened; pass through as-is.
+        inner = json.dumps({
+            "verdict": "approve",
+            "review_markdown": "## Summary Looks good to me",
+        })
+        resp = {"choices": [{"message": {"content": inner}}]}
+        result = parse_response(resp)
+        self.assertEqual(result["verdict"], "approve")
+        self.assertEqual(result["review_markdown"], "## Summary Looks good to me")
+
+    def test_multiple_headings_with_newlines_accepted(self):
+        # Well-formed review with proper newlines -> no false positive.
+        inner = json.dumps({
+            "verdict": "approve",
+            "review_markdown": (
+                "## Summary\n\nLooks good.\n\n## Details\n\nNo issues found."
+            ),
+        })
+        resp = {"choices": [{"message": {"content": inner}}]}
+        result = parse_response(resp)
+        self.assertEqual(result["verdict"], "approve")
+        self.assertIn("\n", result["review_markdown"])
 
 
 # ---------------------------------------------------------------------------

@@ -18,37 +18,15 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PASS=0
 FAIL=0
-check() {
-  local desc="$1" result="$2" expected="$3"
-  if [[ "$result" == "$expected" ]]; then
-    echo "  PASS: $desc"; PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (got '$result', expected '$expected')"; FAIL=$((FAIL + 1))
-  fi
-}
-check_contains() {
-  local desc="$1" haystack="$2" needle="$3"
-  if [[ "$haystack" == *"$needle"* ]]; then
-    echo "  PASS: $desc"; PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (expected to contain '$needle')"; FAIL=$((FAIL + 1))
-  fi
-}
-check_not_contains() {
-  local desc="$1" haystack="$2" needle="$3"
-  if [[ "$haystack" != *"$needle"* ]]; then
-    echo "  PASS: $desc"; PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (should not contain '$needle')"; FAIL=$((FAIL + 1))
-  fi
-}
+# shellcheck source=_lib/assert.sh
+source "$SCRIPT_DIR/_lib/assert.sh"
 
 # Extract build_user_message from run_review.sh so it can be called directly
 # (same pattern as test_context_budget.sh).
 FUNCS="$(mktemp)"
 TMP="$(mktemp -d)"
 trap 'rm -f "$FUNCS"; rm -rf "$TMP"' EXIT
-python3 - "$ROOT_DIR/scripts/run_review.sh" "$FUNCS" <<'PY'
+python3 - "$ROOT_DIR/scripts/sections/review.sh" "$FUNCS" <<'PY'
 import re, sys
 src = open(sys.argv[1]).read()
 m = re.search(r"^build_user_message\(\) \{\n(.*?)\n\}", src, re.S | re.M)
@@ -116,10 +94,12 @@ MSG="$(build_user_message "$TMP/classification.json")"
 check "at most 12 check bullets" "$(printf '%s\n' "$MSG" | grep -c '^- check ')" "12"
 
 echo ""
-echo "=== Test: wiring in run_review.sh and system prompt ==="
-RUN_REVIEW="$(cat "$ROOT_DIR/scripts/run_review.sh")"
-check "primary request uses the steered message" \
-  "$(grep -c '"\$USER_MESSAGE" \\' "$ROOT_DIR/scripts/run_review.sh")" "2"
+echo "=== Test: wiring in the review section module and system prompt ==="
+# The steered USER_MESSAGE reaches the model on both the primary and fallback
+# tiers (the smart tier sends escalated_user, which embeds it). The inline
+# build_model_request calls became call_model_tier call sites in #368.
+check "primary/fallback requests use the steered message" \
+  "$(grep -c 'call_model_tier \(primary\|fallback\) "\$USER_MESSAGE"' "$ROOT_DIR/scripts/sections/review.sh")" "2"
 PROMPT="$(cat "$ROOT_DIR/scripts/default_system_prompt.txt")"
 check_contains "system prompt references the PR Classification section" \
   "$PROMPT" "# PR Classification"

@@ -18,19 +18,14 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PASS=0
 FAIL=0
-check() {
-  local desc="$1" result="$2" expected="$3"
-  if [[ "$result" == "$expected" ]]; then
-    echo "  PASS: $desc"; PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (got '$result', expected '$expected')"; FAIL=$((FAIL + 1))
-  fi
-}
+# shellcheck source=_lib/assert.sh
+source "$SCRIPT_DIR/_lib/assert.sh"
 
-# Extract the two functions from run_review.sh so we can call them directly.
+# Extract the two functions from the config section module (#307 split) so we
+# can call them directly.
 FUNCS="$(mktemp)"
 trap 'rm -f "$FUNCS"' EXIT
-python3 - "$ROOT_DIR/scripts/run_review.sh" "$FUNCS" <<'PY'
+python3 - "$ROOT_DIR/scripts/sections/config.sh" "$FUNCS" <<'PY'
 import re, sys
 src = open(sys.argv[1]).read()
 out = []
@@ -86,23 +81,40 @@ check "output is valid UTF-8" \
   "$(python3 -c 'open("'"$TMP"'/utfdst",encoding="utf-8").read(); print("ok")')" "ok"
 
 echo ""
-echo "=== Test: enrichment context trims are wired into run_review.sh ==="
-RUN_REVIEW="$(cat "$ROOT_DIR/scripts/run_review.sh")"
+echo "=== Test: enrichment context trims are wired into the Python pipeline ==="
+# Enrichment rendering moved from scripts/sections/enrichment.sh into the
+# Python pipeline (#7892), and the render + skip-list logic was extracted from
+# scripts/run_enrichment.py into pr_reviewer/linked_sources.py (#359). The
+# skip-list and corpus-note behavior must survive both migrations.
+LINKED_SOURCES_PY="$ROOT_DIR/pr_reviewer/linked_sources.py"
 check "github.com raw HTML fetch is skipped" \
-  "$(grep -c 'Raw HTML fetch skipped for github.com' "$ROOT_DIR/scripts/run_review.sh")" "1"
+  "$(grep -c 'Raw HTML fetch skipped for github.com' "$LINKED_SOURCES_PY")" "1"
 check "non-github sources go through strip_source_to_text" \
-  "$(grep -c 'strip_source_to_text "source.$i.raw"' "$ROOT_DIR/scripts/run_review.sh")" "1"
+  "$(grep -c 'strip_source_to_text' "$LINKED_SOURCES_PY")" "2"
 check "github.com is excluded from the parallel prefetch" \
-  "$(grep -c '"\$host" != "github.com"' "$ROOT_DIR/scripts/run_review.sh")" "1"
+  "$(grep -c 'host == "github.com"' "$LINKED_SOURCES_PY")" "2"
+check "SKIP_FETCH_HOSTS constant is defined" \
+  "$(grep -c '^SKIP_FETCH_HOSTS' "$LINKED_SOURCES_PY")" "1"
+check "SKIP_FETCH_HOSTS list covers gitlab.com" \
+  "$(grep -c 'gitlab.com' "$LINKED_SOURCES_PY")" "1"
+check "SKIP_FETCH_HOSTS list covers bitbucket.org" \
+  "$(grep -c 'bitbucket.org' "$LINKED_SOURCES_PY")" "1"
+check "Phase-1 loop skips SKIP_FETCH_HOSTS" \
+  "$(grep -c 'SKIP_FETCH_HOSTS' "$LINKED_SOURCES_PY")" "3"
+check "Phase-2 emits 'known non-Forgejo host' corpus note" \
+  "$(grep -c 'Raw HTML fetch skipped for known non-Forgejo host' "$LINKED_SOURCES_PY")" "1"
 
 echo ""
-echo "=== Test: no tokens on curl argv in run_review.sh ==="
+echo "=== Test: no tokens on curl argv in the incremental fetch ==="
 check "incremental fetch passes the token via --config, not argv" \
-  "$(grep -c 'Authorization: token \$GH_TOKEN" \\' "$ROOT_DIR/scripts/run_review.sh" || true)" "0"
+  "$(grep -c 'Authorization: token \$GH_TOKEN" \\' "$ROOT_DIR/scripts/sections/config.sh" || true)" "0"
 check "incremental fetch uses curl_config_escape helper" \
-  "$(grep -c 'curl_config_escape "Authorization: token' "$ROOT_DIR/scripts/run_review.sh")" "1"
-check "strip helper delegates to strip_source_text.py" \
-  "$(grep -c 'strip_source_text.py' "$ROOT_DIR/scripts/run_review.sh")" "1"
+  "$(grep -c 'curl_config_escape "Authorization: token' "$ROOT_DIR/scripts/sections/config.sh")" "1"
+# HTML stripping lives only in pr_reviewer/linked_sources.py (via
+# strip_source_text.py); context.sh must not grow a parallel shell
+# implementation again.
+check "context.sh has no parallel strip implementation" \
+  "$(grep -c 'strip_source_to_text' "$ROOT_DIR/scripts/sections/context.sh" || true)" "0"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

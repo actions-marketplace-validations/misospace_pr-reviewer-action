@@ -32,6 +32,8 @@ they document the defended surface and fail loudly if a future change weakens it
 from __future__ import annotations
 
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -146,6 +148,25 @@ def test_web_fetch_blocks_unallowlisted_host(tmp_path, url):
     assert "not allowlisted" in str(res["result"]).lower()
 
 
+def test_allowlisted_host_wildcard_allows_any():
+    """Wildcard '*' should allow any host, mirroring gh_api's repo wildcard.
+
+    Regression guard: ``allowlisted_host`` previously did exact-match only, so
+    an operator setting ``allowed_source_hosts: "*"`` silently blocked every
+    fetch (the "*" matched no real host).
+    """
+    from pr_reviewer.tool_executors import allowlisted_host
+
+    assert allowlisted_host("registry.npmjs.org", ["*"]) is True
+    assert allowlisted_host("evil.example.com", ["*"]) is True
+    # Non-wildcard exact behaviour is unchanged.
+    assert allowlisted_host("github.com", ["github.com"]) is True
+    assert allowlisted_host("evil.example.com", ["github.com"]) is False
+    # Entries are normalised, so stray case/whitespace no longer causes a
+    # silent denial.
+    assert allowlisted_host("github.com", ["  GitHub.COM  "]) is True
+
+
 # 5. A hostile web_search query cannot smuggle in a different host: the query is
 #    URL-encoded into the operator-configured search_url, which stays fixed.
 def test_web_search_query_cannot_change_host(tmp_path, monkeypatch):
@@ -165,7 +186,7 @@ def test_web_search_query_cannot_change_host(tmp_path, monkeypatch):
         captured["url"] = req.full_url if hasattr(req, "full_url") else req.get_full_url()
         return _Resp()
 
-    monkeypatch.setattr(rth.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     hostile_query = "talos matrix&engines=x http://evil.example/?leak=secret"
     res = _exec(
@@ -178,7 +199,7 @@ def test_web_search_query_cannot_change_host(tmp_path, monkeypatch):
     # The request host stayed the configured one; the hostile text rode inside
     # the URL-encoded q= parameter rather than re-pointing the request.
     assert captured["url"].startswith("https://search.jory.dev/search?")
-    assert "evil.example" not in rth.urllib.parse.urlparse(captured["url"]).netloc
+    assert "evil.example" not in urllib.parse.urlparse(captured["url"]).netloc
     assert "q=talos+matrix%26engines" in captured["url"] or "q=talos%20matrix%26engines" in captured["url"]
 
 

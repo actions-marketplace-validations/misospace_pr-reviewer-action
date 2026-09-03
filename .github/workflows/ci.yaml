@@ -13,10 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so the gitleaks CLI below can scan every commit, not
+          # just the PR merge ref of a shallow checkout.
+          fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           # Pinned to 3.14 to match the local dev interpreter — a version skew
           # between local and CI is how the duplicate-key regression test first
@@ -24,7 +28,7 @@ jobs:
           python-version: '3.14'
 
       - name: Install test dependencies
-        run: pip install pytest yamllint
+        run: pip install -r requirements.txt
 
       - name: Validate action metadata YAML
         run: ruby -e 'require "yaml"; YAML.load_file("action.yml")'
@@ -45,6 +49,21 @@ jobs:
             .github/workflows/*.yaml \
             examples/*.yml
 
+      - name: Lint GitHub Actions workflows
+        uses: rhysd/actionlint@914e7df21a07ef503a81201c76d2b11c789d3fca # v1.7.12
+
+      # Secret scan: this action forwards operator PATs and AI_API_KEYs, so a
+      # hardcoded credential in a committed diff is exactly the regression class
+      # the redaction work (#471, #360) guards against. The official license-free
+      # gitleaks CLI (image pinned by digest) scans the full checkout history —
+      # the checkout above uses fetch-depth 0 — on every run, failing the build
+      # on any detection. .gitleaks.toml allowlists the intentionally fake
+      # credential fixtures in the redaction test suites.
+      - name: Scan for leaked secrets (gitleaks)
+        uses: docker://ghcr.io/gitleaks/gitleaks@sha256:090a2715530bd6592342e6a66c3f35eafcaaf2a3227a312482504f9c854997e3
+        with:
+          args: git --config /github/workspace/.gitleaks.toml --no-banner --redact /github/workspace
+
       - name: Check shell scripts
         run: |
           set -euo pipefail
@@ -52,8 +71,15 @@ jobs:
             bash -n "$f"
           done
 
+      - name: Lint shell scripts with shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 shellcheck
+
       - name: Check Python scripts
-        run: python3 -m py_compile scripts/image_digest_analysis.py scripts/run_evidence_providers.py scripts/run_tool_harness.py tests/mock_openai_server.py tests/test_model_parsing.py tests/test_redact.py tests/test_strip_metadata_markers.py tests/test_evidence_providers.py
+        run: find scripts pr_reviewer tests -name '*.py' -print0 | xargs -0 python3 -m py_compile
 
       - name: Verify smoke test helper is executable
         run: test -x tests/smoke_test.sh
@@ -61,8 +87,20 @@ jobs:
       - name: Run smoke test
         run: tests/smoke_test.sh
 
+      - name: Verify Forgejo E2E smoke harness parses
+        run: bash -n tests/forgejo_e2e_smoke.sh
+
+      # Coverage is scoped to pr_reviewer/ and scripts/ — the bash test suites
+      # below cover the shell side, which pytest-cov can't measure.
+      # Threshold: measured baseline was 76% (2026-07-03); gate at 72 to absorb
+      # small fluctuations. Ratchet toward the audit's 80% as coverage grows.
       - name: Run Python tests (auto-discover all 215)
-        run: pytest tests/ -v --tb=short
+        run: |
+          COV_FAIL_UNDER=72
+          pytest tests/ -v --tb=short \
+            --cov=pr_reviewer --cov=scripts \
+            --cov-report=term-missing:skip-covered \
+            --cov-fail-under="$COV_FAIL_UNDER"
 
       # Auto-discover every bash suite so a new (or previously unlisted) suite
       # cannot silently stay out of CI. The smoke test runs separately above.

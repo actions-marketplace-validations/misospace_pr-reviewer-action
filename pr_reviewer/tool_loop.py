@@ -26,14 +26,15 @@ calls are answered from a dedup note without burning budget, every call id
 the model issues gets *some* result before the next request (the
 ``Conversation.open_tool_call_ids`` contract), and hard caps bound rounds,
 total calls, and wall clock. A model that never calls tools at all is
-reported as ``degraded`` so the caller can fall back to the
-plan_execute_loop planner path.
+reported as ``degraded`` so the caller can fall back to a corpus-only
+review (the plan_execute planner fallback was removed in #304).
 """
 
 from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -68,9 +69,39 @@ class LoopBudgets:
     max_rounds: int = 3  # model round-trips (TOOL_MAX_ROUNDS)
     wall_clock_sec: float = 120.0  # whole-loop ceiling (TOOL_LOOP_WALL_CLOCK_SEC)
     # When the conversation outgrows this, the oldest tool results are
-    # truncated before the next request (newest results stay intact).
+    # compacted before the next request (newest results stay intact) — by a
+    # model-generated digest when a summarizer is wired, else blunt truncation.
     max_conversation_tokens: int = 24000
     truncated_result_bytes: int = 2000
+    # Results kept verbatim when summarizing the rest (the model is actively
+    # reasoning over the newest evidence).
+    summarize_keep_newest: int = 2
+
+
+def adaptive_loop_budgets(
+    max_rounds: int,
+    max_tool_calls: int,
+    wall_clock_sec: float,
+) -> "LoopBudgets":
+    """Right-size the loop budget. A native round is one model turn, so the
+    headroom is 2× the configured rounds (capped at 8); the configured tool-call
+    budget is used as-is.
+
+    The budget is the SAME on every route — the route selects the MODEL, never
+    the tool budget. An earlier version shallow-capped the primary route (then
+    misnamed "fast") on low-risk PRs to "save budget on a trivial diff", but the
+    loop already self-limits (it stops as soon as the model stops calling
+    tools), so the cap never saved cost on trivial PRs — it only starved the
+    PRs that genuinely need a multi-hop chain (e.g. reading a deployed version,
+    then verifying it against a host platform's compatibility matrix). The
+    primary model is fully capable; don't ration its evidence-gathering.
+    """
+    rounds = min(max(max_rounds, 1) * 2, 8)
+    return LoopBudgets(
+        max_tool_calls=max_tool_calls,
+        max_rounds=rounds,
+        wall_clock_sec=float(wall_clock_sec),
+    )
 
 
 @dataclass
@@ -87,8 +118,8 @@ class LoopOutcome:
     tool_calls_issued: int = 0  # everything the model asked for, incl. refused
     stop_reason: str = STOP_NO_TOOL_CALLS
     final_text: str = ""
-    # True when the model never issued a single tool call: the caller should
-    # degrade to the plan_execute_loop planner path (issue #203 spec).
+    # True when the model never issued a single tool call: the caller degrades
+    # to a corpus-only review (the plan_execute planner fallback was removed in #304).
     degraded: bool = False
     error: str = ""
 
@@ -183,6 +214,9 @@ def drive_tool_loop(
     max_tokens: int = 1024,
     temperature: float = 0.0,
     stream: bool = False,
+    tokens_param: str = "max_tokens",
+    cache_prefix: bool = False,
+    summarize_fn: Callable[[str], str] | None = None,
     time_fn: Callable[[], float] = time.monotonic,
 ) -> LoopOutcome:
     """Run the agentic loop until the model stops or a budget hits.
@@ -211,9 +245,26 @@ def drive_tool_loop(
             break
 
         # Keep the next request within the advisory context budget by
-        # shrinking the oldest tool results (newest stay intact).
+        # compacting the oldest tool results (newest stay intact). When a
+        # summarizer is wired, fold them into a model-generated digest that
+        # preserves salient facts; otherwise (or if it frees nothing / fails)
+        # fall back to blunt truncation, which is the guaranteed backstop.
         if conversation.approx_tokens() > budgets.max_conversation_tokens:
-            conversation.truncate_oldest_tool_results(budgets.truncated_result_bytes)
+            summarized = 0
+            if summarize_fn is not None:
+                try:
+                    summarized = conversation.summarize_oldest_tool_results(
+                        summarize_fn, keep_newest=budgets.summarize_keep_newest
+                    )
+                except Exception:  # noqa: BLE001 — summarization is best-effort
+                    summarized = 0
+            if (
+                not summarized
+                or conversation.approx_tokens() > budgets.max_conversation_tokens
+            ):
+                conversation.truncate_oldest_tool_results(
+                    budgets.truncated_result_bytes
+                )
 
         payload = conversation.to_request_payload(
             api_format,
@@ -221,6 +272,8 @@ def drive_tool_loop(
             stream=stream,
             max_tokens=max_tokens,
             temperature=temperature,
+            tokens_param=tokens_param,
+            cache_prefix=cache_prefix,
         )
         try:
             response = post_fn(payload)
@@ -247,42 +300,67 @@ def drive_tool_loop(
         conversation.add_assistant_tool_calls(calls)
         outcome.tool_calls_issued += len(calls)
 
-        for call in calls:
+        # Decide each call's disposition SEQUENTIALLY — dedup (seen_keys) and
+        # the budget counter are stateful and must stay deterministic and
+        # call-ordered. Only the to-run executions are then fanned out
+        # concurrently: the executor is read-only and a round's calls are
+        # independent (the model emitted them together). Results are applied in
+        # the original call order to preserve the open-call contract.
+        plan: list[tuple[str, str, Any]] = []  # (call_id, kind, data) in order
+        to_execute: dict[int, tuple[str, dict[str, Any]]] = {}
+        for idx, call in enumerate(calls):
             call_id = call["id"]
-            # Arguments arrive as an opaque JSON string (#233 contract);
-            # parse here, and on failure answer with a repairable error
-            # instead of crashing the loop — weak models misquote JSON.
+            # Arguments arrive as an opaque JSON string (#233 contract); parse
+            # here, and on failure answer with a repairable error instead of
+            # crashing the loop — weak models misquote JSON.
             try:
                 args = json.loads(call["arguments"]) if call["arguments"] else {}
                 if not isinstance(args, dict):
                     raise ValueError("arguments must be a JSON object")
             except (json.JSONDecodeError, ValueError) as exc:
-                conversation.add_tool_result(
-                    call_id,
-                    {"error": f"Invalid tool arguments (not a JSON object): {exc}"},
-                    is_error=True,
+                plan.append(
+                    (call_id, "error",
+                     {"error": f"Invalid tool arguments (not a JSON object): {exc}"})
                 )
                 continue
 
             key = _request_key(call["name"], args)
             if key in seen_keys:
-                # Free synthetic answer: doesn't execute, doesn't burn budget.
-                conversation.add_tool_result(
-                    call_id, {"note": _DUPLICATE_NOTE}, is_error=True
-                )
+                plan.append((call_id, "dup", {"note": _DUPLICATE_NOTE}))
                 continue
 
             if calls_executed >= budgets.max_tool_calls:
-                conversation.add_tool_result(
-                    call_id, {"error": _BUDGET_NOTE}, is_error=True
-                )
+                plan.append((call_id, "budget", {"error": _BUDGET_NOTE}))
                 continue
 
             seen_keys.add(key)
             calls_executed += 1
-            result = execute_fn(call["name"], args)
+            to_execute[idx] = (call["name"], args)
+            plan.append((call_id, "exec", idx))
+
+        # Fan out the executions (read-only, independent within a round).
+        results_by_idx: dict[int, dict[str, Any]] = {}
+        if len(to_execute) == 1:
+            (only_idx, (name, args)), = to_execute.items()
+            results_by_idx[only_idx] = execute_fn(name, args)
+        elif to_execute:
+            with ThreadPoolExecutor(max_workers=min(len(to_execute), 8)) as pool:
+                futures = {
+                    pool.submit(execute_fn, name, args): i
+                    for i, (name, args) in to_execute.items()
+                }
+                for fut in futures:
+                    results_by_idx[futures[fut]] = fut.result()
+
+        # Apply results in call order (synthetic refusals inline).
+        for call_id, kind, data in plan:
+            if kind != "exec":
+                conversation.add_tool_result(call_id, data, is_error=True)
+                continue
+            name, args = to_execute[data]
+            result = results_by_idx[data]
             outcome.executed.append(
-                ExecutedCall(tool=call["name"], args=args, result=result)
+                ExecutedCall(tool=name, args=args, result=result)
             )
             conversation.add_tool_result(
                 call_id,

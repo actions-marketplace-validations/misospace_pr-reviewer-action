@@ -151,6 +151,36 @@ def test_action_yml_has_no_duplicate_env_keys():
     )
 
 
+def test_platform_resolution_centralized_in_precheck():
+    """Platform resolution lives in one place — the precheck (issue #367).
+
+    The ``github.server_url``→FORGEJO_API_URL fallback expression must appear
+    exactly once (the precheck step env, the only step with no precheck to
+    consume). Every downstream step reads the precheck's resolved_platform /
+    effective_forgejo_api_url outputs instead of re-deriving the platform,
+    which is what let the shell seam and forgejo_backend disagree.
+    """
+    content = (_REPO_ROOT / "action.yml").read_text()
+    fallback = "github.server_url != 'https://github.com'"
+    count = content.count(fallback)
+    assert count == 1, (
+        "the server_url→FORGEJO_API_URL fallback expression must appear exactly "
+        f"once (precheck only); found {count}. Downstream steps should consume "
+        "steps.precheck.outputs.resolved_platform / effective_forgejo_api_url."
+    )
+    assert "steps.precheck.outputs.resolved_platform" in content, (
+        "downstream steps must consume the precheck's resolved_platform output"
+    )
+    assert "steps.precheck.outputs.effective_forgejo_api_url" in content, (
+        "downstream steps must consume the precheck's effective_forgejo_api_url output"
+    )
+    # The lone remaining fallback must be paired with PLATFORM: inputs.platform
+    # (the precheck still takes raw inputs; it is the resolver, not a consumer).
+    assert "PLATFORM: ${{ inputs.platform }}" in content, (
+        "the precheck step must still resolve from the raw platform input"
+    )
+
+
 def test_comment_marker_input_exists():
     """Verify comment_marker input is declared (regression test for #113)."""
     action_inputs = parse_action_inputs()
@@ -160,8 +190,91 @@ def test_comment_marker_input_exists():
     )
 
 
+def test_fallback_inputs_inherit_from_primary():
+    """Fallback base_url, api_format, and api_key inherit from primary when blank.
+
+    Regression test for #448: ai_fallback_base_url, ai_fallback_api_format, and
+    ai_fallback_api_key must default to their ai_* primary equivalents (matching
+    the smart-route behavior) so that a fallback model on the same gateway works
+    with zero extra config.
+    """
+    content = (_REPO_ROOT / "action.yml").read_text()
+
+    # Check AI_FALLBACK_BASE_URL inherits from ai_base_url
+    assert "AI_FALLBACK_BASE_URL: ${{ inputs.ai_fallback_base_url || inputs.ai_base_url }}" in content, (
+        "AI_FALLBACK_BASE_URL must inherit from ai_base_url when blank"
+    )
+    # Check AI_FALLBACK_API_FORMAT inherits from ai_api_format
+    assert "AI_FALLBACK_API_FORMAT: ${{ inputs.ai_fallback_api_format || inputs.ai_api_format }}" in content, (
+        "AI_FALLBACK_API_FORMAT must inherit from ai_api_format when blank"
+    )
+    # Check AI_FALLBACK_API_KEY inherits from ai_api_key
+    assert "AI_FALLBACK_API_KEY: ${{ inputs.ai_fallback_api_key || inputs.ai_api_key }}" in content, (
+        "AI_FALLBACK_API_KEY must inherit from ai_api_key when blank"
+    )
+
+
+def test_fail_on_request_changes_input():
+    """fail_on_request_changes gates merges without a GitHub App (issue #518).
+
+    - Declared with default "false" so existing consumers see no change.
+    - The gate step reads the final verdict from $GITHUB_OUTPUT (the same
+      value the `verdict` output reports) and exits non-zero only on
+      request_changes.
+    - The gate runs after the publish step, so the review comment and inline
+      findings land on the PR before the step goes red.
+    """
+    content = (_REPO_ROOT / "action.yml").read_text()
+
+    # Declared with a "false" default.
+    m = re.search(
+        r"^  fail_on_request_changes:\n(?:^    .*\n)*?^    default: \"false\"\s*$",
+        content,
+        re.MULTILINE,
+    )
+    assert m, (
+        "fail_on_request_changes must be declared in action.yml inputs with "
+        'default "false" so existing consumers see no behaviour change.'
+    )
+
+    # The gate step exists, is conditional on the input, and reads the final
+    # verdict from the output file rather than re-deriving it.
+    gate = re.search(
+        r"^    - name: Fail on request_changes\n"
+        r"(?:^      .*\n)*?^      if: \$\{\{ inputs\.fail_on_request_changes == 'true' \}\}\n"
+        r"(?:^      .*\n)*?^      run: \|\n"
+        r"(?:^        .*\n)*?^          exit 1\n",
+        content,
+        re.MULTILINE,
+    )
+    assert gate, (
+        "action.yml must contain a 'Fail on request_changes' step that is "
+        "conditional on inputs.fail_on_request_changes and exits non-zero."
+    )
+    gate_body = gate.group(0)
+    assert '"$GITHUB_OUTPUT"' in gate_body, (
+        "the gate must read the final verdict from $GITHUB_OUTPUT (the same "
+        "value the `verdict` output reports), not re-derive it."
+    )
+    assert 'verdict' in gate_body and 'request_changes' in gate_body
+
+    # The gate runs after the publish step (a red check with no explanation
+    # attached is worse than no gate).
+    publish_idx = content.find("Publish review")
+    gate_idx = content.find("Fail on request_changes")
+    assert publish_idx != -1 and gate_idx != -1, (
+        "both the publish step and the fail_on_request_changes gate step must exist."
+    )
+    assert gate_idx > publish_idx, (
+        "the fail_on_request_changes gate must run after the publish step so "
+        "the review comment and inline findings land on the PR first."
+    )
+
+
 if __name__ == "__main__":
     test_readme_inputs_in_action()
     test_action_inputs_in_readme()
     test_comment_marker_input_exists()
+    test_fallback_inputs_inherit_from_primary()
+    test_fail_on_request_changes_input()
     print("All action inputs tests passed!")

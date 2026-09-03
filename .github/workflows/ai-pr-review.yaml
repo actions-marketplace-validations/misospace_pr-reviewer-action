@@ -2,7 +2,14 @@ name: AI PR Review
 
 on:
   pull_request:
-    branches: ["main"]
+    # Deliberately unfiltered by base branch. A `branches: ["main"]` filter is
+    # evaluated against the BASE ref, so a stacked PR — one opened against
+    # another in-flight branch, the normal way to split a change into reviewable
+    # parts — never matched and was silently never reviewed. No check appeared
+    # to explain the absence, and neither the `ai-review` label nor
+    # workflow_dispatch could recover it: the filter applies to every activity
+    # type, and the review step below is gated on `pull_request`.
+    #
     # `labeled` enables the one-click re-review: add the `ai-review` label to
     # force a fresh review (only write/triage can label — self-authorizing).
     types: [opened, reopened, synchronize, ready_for_review, labeled]
@@ -24,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -39,7 +46,14 @@ jobs:
       - name: Review PR with reusable AI reviewer
         if: github.event_name == 'pull_request'
         id: review
-        uses: misospace/pr-reviewer-action@4126a2701a5e9adcf7c48ac6eb678e2e3a2bb2a0 # v1.2.9
+        # Dogfood: `$/` resolves to this repository at the running commit, so
+        # every PR is reviewed by its own in-flight action code instead of the
+        # last release — a PR that breaks the manifest or publish path now
+        # fails its own review before it can ship. Also ends the renovate
+        # self-pin churn. Fork PRs are unchanged: they get no secrets and the
+        # job fails at the app-token step. Requires runner >= 2.336.0
+        # (github.com hosted runners qualify; not available on GHES).
+        uses: $/
         with:
           github_token: ${{ steps.app-token.outputs.token }}
           ai_primary_retries: "3"
@@ -53,7 +67,7 @@ jobs:
           ai_fallback_api_format: ${{ vars.FALLBACK_FORMAT }}
           ai_fallback_model: ${{ vars.FALLBACK_MODEL }}
           ai_fallback_api_key: ${{ secrets.LITELLM_API_KEY }}
-          ai_max_tokens: "16384"
+          ai_max_tokens: "32768"
           review_routing_mode: auto
           ai_smart_base_url: ${{ vars.LITELLM_URL }}
           ai_smart_api_format: ${{ vars.SMART_FORMAT }}
@@ -62,12 +76,13 @@ jobs:
           context_limit_mode: normal
           ci_status_check: "true"
           ci_timeout_sec: "600"
-          tool_mode: plan_execute_loop
+          tool_mode: native_loop
           tool_max_rounds: "2"
           tool_max_requests: "4"
-          tool_planning_timeout_sec: "45"
+          tool_loop_wall_clock_sec: "300"
+          tool_planning_timeout_sec: "300"
           tool_planning_max_context_bytes: "15000"
-          tool_planning_max_tokens: "300"
+          tool_planning_max_tokens: "16000"
           tool_max_response_bytes: "12000"
           tool_allowed_gh_api_repos: misospace/pr-reviewer-action
           tool_request_timeout_sec: "15"

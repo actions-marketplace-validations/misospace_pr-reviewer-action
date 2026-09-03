@@ -18,20 +18,14 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PASS=0
 FAIL=0
-check() {
-  local desc="$1" result="$2" expected="$3"
-  if [[ "$result" == "$expected" ]]; then
-    echo "  PASS: $desc"; PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (got '$result', expected '$expected')"; FAIL=$((FAIL + 1))
-  fi
-}
+# shellcheck source=_lib/assert.sh
+source "$SCRIPT_DIR/_lib/assert.sh"
 
 FUNC="$(mktemp)"
 TMP="$(mktemp -d)"
 trap 'rm -f "$FUNC"; rm -rf "$TMP"' EXIT
 
-python3 - "$ROOT_DIR/scripts/run_review.sh" "$FUNC" <<'PY'
+python3 - "$ROOT_DIR/scripts/sections/review.sh" "$FUNC" <<'PY'
 import re, sys
 src = open(sys.argv[1]).read()
 m = re.search(r"^write_step_summary\(\) \{\n(.*?)\n\}", src, re.S | re.M)
@@ -46,6 +40,7 @@ source "$FUNC"
 
 cd "$TMP"
 echo '{"verdict":"request_changes","review_markdown":"x"}' > ai-output.json
+echo '{"executed_request_count":2,"tool_calls":[{"tool":"read_file","status":"ok"},{"tool":"web_fetch","status":"error"}]}' > tool-harness.json
 # 100-byte diff with a small cap → should report truncation
 printf 'd%.0s' $(seq 1 100) > pr.diff
 printf 'c%.0s' $(seq 1 50) > review-corpus.md
@@ -69,6 +64,8 @@ check "summary flags diff truncation" \
   "$(grep -qi 'Diff bytes' "$GITHUB_STEP_SUMMARY" && grep -qi 'truncated: yes' "$GITHUB_STEP_SUMMARY" && echo yes || echo no)" "yes"
 check "summary shows the budget mode" \
   "$(grep -qi 'context_limit_mode=normal' "$GITHUB_STEP_SUMMARY" && echo yes || echo no)" "yes"
+check "summary shows tool call counts" \
+  "$(grep -qi '2 executed (1 successful)' "$GITHUB_STEP_SUMMARY" && echo yes || echo no)" "yes"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

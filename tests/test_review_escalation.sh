@@ -14,34 +14,24 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-RUN_REVIEW="$ROOT_DIR/scripts/run_review.sh"
+# The escalation / enforcement / output logic now lives in the review section
+# module (#307 split); the orchestrator just sources the sections in order.
+RUN_REVIEW="$ROOT_DIR/scripts/sections/review.sh"
 
 PASS=0
 FAIL=0
-check() {
-  local desc="$1" result="$2" expected="$3"
-  if [[ "$result" == "$expected" ]]; then
-    echo "  PASS: $desc"; PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (got '$result', expected '$expected')"; FAIL=$((FAIL + 1))
-  fi
-}
-check_contains() {
-  local desc="$1" haystack="$2" needle="$3"
-  if [[ "$haystack" == *"$needle"* ]]; then
-    echo "  PASS: $desc"; PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (expected to contain '$needle')"; FAIL=$((FAIL + 1))
-  fi
-}
+# shellcheck source=_lib/assert.sh
+source "$SCRIPT_DIR/_lib/assert.sh"
 
-SRC="$(cat "$RUN_REVIEW")"
+SRC="$(cat "$ROOT_DIR/scripts/run_review.sh" "$ROOT_DIR"/scripts/sections/*.sh)"
 ACTION="$(cat "$ROOT_DIR/action.yml")"
 
 echo "=== Escalation gating ==="
 check_contains "escalation requires auto routing" "$SRC" '[[ "$REVIEW_ROUTING_MODE" == "auto" ]] || return 0'
-check_contains "escalation requires the fast route" "$SRC" '[[ "${REVIEW_ROUTE:-legacy}" == "fast" ]] || return 0'
+check_contains "escalation requires the primary route" "$SRC" '[[ "${REVIEW_ROUTE:-legacy}" == "primary" ]] || return 0'
 check_contains "escalation requires a smart model" "$SRC" '[[ -n "$SMART_MODEL_RESOLVED" ]] || return 0'
+check_contains "smart resolves ONLY from ai_smart_model (fallback is not the smart tier)" "$SRC" 'SMART_MODEL="${AI_SMART_MODEL}"'
+check_contains "smart gating keys off the smart model alone" "$SRC" 'if [[ -n "$SMART_MODEL" ]]; then'
 check_contains "no-op when smart equals the active fast config" "$SRC" 'nothing distinct to escalate to'
 check_contains "no-op when the fallback already produced the review on the smart config" "$SRC" 'the fallback model that produced this review is the smart model'
 check_contains "step summary reads smart-response usage when escalated" "$SRC" 'usage_file="ai-response.smart.json"'
@@ -50,10 +40,10 @@ echo ""
 echo "=== Decision and publication contracts ==="
 check_contains "decision made by pr_reviewer.escalation" "$SRC" "from pr_reviewer.escalation import should_escalate"
 check_contains "decision runs on the raw fast output (before mutation)" "$SRC" "before verdict policy / completeness"
-check_contains "fast output preserved as ai-output.fast.json" "$SRC" "cp ai-output.json ai-output.fast.json"
+check_contains "primary output preserved as ai-output.primary.json" "$SRC" "cp ai-output.json ai-output.primary.json"
 check_contains "escalated prompt names the reasons" "$SRC" "ESCALATED review"
-check_contains "smart failure restores the fast review" "$SRC" "cp ai-output.fast.json ai-output.json"
-check_contains "smart failure publishes the fast review" "$SRC" "publishing the fast review"
+check_contains "smart failure restores the primary review" "$SRC" "cp ai-output.primary.json ai-output.json"
+check_contains "smart failure publishes the primary review" "$SRC" "publishing the primary review"
 check_contains "route becomes escalated on success" "$SRC" 'REVIEW_ROUTE="escalated"'
 check "escalation_reason output emitted" "$(grep -c '^echo "escalation_reason=' "$RUN_REVIEW")" "1"
 # Escalation must be decided before the enforcement wrapper runs.
@@ -74,11 +64,11 @@ check_contains "input escalate_on_fast_request_changes" "$ACTION" "escalate_on_f
 check_contains "input escalate_on_fast_low_confidence" "$ACTION" "escalate_on_fast_low_confidence:"
 check_contains "input escalate_on_tool_or_evidence_blockers" "$ACTION" "escalate_on_tool_or_evidence_blockers:"
 check_contains "input escalate_on_dirty_baseline" "$ACTION" "escalate_on_dirty_baseline:"
-check_contains "review step receives BASELINE_CLEAN" "$ACTION" 'BASELINE_CLEAN: ${{ steps.precheck.outputs.baseline_clean }}'
+check_contains "review step receives BASELINE_CLEAN" "$ACTION" "BASELINE_CLEAN: \${{ steps.precheck.outputs.baseline_clean || 'false' }}"
 check_contains "run_review wires dirty_baseline into should_escalate" "$SRC" "dirty_baseline=('\$DIRTY_BASELINE' == 'true')"
 check_contains "escalation_reason output declared" "$ACTION" "escalation_reason:"
-check "publish steps receive ESCALATION_REASON" \
-  "$(grep -c 'ESCALATION_REASON: \${{ steps.review.outputs.escalation_reason }}' "$ROOT_DIR/action.yml")" "3"
+check "publish step receives ESCALATION_REASON" \
+  "$(grep -c 'ESCALATION_REASON: \${{ steps.review.outputs.escalation_reason }}' "$ROOT_DIR/action.yml")" "1"
 
 echo ""
 echo "=== Marker carries escalation metadata ==="

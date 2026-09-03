@@ -27,7 +27,25 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
 from typing import Any
+from urllib.parse import quote
+
+# Shared credential redactor for remote diagnostics; scripts/ is not a
+# package, so extend sys.path the same way the scripts/ entrypoints do.
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from redact import mask_secrets  # noqa: E402
+
+# Top-level import is safe: platform.py imports forgejo_backend only lazily
+# (inside _gh_api_forgejo), so there is no import cycle in this direction.
+from pr_reviewer.platform import USER_AGENT, resolve_platform
 
 
 # ---------------------------------------------------------------------------
@@ -35,16 +53,177 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 FORGEJO_API_URL = os.environ.get("FORGEJO_API_URL", "").rstrip("/")
-FORGEJO_TOKEN = os.environ.get("FORGEJO_TOKEN", os.environ.get("GITHUB_TOKEN", ""))
+FORGEJO_TOKEN = (
+    os.environ.get("FORGEJO_TOKEN")
+    or os.environ.get("GITHUB_TOKEN")
+    or os.environ.get("GH_TOKEN")
+    or ""
+)
+FORGEJO_AUTH_METHOD = os.environ.get("FORGEJO_AUTH_METHOD", "token").strip().lower()
+FORGEJO_AUTHORIZED_INTEGRATION_AUDIENCE = os.environ.get(
+    "FORGEJO_AUTHORIZED_INTEGRATION_AUDIENCE", ""
+).strip()
 COMMENT_MARKER = os.environ.get(
     "COMMENT_MARKER", "<!-- ai-pr-reviewer -->"
 )
 GH_TOKEN = os.environ.get("GH_TOKEN", os.environ.get("GITHUB_TOKEN", ""))
 
+# JWT cache state — module-level so it persists across _curl calls within a
+# single review run but is fresh per process invocation.
+_JWT_CACHE: str | None = None
+_JWT_CACHE_TIME: float = 0.0
+_JWT_TTL_SECONDS = 2700  # 45 min, well under Forgejo's 1h default
+
 
 def _is_forgejo_mode() -> bool:
-    """Return True when FORGEJO_API_URL is set and non-empty."""
-    return bool(FORGEJO_API_URL)
+    """Return True when the active platform is Forgejo.
+
+    PLATFORM-aware (issue #367): delegates to ``platform.resolve_platform`` so
+    this backend and the shell seam (``platform_api.sh``) never disagree — in
+    particular ``PLATFORM=github`` now forces the GitHub path even when
+    FORGEJO_API_URL is populated (action.yml force-fills it from
+    ``github.server_url`` on non-github hosts, so keying purely off its
+    presence silently curled while the shell used gh).
+
+    Two deliberate deviations from a bare ``resolve_platform()`` call, each
+    needed to preserve existing behaviour:
+
+      * An unset/empty PLATFORM is treated as ``auto`` (not
+        ``resolve_platform``'s ``github`` default). Standalone/test callers
+        that switch to Forgejo purely by setting FORGEJO_API_URL — never
+        PLATFORM — must keep resolving to forgejo.
+      * The Forgejo URL passed in is this module's ``FORGEJO_API_URL``
+        constant (captured at import, monkeypatched by the test suite via
+        ``patch.object(fb, "FORGEJO_API_URL", ...)``) rather than a fresh env
+        read, so attribute patches still flip the mode.
+    """
+    if not FORGEJO_API_URL:
+        # This module cannot operate against Forgejo without a base URL, so
+        # an empty FORGEJO_API_URL always means GitHub mode — even when
+        # resolve_platform's auto rule would infer forgejo from a non-github
+        # GITHUB_SERVER_URL (always set on Forgejo runners). Matches the
+        # pre-#367 behaviour exactly.
+        return False
+    platform = os.environ.get("PLATFORM", "").strip().lower() or "auto"
+    return resolve_platform(platform=platform, forgejo_api_url=FORGEJO_API_URL) == "forgejo"
+
+
+def _is_authorized_integration_mode() -> bool:
+    """Return True when the active auth method is authorized_integration (JWT)."""
+    return FORGEJO_AUTH_METHOD == "authorized_integration"
+
+
+# ---------------------------------------------------------------------------
+# Authorized Integration JWT fetch + cache
+# ---------------------------------------------------------------------------
+
+def _fetch_authorized_integration_jwt() -> str:
+    """Exchange the Forgejo Authorized Integration audience for a short-lived JWT.
+
+    Reads the OIDC token-request env vars injected by the Forgejo Actions runner
+    (when ``enable-openid-connect: true`` is set in the workflow) and the
+    configured audience, then calls the OIDC token endpoint to obtain a JWT.
+    The JWT is cached module-level with a TTL to avoid expiry mid-review.
+
+    Raises ``RuntimeError`` with an actionable message on any failure.
+    """
+    global _JWT_CACHE, _JWT_CACHE_TIME
+
+    request_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "").strip()
+    request_token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "").strip()
+    audience = FORGEJO_AUTHORIZED_INTEGRATION_AUDIENCE
+
+    missing: list[str] = []
+    if not request_url:
+        missing.append("ACTIONS_ID_TOKEN_REQUEST_URL")
+    if not request_token:
+        missing.append(
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN (set enable-openid-connect: true in the workflow)"
+        )
+    if not audience:
+        missing.append("FORGEJO_AUTHORIZED_INTEGRATION_AUDIENCE")
+    if missing:
+        raise RuntimeError(
+            "Forgejo authorized_integration auth requires: " + ", ".join(missing)
+        )
+
+    # Per the Forgejo docs, the request URL already carries query params, so
+    # the audience is appended with '&' (never a second '?').
+    full_url = f"{request_url}&audience={quote(audience, safe='')}"
+    req = urllib.request.Request(full_url)  # GET by default
+    req.add_header("Authorization", f"bearer {request_token}")
+    req.add_header("Accept", "application/json")
+    req.add_header("User-Agent", USER_AGENT)
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            status_code = resp.status
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        status_code = exc.code
+        _report_http_error("JWT token exchange", status_code, body)
+        raise RuntimeError(
+            f"Forgejo JWT token exchange failed (HTTP {status_code})"
+        ) from None
+    except urllib.error.URLError as exc:
+        raise RuntimeError(
+            f"Forgejo JWT token exchange network error: {exc.reason}"
+        ) from None
+
+    data = _json_decode(body)
+    jwt = data.get("value") if isinstance(data, dict) else None
+    if not isinstance(jwt, str) or not jwt:
+        _report_http_error("JWT token exchange", status_code, body)
+        raise RuntimeError(
+            "Forgejo JWT token exchange returned no .value field"
+        )
+
+    _JWT_CACHE = jwt
+    _JWT_CACHE_TIME = time.time()
+    return jwt
+
+
+def _get_jwt() -> str:
+    """Return a valid JWT, fetching one if the cache is empty or expired."""
+    global _JWT_CACHE, _JWT_CACHE_TIME
+    if (
+        _JWT_CACHE is not None
+        and (time.time() - _JWT_CACHE_TIME) < _JWT_TTL_SECONDS
+    ):
+        return _JWT_CACHE
+    return _fetch_authorized_integration_jwt()
+
+
+def _resolve_auth_header(token: str | None) -> str | None:
+    """Resolve the ``Authorization`` header value for a ``_curl`` call.
+
+    Returns ``None`` when the request should be unauthenticated.
+
+    In authorized_integration mode:
+      * ``token=None`` (default callers + configured-host enrichment) -> JWT Bearer.
+      * ``token=""``   (unconfigured-host enrichment)                 -> unauthenticated.
+      * ``token="pat"`` (explicit override)                          -> token PAT.
+
+    In token mode (default):
+      * ``token=None`` -> ``FORGEJO_TOKEN or GH_TOKEN`` PAT, or None if both empty.
+      * ``token=""``   -> unauthenticated.
+      * ``token="pat"`` -> that PAT.
+    """
+    if _is_authorized_integration_mode() and _is_forgejo_mode():
+        if token is None:
+            jwt = _get_jwt()
+            return f"Bearer {jwt}"
+        if token == "":
+            return None
+        return f"token {token}"
+
+    # token mode (default) -- existing behavior
+    if token is None:
+        token = FORGEJO_TOKEN or GH_TOKEN
+    if token:
+        return f"token {token}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +236,7 @@ def _curl(
     token: str | None = None,
     data: dict[str, Any] | bytes | None = None,
     accept: str = "application/json",
+    timeout: float | None = None,
 ) -> tuple[int, str]:
     """Execute a curl request and return (http_status_code, body_text).
 
@@ -64,32 +244,55 @@ def _curl(
     On HTTP errors the response body is written to stdout so callers can
     parse error payloads — this is the *error-body-on-stdout* discipline.
     """
-    if token is None:
-        token = FORGEJO_TOKEN or GH_TOKEN
+    auth_header = _resolve_auth_header(token)
 
     # The status code is appended after an explicit newline separator: bodies
     # are not guaranteed to end with whitespace (an empty 204 body, or compact
     # JSON without a trailing newline, would otherwise fuse with the code and
     # make it unparseable).
-    cmd: list[str] = [
-        "curl", "-sS",
-        "-X", method.upper(),
-        "-H", f"Authorization: token {token}",
+    cmd: list[str] = ["curl", "-sS", "-X", method.upper()]
+
+    # Route the Authorization header through a 0600 --config file so the
+    # credential never appears in /proc/<pid>/cmdline or ``ps`` output on
+    # shared runners.  Mirrors the pattern in ``scripts/model_call.sh``.
+    auth_config_path: str | None = None
+    if auth_header:
+        auth_config_fd, auth_config_path = tempfile.mkstemp(prefix="forgejo_auth_", suffix=".conf")
+        try:
+            os.fchmod(auth_config_fd, 0o600)
+            os.write(auth_config_fd, f'header = "Authorization: {auth_header}"\n'.encode("utf-8"))
+            os.close(auth_config_fd)
+            auth_config_fd = -1  # mark as closed so finally doesn't double-close
+            cmd.extend(["--config", auth_config_path])
+        except BaseException:
+            if auth_config_fd >= 0:
+                os.close(auth_config_fd)
+            raise
+
+    cmd.extend([
         "-H", f"Accept: {accept}",
+        "-H", f"User-Agent: {USER_AGENT}",
         "-o", "-",
         "-w", "\n%{http_code}",
         url,
-    ]
+    ])
     if data is not None and method.upper() in ("POST", "PATCH", "PUT"):
         if isinstance(data, bytes):
-            cmd.extend(["--data-binary", "@-"])
-            proc = subprocess.run(cmd, input=data, capture_output=True)
+            body_bytes = data
         else:
-            body_json = json.dumps(data).encode("utf-8")
+            body_bytes = json.dumps(data).encode("utf-8")
             cmd.extend(["-H", "Content-Type: application/json"])
-            proc = subprocess.run(cmd, input=body_json, capture_output=True)
+        cmd.extend(["--data-binary", "@-"])
+        proc = subprocess.run(cmd, input=body_bytes, capture_output=True, timeout=timeout)
     else:
-        proc = subprocess.run(cmd, capture_output=True)
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+
+    # Clean up the auth config file after curl has finished.
+    if auth_config_path is not None:
+        try:
+            os.unlink(auth_config_path)
+        except OSError:
+            pass
 
     raw = proc.stdout.decode("utf-8", errors="replace")
 
@@ -113,6 +316,44 @@ def _gh(*args: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout.decode("utf-8", errors="replace")
 
 
+def _gh_api_json(method: str, path: str, data: dict[str, Any]) -> tuple[int, str]:
+    """POST/PATCH JSON to the GitHub REST API via ``gh api`` and return
+    (returncode, stdout) — the structured JSON response, not human-oriented
+    text.
+
+    The body is written to a temp file and passed via ``--input`` rather
+    than as a ``-f field=value`` argv entry — the same pattern already used
+    by ``create_pr_review_from_payload`` — because comment bodies can be
+    large markdown blobs.
+    """
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+        json.dump(data, tmp)
+        tmp_path = tmp.name
+    try:
+        return _gh("api", path, "--method", method, "--input", tmp_path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _report_http_error(operation: str, status_code: int, body_text: str) -> None:
+    """Emit an actionable error without echoing arbitrary response fields.
+
+    Only the API error's ``message`` field is considered, and it is
+    control-stripped, secret-masked, and truncated before printing.
+    """
+    data = _json_decode(body_text)
+    message = data.get("message") if isinstance(data, dict) else None
+    if isinstance(message, str):
+        message = mask_secrets(re.sub(r"[\x00-\x1f\x7f]", " ", message).strip())[:300]
+    detail = f": {message}" if message else ""
+    print(f"Forgejo {operation} failed (HTTP {status_code}){detail}", file=sys.stderr)
+
+
 def _parse_repo(repo_full_name: str) -> tuple[str, str]:
     """Split ``owner/repo`` into (owner, repo)."""
     parts = repo_full_name.split("/", 1)
@@ -129,6 +370,100 @@ def _json_decode(text: str) -> Any:
         return json.loads(text)
     except (json.JSONDecodeError, ValueError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Repository access preflight
+# ---------------------------------------------------------------------------
+
+def get_authenticated_repo_permission(repo_full_name: str) -> str | None:
+    """Return the active token's effective repository permission, or None.
+
+    Forgejo PAT scopes are independent of repository membership, so a token
+    that can read a PR may still be unable to publish a review. The
+    collaborator-permission endpoint reports the authenticated user's
+    effective access (read|write|admin).
+
+    Repository owners are not listed as collaborators in Forgejo/Gitea, so the
+    collaborator endpoint returns 404 for them. In that case we fall back to the
+    repo endpoint, whose payload carries a ``permissions`` object
+    (``{admin, write, read}`` booleans) reflecting the authenticated user's
+    effective access — including for owners using JWT authorized integrations.
+    """
+    owner, repo = _parse_repo(repo_full_name)
+    if not _is_forgejo_mode():
+        return None
+
+    def permission_from_repo_payload(data: Any) -> str | None:
+        """Extract effective access from a Forgejo repository response.
+
+        Forgejo/Gitea versions have used both the GitHub-shaped ``write`` /
+        ``read`` names and the older ``push`` / ``pull`` names here.
+        """
+        if not isinstance(data, dict):
+            return None
+        perms = data.get("permissions")
+        if not isinstance(perms, dict):
+            return None
+        if perms.get("admin"):
+            return "admin"
+        if perms.get("write") or perms.get("push"):
+            return "write"
+        if perms.get("read") or perms.get("pull"):
+            return "read"
+        return None
+
+    # An Authorized Integration may be granted repository/issue capabilities
+    # without read:user.  Its JWT can already read this repository (the PR
+    # fetch above proves that), so use its repository payload directly rather
+    # than requiring the unrelated /user endpoint merely to learn a login.
+    if _is_authorized_integration_mode():
+        status_code, body_text = _curl(
+            "GET", f"{FORGEJO_API_URL}/api/v1/repos/{owner}/{repo}"
+        )
+        permission = permission_from_repo_payload(_json_decode(body_text))
+        if status_code == 200 and permission is not None:
+            return permission
+        _report_http_error("review access preflight", status_code, body_text)
+        return None
+
+    status_code, body_text = _curl("GET", f"{FORGEJO_API_URL}/api/v1/user")
+    user = _json_decode(body_text)
+    login = user.get("login") if status_code == 200 and isinstance(user, dict) else None
+    if not isinstance(login, str) or not login:
+        _report_http_error("review access preflight", status_code, body_text)
+        return None
+
+    # Primary path: collaborator-permission endpoint.
+    status_code, body_text = _curl(
+        "GET",
+        f"{FORGEJO_API_URL}/api/v1/repos/{owner}/{repo}/collaborators/{quote(login, safe='')}/permission",
+    )
+    data = _json_decode(body_text)
+    permission = data.get("permission") if status_code == 200 and isinstance(data, dict) else None
+    # Forgejo reports repository/organization owners as "owner" rather than
+    # "admin". Normalize to the action's coarse read/write/admin vocabulary.
+    if permission == "owner":
+        permission = "admin"
+    if permission in {"read", "write", "admin"}:
+        return str(permission)
+
+    # Fallback: repo owners (and users not explicitly added as collaborators)
+    # are not reachable via the collaborator endpoint. The repo payload carries
+    # a ``permissions`` object keyed by the authenticated user's login (or the
+    # deprecated top-level ``permissions`` field) with boolean admin/write/read.
+    if status_code == 404:
+        status_code, body_text = _curl(
+            "GET",
+            f"{FORGEJO_API_URL}/api/v1/repos/{owner}/{repo}",
+        )
+        data = _json_decode(body_text)
+        permission = permission_from_repo_payload(data)
+        if status_code == 200 and permission is not None:
+            return permission
+
+    _report_http_error("review access preflight", status_code, body_text)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -220,9 +555,10 @@ def get_pr_diff(repo_full_name: str, pr_number: int) -> str:
     Returns an empty string on failure.
     """
     if _is_forgejo_mode():
+        owner, repo = _parse_repo(repo_full_name)
         status_code, body = _curl(
             "GET",
-            f"{FORGEJO_API_URL}/api/v1/repos/{_parse_repo(repo_full_name)[0]}/{_parse_repo(repo_full_name)[1]}/pulls/{pr_number}.diff",
+            f"{FORGEJO_API_URL}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}.diff",
         )
         if status_code != 200:
             return ""
@@ -296,6 +632,24 @@ def _forgejo_comment_to_standard(comment: dict, owner: str, repo: str) -> dict[s
     }
 
 
+def _latest_marker_comment(
+    comments: list[dict[str, Any]], marker: str
+) -> dict[str, Any] | None:
+    """Return the most recently updated comment containing *marker*, or None.
+
+    Shared by both backends so "sticky comment" selection means the same
+    thing regardless of platform: the latest comment containing the marker
+    — not gh's platform-specific "last comment authored by the current
+    user" (``--edit-last``), which picks a different comment on multi-bot
+    repos and diverges from the Forgejo behaviour.
+    """
+    matching = [c for c in comments if marker in (c.get("body") or "")]
+    if not matching:
+        return None
+    matching.sort(key=lambda c: c.get("updated_at", ""), reverse=True)
+    return matching[0]
+
+
 def create_comment(
     repo_full_name: str,
     issue_number: int,
@@ -324,24 +678,22 @@ def create_comment(
             "body": data.get("body", body),
         }
 
-    # GitHub via gh CLI. Plain creation — ``--create-if-none`` is only valid
-    # together with ``--edit-last`` and is a flag-parse error on its own.
-    status_code, body_text = _gh(
-        "pr", "comment", str(issue_number),
-        "--repo", repo_full_name,
-        "--body", body,
+    # GitHub via gh CLI, hitting the REST endpoint directly rather than
+    # ``gh pr comment`` — that subcommand's stdout is a human-oriented URL
+    # string that a gh wording change can silently degrade to an unparsable
+    # blob. The REST endpoint returns real JSON we can decode structurally.
+    status_code, body_text = _gh_api_json(
+        "POST", f"repos/{owner}/{repo}/issues/{issue_number}/comments", {"body": body},
     )
     if status_code != 0 or not body_text.strip():
         return None
-
-    # gh prints the comment URL as .../pull/N#issuecomment-ID (no slash
-    # before the fragment).
-    url_match = re.search(r"https?://\S+/pull/[0-9]+#issuecomment-[0-9]+", body_text)
-    comment_id_match = re.search(r"#issuecomment-([0-9]+)", body_text or "")
+    data = _json_decode(body_text)
+    if data is None:
+        return None
     return {
-        "id": int(comment_id_match.group(1)) if comment_id_match else 0,
-        "html_url": url_match.group(0) if url_match else "",
-        "body": body,
+        "id": data.get("id", 0),
+        "html_url": data.get("html_url", ""),
+        "body": data.get("body", body),
     }
 
 
@@ -351,62 +703,57 @@ def edit_last_comment(
     new_body: str,
     marker: str = COMMENT_MARKER,
 ) -> dict[str, Any] | None:
-    """Edit the last comment containing *marker*, or create a new one.
+    """Edit the latest comment containing *marker*, or create a new one.
 
     This implements the "sticky comment" pattern used by the review action:
     if a comment with the marker exists, edit it in place; otherwise create
-    a new comment.
+    a new comment. Both backends select the target comment the same way
+    (see ``_latest_marker_comment``) so which comment gets updated no
+    longer depends on platform.
 
     Returns the comment dict with ``id`` and ``html_url``, or ``None`` on failure.
     """
     owner, repo = _parse_repo(repo_full_name)
+    comments = list_comments(repo_full_name, issue_number)
+    target = _latest_marker_comment(comments, marker)
+
+    if target is None:
+        # No matching comment — create a new one.
+        return create_comment(repo_full_name, issue_number, new_body)
 
     if _is_forgejo_mode():
-        # List comments and find the latest one containing the marker
-        comments = list_comments(repo_full_name, issue_number)
-        matching = [c for c in comments if marker in (c.get("body") or "")]
+        status_code, body_text = _curl(
+            "PATCH",
+            f"{FORGEJO_API_URL}/api/v1/repos/{owner}/{repo}/issues/comments/{target['id']}",
+            data={"body": new_body},
+        )
+        if status_code != 200:
+            return None
+        data = _json_decode(body_text)
+        if data is None:
+            return None
+        return {
+            "id": target["id"],
+            "html_url": data.get("html_url", ""),
+            "body": new_body,
+        }
 
-        if matching:
-            # Sort by updated_at descending to get the latest
-            matching.sort(key=lambda c: c.get("updated_at", ""), reverse=True)
-            target = matching[0]
-
-            status_code, body_text = _curl(
-                "PATCH",
-                f"{FORGEJO_API_URL}/api/v1/repos/{owner}/{repo}/issues/comments/{target['id']}",
-                data={"body": new_body},
-            )
-            if status_code != 200:
-                return None
-            data = _json_decode(body_text)
-            if data is None:
-                return None
-            return {
-                "id": target["id"],
-                "html_url": data.get("html_url", ""),
-                "body": new_body,
-            }
-
-        # No matching comment — create a new one
-        return create_comment(repo_full_name, issue_number, new_body)
-
-    # GitHub via gh CLI
-    status_code, body_text = _gh(
-        "pr", "comment", str(issue_number),
-        "--repo", repo_full_name,
-        "--edit-last",
-        "--body", new_body,
+    # GitHub via gh CLI — PATCH the located comment's REST resource directly
+    # (structured JSON in, structured JSON out), instead of ``gh pr comment
+    # --edit-last`` which both scrapes stdout text and edits a different
+    # comment (the last one authored by the current gh user).
+    status_code, body_text = _gh_api_json(
+        "PATCH", f"repos/{owner}/{repo}/issues/comments/{target['id']}", {"body": new_body},
     )
-    if status_code != 0:
-        # --edit-last fails when no comment exists; fall back to create
-        return create_comment(repo_full_name, issue_number, new_body)
-
-    url_match = re.search(r"https?://\S+/pull/[0-9]+#issuecomment-[0-9]+", body_text)
-    comment_id_match = re.search(r"#issuecomment-([0-9]+)", body_text or "")
+    if status_code != 0 or not body_text.strip():
+        return None
+    data = _json_decode(body_text)
+    if data is None:
+        return None
     return {
-        "id": int(comment_id_match.group(1)) if comment_id_match else 0,
-        "html_url": url_match.group(0) if url_match else "",
-        "body": new_body,
+        "id": data.get("id", target["id"]),
+        "html_url": data.get("html_url", ""),
+        "body": data.get("body", new_body),
     }
 
 
@@ -428,23 +775,14 @@ def fetch_issue(repo_full_name: str, issue_number: int) -> dict[str, Any] | None
         )
         if status_code != 200:
             return None
-        data = _json_decode(body_text)
-        if data is None:
+    else:
+        # GitHub via gh CLI
+        status_code, body_text = _gh(
+            "api", f"repos/{owner}/{repo}/issues/{issue_number}",
+        )
+        if status_code != 0:
             return None
-        return {
-            "body": data.get("body", ""),
-            "title": data.get("title", ""),
-            "state": data.get("state", "open"),
-            "created_at": data.get("created_at", ""),
-            "updated_at": data.get("updated_at", ""),
-        }
 
-    # GitHub via gh CLI
-    status_code, body_text = _gh(
-        "api", f"repos/{owner}/{repo}/issues/{issue_number}",
-    )
-    if status_code != 0:
-        return None
     data = _json_decode(body_text)
     if data is None:
         return None
@@ -455,6 +793,88 @@ def fetch_issue(repo_full_name: str, issue_number: int) -> dict[str, Any] | None
         "created_at": data.get("created_at", ""),
         "updated_at": data.get("updated_at", ""),
     }
+
+
+def compare_commits(repo_full_name: str, spec: str) -> dict[str, Any] | None:
+    """Return compare metadata for ``base...head``.
+
+    Forgejo/Gitea expose the compare endpoint at
+    ``/repos/{owner}/{repo}/compare/{base}...{head}``. Callers use failure as
+    a fail-closed signal for incremental review scope, so return ``None`` on
+    any non-200 response or malformed payload rather than fabricating data.
+    """
+    owner, repo = _parse_repo(repo_full_name)
+
+    if _is_forgejo_mode():
+        status_code, body_text = _curl(
+            "GET",
+            f"{FORGEJO_API_URL}/api/v1/repos/{owner}/{repo}/compare/{quote(spec, safe='')}",
+        )
+        if status_code != 200:
+            return None
+        data = _json_decode(body_text)
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    status_code, body_text = _gh("api", f"repos/{owner}/{repo}/compare/{spec}")
+    if status_code != 0 or not body_text.strip():
+        return None
+    data = _json_decode(body_text)
+    return data if isinstance(data, dict) else None
+
+
+# ---------------------------------------------------------------------------
+# Linked-source enrichment against arbitrary Forgejo/Gitea instances
+# ---------------------------------------------------------------------------
+# The upstream repo may live on a different forge than the PR, so host is an
+# explicit argument (vs platform_*, which use the configured FORGEJO_API_URL).
+
+def _enrich_token_for_host(host: str) -> str | None:
+    """Token for *host*: the configured instance only, else empty (unauth).
+
+    In authorized_integration mode, returns ``None`` for the configured host so
+    ``_curl`` resolves to the JWT bearer path. Returns ``""`` for unconfigured
+    hosts (unauthenticated) in all modes.
+    """
+    configured = re.sub(r"^https?://", "", FORGEJO_API_URL).strip("/").lower()
+    if not configured or host.lower() != configured:
+        return ""
+    # Configured host: JWT mode delegates to _curl's JWT resolution (return
+    # None); token mode returns the PAT.
+    if _is_authorized_integration_mode():
+        return None
+    return FORGEJO_TOKEN
+
+
+def fetch_forge_release(host: str, repo_full_name: str, tag: str) -> dict[str, Any] | None:
+    """Release by tag from a Forgejo/Gitea *host*; None on failure."""
+    owner, repo = _parse_repo(repo_full_name)
+    url = f"https://{host}/api/v1/repos/{owner}/{repo}/releases/tags/{quote(tag, safe='')}"
+    status_code, body = _curl("GET", url, token=_enrich_token_for_host(host))
+    if status_code != 200:
+        return None
+    data = _json_decode(body)
+    if not isinstance(data, dict):
+        return None
+    return {
+        "tag_name": data.get("tag_name", tag),
+        "name": data.get("name", ""),
+        "published_at": data.get("published_at", data.get("created_at", "")),
+        "html_url": data.get("html_url", data.get("url", "")),
+        "body": data.get("body", ""),
+    }
+
+
+def fetch_forge_compare(host: str, repo_full_name: str, spec: str) -> dict[str, Any] | None:
+    """Compare (``base...head``) from a Forgejo/Gitea *host*; None on failure."""
+    owner, repo = _parse_repo(repo_full_name)
+    url = f"https://{host}/api/v1/repos/{owner}/{repo}/compare/{quote(spec, safe='')}"
+    status_code, body = _curl("GET", url, token=_enrich_token_for_host(host))
+    if status_code != 200:
+        return None
+    data = _json_decode(body)
+    return data if isinstance(data, dict) else None
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +929,245 @@ def list_pr_files(repo_full_name: str, pr_number: int) -> list[dict[str, Any]]:
     return results
 
 
+
+# ---------------------------------------------------------------------------
+# Native PR Reviews (list / create / dismiss)
+# ---------------------------------------------------------------------------
+
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+
+
+def _diff_positions(diff_text: str) -> dict[str, dict[int, int]]:
+    """Map file/new-line anchors to Forgejo ``new_position`` values."""
+    positions_by_path: dict[str, dict[int, int]] = {}
+    current_path: str | None = None
+    new_line = 0
+    diff_position = 0
+    in_hunk = False
+
+    for raw in diff_text.splitlines():
+        if raw.startswith("diff --git "):
+            current_path = None
+            in_hunk = False
+            diff_position = 0
+            continue
+        if raw.startswith("+++ "):
+            target = raw[4:].strip()
+            current_path = None if target == "/dev/null" else target[2:] if target.startswith("b/") else target
+            continue
+        match = _HUNK_RE.match(raw)
+        if match:
+            new_line = int(match.group(1))
+            in_hunk = True
+            continue
+        if not in_hunk or current_path is None or raw.startswith("\\"):
+            continue
+
+        diff_position += 1
+        if raw.startswith("+"):
+            positions_by_path.setdefault(current_path, {})[new_line] = diff_position
+            new_line += 1
+        elif raw.startswith("-"):
+            continue
+        else:
+            positions_by_path.setdefault(current_path, {})[new_line] = diff_position
+            new_line += 1
+
+    return positions_by_path
+
+
+def list_pr_reviews(repo_full_name: str, pr_number: int) -> list[dict[str, Any]]:
+    """List native PR reviews, normalised to the fields publish helpers read."""
+    owner, repo = _parse_repo(repo_full_name)
+
+    if _is_forgejo_mode():
+        status_code, body_text = _curl(
+            "GET",
+            f"{FORGEJO_API_URL}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+        )
+        if status_code != 200:
+            return []
+        data = _json_decode(body_text)
+        if not isinstance(data, list):
+            return []
+        return [_forgejo_review_to_github(review) for review in data]
+
+    status_code, body_text = _gh(
+        "api", f"repos/{owner}/{repo}/pulls/{pr_number}/reviews", "--paginate",
+    )
+    if status_code != 0 or not body_text.strip():
+        return []
+    data = _json_decode(body_text)
+    return data if isinstance(data, list) else []
+
+
+def _forgejo_review_to_github(review: dict[str, Any]) -> dict[str, Any]:
+    state = str(review.get("state") or review.get("event") or "COMMENT").upper()
+    if state == "APPROVE":
+        state = "APPROVED"
+    if state == "REQUEST_CHANGES":
+        state = "CHANGES_REQUESTED"
+    return {
+        "id": review.get("id", 0),
+        "body": review.get("body", ""),
+        "state": state,
+        "user": review.get("user", {}),
+        "submitted_at": review.get("submitted_at", review.get("updated_at", "")),
+        "html_url": review.get("html_url", ""),
+    }
+
+
+def _forgejo_review_event(event: str) -> str:
+    event = (event or "COMMENT").upper()
+    if event in {"APPROVE", "APPROVED"}:
+        # GitHub submits reviews with `APPROVE`; Forgejo's ReviewStateType uses
+        # `APPROVED`. Forgejo accepts the former without an error but creates a
+        # PENDING draft whose body the timeline hides as "No description".
+        return "APPROVED"
+    if event in {"REQUEST_CHANGES", "CHANGES_REQUESTED"}:
+        return "REQUEST_CHANGES"
+    return "COMMENT"
+
+
+def _normalise_review_comment_positions(
+    repo_full_name: str,
+    pr_number: int,
+    comments: Any,
+) -> list[dict[str, Any]]:
+    if not isinstance(comments, list):
+        return []
+    positions = _diff_positions(get_pr_diff(repo_full_name, pr_number))
+    normalised: list[dict[str, Any]] = []
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        path = comment.get("path")
+        body = comment.get("body")
+        if not isinstance(path, str) or not path or not isinstance(body, str) or not body:
+            continue
+        new_position = comment.get("new_position")
+        if not isinstance(new_position, int) or new_position <= 0:
+            line = comment.get("line")
+            if not isinstance(line, int) or line <= 0:
+                continue
+            new_position = positions.get(path, {}).get(line)
+        if not isinstance(new_position, int) or new_position <= 0:
+            continue
+        normalised.append({"path": path, "new_position": new_position, "body": body})
+    return normalised
+
+
+def create_pr_review_from_payload(
+    repo_full_name: str,
+    pr_number: int,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Create a native PR review from a GitHub-shaped review payload."""
+    owner, repo = _parse_repo(repo_full_name)
+
+    if _is_forgejo_mode():
+        request = {
+            "body": str(payload.get("body") or ""),
+            "event": _forgejo_review_event(str(payload.get("event") or "COMMENT")),
+        }
+        commit_id = payload.get("commit_id")
+        if isinstance(commit_id, str) and commit_id:
+            request["commit_id"] = commit_id
+        comments = _normalise_review_comment_positions(repo_full_name, pr_number, payload.get("comments"))
+        if comments:
+            request["comments"] = comments
+        status_code, body_text = _curl(
+            "POST",
+            f"{FORGEJO_API_URL}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+            data=request,
+        )
+        if status_code not in (200, 201):
+            _report_http_error("review publication", status_code, body_text)
+            return None
+        data = _json_decode(body_text)
+        return data if isinstance(data, dict) else {"id": 0, "body": request["body"]}
+
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+        json.dump(payload, tmp)
+        tmp_path = tmp.name
+    try:
+        status_code, body_text = _gh(
+            "api", f"repos/{owner}/{repo}/pulls/{pr_number}/reviews", "--method", "POST", "--input", tmp_path,
+        )
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    if status_code != 0:
+        return None
+    data = _json_decode(body_text)
+    return data if isinstance(data, dict) else {"id": 0}
+
+
+def create_pr_review_from_file(
+    repo_full_name: str,
+    pr_number: int,
+    payload_file: str,
+) -> dict[str, Any] | None:
+    try:
+        with open(payload_file, encoding="utf-8") as f:
+            payload = json.loads(f.read())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return create_pr_review_from_payload(repo_full_name, pr_number, payload)
+
+
+def create_native_review(
+    repo_full_name: str,
+    pr_number: int,
+    event: str,
+    body: str,
+) -> dict[str, Any] | None:
+    """Submit a body-only review. Forgejo mode only.
+
+    The event is pre-mapped to Forgejo's ReviewStateType tokens (e.g.
+    ``APPROVED``), which GitHub's review API rejects — GitHub-mode callers
+    go through ``gh pr review`` in ``scripts/platform_api.sh`` instead.
+    """
+    return create_pr_review_from_payload(
+        repo_full_name,
+        pr_number,
+        {"event": _forgejo_review_event(event), "body": body},
+    )
+
+
+def dismiss_pr_review(repo_full_name: str, pr_number: int, review_id: int, message: str) -> int | None:
+    owner, repo = _parse_repo(repo_full_name)
+
+    if _is_forgejo_mode():
+        status_code, body_text = _curl(
+            "POST",
+            f"{FORGEJO_API_URL}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}/reviews/{review_id}/dismissals",
+            data={"message": message},
+        )
+        if status_code not in (200, 201, 204):
+            return None
+        data = _json_decode(body_text)
+        if isinstance(data, dict):
+            return int(data.get("id") or review_id)
+        return review_id
+
+    status_code, body_text = _gh(
+        "api", f"repos/{owner}/{repo}/pulls/{pr_number}/reviews/{review_id}/dismissals",
+        "--method", "PUT", "-f", f"message={message}", "--jq", ".id",
+    )
+    if status_code != 0:
+        return None
+    try:
+        return int(body_text.strip())
+    except ValueError:
+        return review_id
+
 # ---------------------------------------------------------------------------
 # Convenience: check if PR is a fork PR
 # ---------------------------------------------------------------------------
@@ -524,7 +1183,9 @@ def is_fork_pr(repo_full_name: str, pr_number: int) -> bool:
     """
     metadata = get_pr_metadata(repo_full_name, pr_number)
     if metadata is None:
-        return False
+        # Total fetch failure: origin unknown -> fail closed, same as the
+        # shell derivation (derive_is_fork_pr in platform_api.sh).
+        return True
 
     head_full = ((metadata.get("head") or {}).get("repo") or {}).get("full_name") or ""
     base_full = ((metadata.get("base") or {}).get("repo") or {}).get("full_name") or ""
@@ -593,6 +1254,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Forgejo backend CLI")
     sub = parser.add_subparsers(dest="command")
 
+    p_permission = sub.add_parser("repo-permission")
+    p_permission.add_argument("repo")
+
     p_meta = sub.add_parser("get-pr-metadata")
     p_meta.add_argument("repo")
     p_meta.add_argument("pr_number", type=int)
@@ -627,9 +1291,49 @@ def main() -> None:
     p_status.add_argument("repo")
     p_status.add_argument("sha")
 
+    p_compare = sub.add_parser("compare")
+    p_compare.add_argument("repo")
+    p_compare.add_argument("spec")
+
+    p_enrich_release = sub.add_parser("enrich-release")
+    p_enrich_release.add_argument("host")
+    p_enrich_release.add_argument("repo")
+    p_enrich_release.add_argument("tag")
+
+    p_enrich_compare = sub.add_parser("enrich-compare")
+    p_enrich_compare.add_argument("host")
+    p_enrich_compare.add_argument("repo")
+    p_enrich_compare.add_argument("spec")
+
+    p_reviews = sub.add_parser("list-pr-reviews")
+    p_reviews.add_argument("repo")
+    p_reviews.add_argument("pr_number", type=int)
+
+    p_review_json = sub.add_parser("create-review-json")
+    p_review_json.add_argument("repo")
+    p_review_json.add_argument("pr_number", type=int)
+    p_review_json.add_argument("payload_file")
+
+    p_review_native = sub.add_parser("create-native-review")
+    p_review_native.add_argument("repo")
+    p_review_native.add_argument("pr_number", type=int)
+    p_review_native.add_argument("event")
+    p_review_native.add_argument("body_file")
+
+    p_dismiss = sub.add_parser("dismiss-review")
+    p_dismiss.add_argument("repo")
+    p_dismiss.add_argument("pr_number", type=int)
+    p_dismiss.add_argument("review_id", type=int)
+    p_dismiss.add_argument("message")
+
     args = parser.parse_args()
 
-    if args.command == "get-pr-metadata":
+    if args.command == "repo-permission":
+        result = get_authenticated_repo_permission(args.repo)
+        print(result or "none")
+        if result is None:
+            sys.exit(1)
+    elif args.command == "get-pr-metadata":
         result = get_pr_metadata(args.repo, args.pr_number)
         print(json.dumps(result, indent=2) if result else "null")
     elif args.command == "get-pr-diff":
@@ -639,9 +1343,13 @@ def main() -> None:
     elif args.command == "create-comment":
         result = create_comment(args.repo, args.issue_number, args.body)
         print(json.dumps(result, indent=2) if result else "null")
+        if result is None:
+            sys.exit(1)
     elif args.command == "edit-last-comment":
         result = edit_last_comment(args.repo, args.issue_number, args.body)
         print(json.dumps(result, indent=2) if result else "null")
+        if result is None:
+            sys.exit(1)
     elif args.command == "fetch-issue":
         result = fetch_issue(args.repo, args.issue_number)
         print(json.dumps(result, indent=2) if result else "null")
@@ -650,6 +1358,43 @@ def main() -> None:
     elif args.command == "commit-status":
         result = get_commit_status(args.repo, args.sha)
         print(json.dumps(result, indent=2) if result else "null")
+    elif args.command == "compare":
+        result = compare_commits(args.repo, args.spec)
+        if result is None:
+            print("null")
+            sys.exit(1)
+        print(json.dumps(result, indent=2))
+    elif args.command == "enrich-release":
+        result = fetch_forge_release(args.host, args.repo, args.tag)
+        if result is None:
+            print("null")
+            sys.exit(1)
+        print(json.dumps(result, indent=2))
+    elif args.command == "enrich-compare":
+        result = fetch_forge_compare(args.host, args.repo, args.spec)
+        if result is None:
+            print("null")
+            sys.exit(1)
+        print(json.dumps(result, indent=2))
+    elif args.command == "list-pr-reviews":
+        print(json.dumps(list_pr_reviews(args.repo, args.pr_number), indent=2))
+    elif args.command == "create-review-json":
+        result = create_pr_review_from_file(args.repo, args.pr_number, args.payload_file)
+        print(json.dumps(result, indent=2) if result else "null")
+        if result is None:
+            sys.exit(1)
+    elif args.command == "create-native-review":
+        with open(args.body_file, encoding="utf-8") as f:
+            body = f.read()
+        result = create_native_review(args.repo, args.pr_number, args.event, body)
+        print(json.dumps(result, indent=2) if result else "null")
+        if result is None:
+            sys.exit(1)
+    elif args.command == "dismiss-review":
+        result = dismiss_pr_review(args.repo, args.pr_number, args.review_id, args.message)
+        print(result if result is not None else "null")
+        if result is None:
+            sys.exit(1)
     else:
         parser.print_help()
         sys.exit(1)

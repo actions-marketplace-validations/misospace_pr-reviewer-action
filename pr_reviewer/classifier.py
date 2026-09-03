@@ -26,7 +26,7 @@ import re
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +73,6 @@ RENOVATE_DIGEST_FILE_PATTERNS = [
 ]
 
 # 64-character hex digest (SHA-256 style) — common in Renovate digest updates
-_SHA256_DIGEST = re.compile(r"(?<![a-fA-F0-9])[a-fA-F0-9]{64}(?![a-fA-F0-9])")
 
 # Dependency-related files (lockfiles, manifests)
 DEPENDENCY_PATTERNS = [
@@ -116,7 +115,10 @@ AUTH_PATTERNS = [
 
 # Public route changes
 PUBLIC_ROUTE_PATTERNS = [
-    re.compile(r"(routes?|urls?|api|endpoints?|controller)\." + _SRC_EXT + r"$",
+    # NB: `routes` (plural) only — a bare `route.<ext>` is the mandated name of
+    # every Next.js App Router API handler (src/app/api/**/route.ts), so it
+    # carries no routing-layer signal and must not match. See #531.
+    re.compile(r"(routes|urls?|api|endpoints?|controller)\." + _SRC_EXT + r"$",
                re.IGNORECASE),
     re.compile(r"router[_.-]?py$"),
     re.compile(r"urlpatterns"),
@@ -169,13 +171,19 @@ DB_MIGRATION_PATTERNS = [
 
 
 # ---------------------------------------------------------------------------
-# Classification logic
+# Classification result
 # ---------------------------------------------------------------------------
 
 @dataclass
 class PRClassification:
     pr_kind: str = "app_code"
     risk_flags: list[str] = field(default_factory=list)
+    risk_flags_with_files: dict[str, list[str]] = field(default_factory=dict)
+    # Subset of (pr_kind + risk_flags) safe to drive smart-model routing:
+    # linked-issue flags and any file-based signal backed by an actual changed
+    # filename. Content-only pattern matches (e.g. a diff that merely mentions
+    # os.path or `token`) are excluded — they over-route benign PRs (#159 fix).
+    route_signals: list[str] = field(default_factory=list)
     changed_files_summary: list[str] = field(default_factory=list)
     linked_issue_labels: list[str] = field(default_factory=list)
     must_check: list[str] = field(default_factory=list)
@@ -212,117 +220,189 @@ def _all_files_are_lockfiles(filenames: list[str]) -> bool:
     )
 
 
-def _is_digest_only_hash(diff_text: str) -> bool:
-    """Check if the diff contains SHA-256 style digests (Renovate digest updates)."""
-    # Look for bare 64-char hex strings typical of SHA-256 digests in lockfiles
-    return bool(_SHA256_DIGEST.search(diff_text))
+# ---------------------------------------------------------------------------
+# pr_kind rule table
+# ---------------------------------------------------------------------------
+#
+# Classification is a declarative table of rules evaluated top-to-bottom by one
+# engine loop (`_classify_pr_kind`). The FIRST matching rule wins, so TABLE
+# ORDER *is* precedence — rows are ordered most-specific first. This replaces
+# the former hand-written if-chain; the ordering below is identical to it.
+#
+# Each rule's `matches(filenames, diff_text) -> bool` predicate is built from a
+# pattern set by one of the factories below, except the two compound rules
+# (renovate_digest_only, dependency_upgrade) whose conditions don't reduce to a
+# single pattern scan and are kept as named predicate functions.
+
+# Pattern-based predicate factories -----------------------------------------
+
+def _filename_matches(patterns: list[re.Pattern]) -> Callable[[list[str], str], bool]:
+    """Predicate: any changed filename matches any pattern in the set."""
+    def _pred(filenames: list[str], diff_text: str) -> bool:
+        return any(any(pat.search(f) for pat in patterns) for f in filenames)
+    return _pred
+
+
+def _filename_or_diff_matches(patterns: list[re.Pattern]) -> Callable[[list[str], str], bool]:
+    """Predicate: any pattern matches a changed filename OR the diff content.
+
+    Mirrors the original two-step check (filenames first, then diff) — both
+    steps yielded the same kind, so folding them into one OR is behavior-
+    preserving while keeping the diff fallback in a single rule.
+    """
+    def _pred(filenames: list[str], diff_text: str) -> bool:
+        if any(any(pat.search(f) for pat in patterns) for f in filenames):
+            return True
+        return any(pat.search(diff_text) for pat in patterns)
+    return _pred
+
+
+# Compound predicates (don't reduce to a single pattern scan) ----------------
+
+def _is_renovate_digest_only(filenames: list[str], diff_text: str) -> bool:
+    """Most specific rule: EVERY changed file is a lockfile and the diff has no
+    version bump. Guards against a mixed PR (real code + a lockfile) being
+    mislabeled as trivial and steering weaker models toward rubber-stamping it.
+    """
+    return _all_files_are_lockfiles(filenames) and not _has_version_bump(diff_text)
+
+
+def _is_dependency_upgrade(filenames: list[str], diff_text: str) -> bool:
+    """A dependency/manifest file changed, but NOT a k8s manifest (which happens
+    to reference versions and must classify as k8s_manifest instead).
+    """
+    has_dep_file = any(
+        any(pat.search(f) for pat in DEPENDENCY_PATTERNS) for f in filenames
+    )
+    if not has_dep_file:
+        return False
+    has_k8s = any(any(pat.search(f) for pat in K8S_PATTERNS) for f in filenames)
+    return not has_k8s
+
+
+@dataclass(frozen=True)
+class KindRule:
+    """One pr_kind classification rule: a name plus a match predicate."""
+    kind: str
+    matches: Callable[[list[str], str], bool]
+
+
+# Precedence encoded as order: first matching rule wins.
+KIND_RULES: list[KindRule] = [
+    KindRule("renovate_digest_only", _is_renovate_digest_only),
+    KindRule("dependency_upgrade", _is_dependency_upgrade),
+    KindRule("k8s_manifest", _filename_matches(K8S_PATTERNS)),
+    # secret handling before auth (more specific)
+    KindRule("secret_handling_changes", _filename_matches(SECRET_HANDLING_PATTERNS)),
+    KindRule("db_or_migration_changes", _filename_matches(DB_MIGRATION_PATTERNS)),
+    KindRule("auth_changes", _filename_matches(AUTH_PATTERNS)),
+    KindRule("public_route_changes", _filename_matches(PUBLIC_ROUTE_PATTERNS)),
+    KindRule("file_serving_changes", _filename_or_diff_matches(FILE_SERVING_PATTERNS)),
+    KindRule("path_handling_changes", _filename_or_diff_matches(PATH_HANDLING_PATTERNS)),
+]
+
+# Fallback kind when no rule matches.
+DEFAULT_PR_KIND = "app_code"
 
 
 def _classify_pr_kind(
     files: list[dict],
     diff_text: str,
 ) -> str:
-    """Determine the single best pr_kind from file patterns and diff content."""
+    """Determine the single best pr_kind from file patterns and diff content.
+
+    Evaluates KIND_RULES in order and returns the first match; falls back to
+    DEFAULT_PR_KIND ("app_code") when nothing matches.
+    """
     filenames = [f.get("filename", "") for f in files]
+    for rule in KIND_RULES:
+        if rule.matches(filenames, diff_text):
+            return rule.kind
+    return DEFAULT_PR_KIND
 
-    # Check Renovate digest-only first (most specific). Require that EVERY
-    # changed file is a lockfile and the diff has no version bump — otherwise a
-    # mixed PR (real code + a lockfile) would be mislabeled as trivial and steer
-    # weaker models toward rubber-stamping it.
-    if _all_files_are_lockfiles(filenames) and not _has_version_bump(diff_text):
-        return "renovate_digest_only"
 
-    # Check dependency upgrade (has version bumps in lockfiles/deps)
-    has_dep_file = any(
-        any(pat.search(f) for pat in DEPENDENCY_PATTERNS) for f in filenames
-    )
-    has_version_bump_val = _has_version_bump(diff_text)
-    if has_dep_file or has_version_bump_val:
-        # But exclude k8s manifests that happen to reference versions
-        has_k8s = any(
-            any(pat.search(f) for pat in K8S_PATTERNS) for f in filenames
-        )
-        if not has_k8s:
-            return "dependency_upgrade"
+# ---------------------------------------------------------------------------
+# Risk-flag rule tables
+# ---------------------------------------------------------------------------
 
-    # Check k8s manifest changes
-    if any(any(pat.search(f) for pat in K8S_PATTERNS) for f in filenames):
-        return "k8s_manifest"
+# Linked-issue flags: a flag fires when a linked issue carries ANY of the
+# trigger labels (case-insensitive). Order matters — flags are appended in this
+# order (deduplicated) as issues are scanned.
+LINKED_ISSUE_RULES: list[tuple[frozenset[str], str]] = [
+    (frozenset({"security", "vulnerability"}), "linked_security_issue"),
+    (frozenset({"audit"}), "linked_audit_issue"),
+    (frozenset({"priority/p0", "priority_p0"}), "linked_priority_p0"),
+    (frozenset({"priority/p1", "priority_p1"}), "linked_priority_p1"),
+]
 
-    # Check secret handling (before auth, more specific)
-    if any(any(pat.search(f) for pat in SECRET_HANDLING_PATTERNS) for f in filenames):
-        return "secret_handling_changes"
-
-    # Check DB / migration changes
-    if any(any(pat.search(f) for pat in DB_MIGRATION_PATTERNS) for f in filenames):
-        return "db_or_migration_changes"
-
-    # Check auth changes
-    if any(any(pat.search(f) for pat in AUTH_PATTERNS) for f in filenames):
-        return "auth_changes"
-
-    # Check public route changes
-    if any(any(pat.search(f) for pat in PUBLIC_ROUTE_PATTERNS) for f in filenames):
-        return "public_route_changes"
-
-    # Check file serving changes (in filenames AND diff content)
-    if any(any(pat.search(f) for pat in FILE_SERVING_PATTERNS) for f in filenames):
-        return "file_serving_changes"
-    if any(pat.search(diff_text) for pat in FILE_SERVING_PATTERNS):
-        return "file_serving_changes"
-
-    # Check path handling changes (in filenames AND diff content)
-    if any(any(pat.search(f) for pat in PATH_HANDLING_PATTERNS) for f in filenames):
-        return "path_handling_changes"
-    if any(pat.search(diff_text) for pat in PATH_HANDLING_PATTERNS):
-        return "path_handling_changes"
-
-    # Default: app code change
-    return "app_code"
+# File-based flags: a flag fires when any changed filename OR the diff content
+# matches the pattern set. Order matters — flags are appended in this order.
+FILE_RISK_RULES: list[tuple[list[re.Pattern], str]] = [
+    (FILE_SERVING_PATTERNS, "file_serving_changes"),
+    (PATH_HANDLING_PATTERNS, "path_handling_changes"),
+    (AUTH_PATTERNS, "auth_changes"),
+    (SECRET_HANDLING_PATTERNS, "secret_handling_changes"),
+]
 
 
 def _detect_risk_flags(
     files: list[dict],
     diff_text: str,
     linked_issues: list[dict],
-) -> list[str]:
-    """Detect risk flags based on file patterns and linked issue metadata."""
+) -> tuple[list[str], dict[str, list[str]]]:
+    """Detect risk flags based on file patterns and linked issue metadata.
+
+    Driven by two rule tables: LINKED_ISSUE_RULES (scanned first, per issue)
+    and FILE_RISK_RULES (scanned second). Flag append order follows table
+    order, matching the former hand-written checks.
+
+    Returns
+    -------
+    flags : list[str]
+        Ordered list of detected risk flag names (unchanged semantics).
+    flags_with_files : dict[str, list[str]]
+        Mapping from each file-based risk flag to the file paths that triggered
+        it.  Issue-linked flags (linked_security_issue, etc.) have no file
+        attribution and are omitted from this mapping.  When a flag fires only
+        from diff content (no filename match), the mapping contains an empty
+        list for that flag.
+    """
     flags: list[str] = []
+    flags_with_files: dict[str, list[str]] = {}
     filenames = [f.get("filename", "") for f in files]
 
-    # Check for linked security/audit/priority issues
+    # Linked security/audit/priority issues (table order, deduplicated).
+    # Linear's native priority is numeric (1=Urgent, 2=High). Convert those
+    # values to the same synthetic labels recognized for linked issues so teams
+    # do not need to duplicate Linear priority as a custom label.
     for issue in linked_issues:
-        labels = [lb.get("name", "").lower() for lb in issue.get("labels", [])]
-        if "security" in labels or "vulnerability" in labels:
-            if "linked_security_issue" not in flags:
-                flags.append("linked_security_issue")
-        if "audit" in labels:
-            if "linked_audit_issue" not in flags:
-                flags.append("linked_audit_issue")
-        if "priority/p0" in labels or "priority_p0" in labels:
-            if "linked_priority_p0" not in flags:
-                flags.append("linked_priority_p0")
-        if "priority/p1" in labels or "priority_p1" in labels:
-            if "linked_priority_p1" not in flags:
-                flags.append("linked_priority_p1")
-
-    # File-based risk flags (derived from classification patterns)
-    for pat_set, flag in [
-        (FILE_SERVING_PATTERNS, "file_serving_changes"),
-        (PATH_HANDLING_PATTERNS, "path_handling_changes"),
-        (AUTH_PATTERNS, "auth_changes"),
-        (SECRET_HANDLING_PATTERNS, "secret_handling_changes"),
-    ]:
-        # Check both filenames and diff content for risk flags
-        matches_in_files = any(
-            any(pat.search(f) for pat in pat_set) for f in filenames
-        )
-        matches_in_diff = any(pat.search(diff_text) for pat in pat_set)
-        if matches_in_files or matches_in_diff:
-            if flag not in flags:
+        labels = {lb.get("name", "").lower() for lb in issue.get("labels", [])}
+        if str(issue.get("source", "")).lower() == "linear":
+            priority = issue.get("priority")
+            if type(priority) is int:
+                if priority == 1:
+                    labels.add("priority/p0")
+                elif priority == 2:
+                    labels.add("priority/p1")
+        for trigger_labels, flag in LINKED_ISSUE_RULES:
+            if labels & trigger_labels and flag not in flags:
                 flags.append(flag)
 
-    return flags
+    # File-based risk flags (derived from classification patterns).
+    for pat_set, flag in FILE_RISK_RULES:
+        # Collect the specific files that triggered this flag
+        triggering_files = [
+            f for f in filenames
+            if any(pat.search(f) for pat in pat_set)
+        ]
+        matches_in_diff = any(pat.search(diff_text) for pat in pat_set)
+        if triggering_files or matches_in_diff:
+            if flag not in flags:
+                flags.append(flag)
+            # Record file attribution (empty list when only diff content matched)
+            flags_with_files[flag] = triggering_files
+
+    return flags, flags_with_files
 
 
 # Checklist items per risk class. Keys are pr_kind values AND the file-based
@@ -375,6 +455,48 @@ FLAG_CHECKS: dict[str, list[str]] = {
 }
 
 
+# Kinds whose classification can come from diff CONTENT, not just filenames
+# (they use _filename_or_diff_matches). A content-only match of these must not
+# drive smart-model routing — only an actual changed filename should.
+_CONTENT_CAPABLE_KINDS: dict[str, list[re.Pattern]] = {
+    "file_serving_changes": FILE_SERVING_PATTERNS,
+    "path_handling_changes": PATH_HANDLING_PATTERNS,
+}
+
+
+def _route_signals(
+    pr_kind: str,
+    filenames: list[str],
+    risk_flags: list[str],
+    risk_flags_with_files: dict[str, list[str]],
+) -> list[str]:
+    """Signals eligible to route a PR straight to the smart model.
+
+    Excludes content-only matches (which over-route benign PRs): keeps
+    linked-issue flags, file-based flags backed by a real changed filename, and
+    the pr_kind unless it is a content-only file_serving/path_handling match.
+    """
+    signals: list[str] = []
+    # Linked-issue flags are explicit human signals — always route.
+    for flag in risk_flags:
+        if flag.startswith("linked_") and flag not in signals:
+            signals.append(flag)
+    # File-based risk flags only when an actual changed filename matched;
+    # content-only matches carry an empty file list.
+    for flag, files in risk_flags_with_files.items():
+        if files and flag not in signals:
+            signals.append(flag)
+    # pr_kind routes unless it is the catch-all default or a content-only
+    # file_serving/path_handling kind.
+    if pr_kind and pr_kind != DEFAULT_PR_KIND and pr_kind not in signals:
+        patterns = _CONTENT_CAPABLE_KINDS.get(pr_kind)
+        if patterns is None:
+            signals.append(pr_kind)
+        elif any(any(p.search(fn) for p in patterns) for fn in filenames):
+            signals.append(pr_kind)
+    return signals
+
+
 def _build_must_check(pr_kind: str, risk_flags: list[str]) -> list[str]:
     """Generate explicit must-check items based on classification.
 
@@ -397,7 +519,6 @@ def _build_must_check(pr_kind: str, risk_flags: list[str]) -> list[str]:
 def classify_pr(
     pr_files: list[dict],
     diff_text: str = "",
-    pr_body: str = "",
     linked_issues: list[dict] | None = None,
     max_summary_files: int = 50,
 ) -> PRClassification:
@@ -409,8 +530,6 @@ def classify_pr(
         PR files array from ``gh api repos/.../pulls/N/files``.
     diff_text : str
         Raw PR diff text (truncated).
-    pr_body : str
-        PR body text (used for linked issue reference extraction).
     linked_issues : list[dict], optional
         Already-fetched linked issue dicts with ``labels`` keys.
     max_summary_files : int
@@ -424,12 +543,15 @@ def classify_pr(
         linked_issues = []
 
     pr_kind = _classify_pr_kind(pr_files, diff_text)
-    risk_flags = _detect_risk_flags(pr_files, diff_text, linked_issues)
+    risk_flags, risk_flags_with_files = _detect_risk_flags(pr_files, diff_text, linked_issues)
     must_check = _build_must_check(pr_kind, risk_flags)
 
     # Build changed files summary (just filenames, truncated)
     file_names = [f.get("filename", "") for f in pr_files]
     changed_files_summary = file_names[:max_summary_files]
+    route_signals = _route_signals(
+        pr_kind, file_names, risk_flags, risk_flags_with_files
+    )
 
     # Collect linked issue labels
     linked_issue_labels: list[str] = []
@@ -442,6 +564,8 @@ def classify_pr(
     return PRClassification(
         pr_kind=pr_kind,
         risk_flags=risk_flags,
+        risk_flags_with_files=risk_flags_with_files,
+        route_signals=route_signals,
         changed_files_summary=changed_files_summary,
         linked_issue_labels=linked_issue_labels,
         must_check=must_check,
@@ -451,7 +575,6 @@ def classify_pr(
 def classify_from_files(
     pr_files_path: str | Path,
     diff_path: str | Path = "",
-    body_path: str | Path = "",
     issues_path: str | Path = "",
     output_path: str | Path = "classification.json",
 ) -> PRClassification:
@@ -466,16 +589,12 @@ def classify_from_files(
     if diff_path:
         diff_text = Path(diff_path).read_text(encoding="utf-8", errors="replace")
 
-    pr_body = ""
-    if body_path:
-        pr_body = Path(body_path).read_text(encoding="utf-8", errors="replace")
-
     linked_issues: list[dict] = []
     if issues_path and Path(issues_path).exists():
         linked_issues = json.loads(
             Path(issues_path).read_text(encoding="utf-8"))
 
-    result = classify_pr(pr_files, diff_text, pr_body, linked_issues)
+    result = classify_pr(pr_files, diff_text, linked_issues)
 
     output = Path(output_path)
     output.write_text(json.dumps(result.to_dict(), indent=2) + "\n")
@@ -497,8 +616,6 @@ def main() -> None:
                         help="Path to pr-files.json")
     parser.add_argument("--diff", default="",
                         help="Path to pr.diff.truncated (optional)")
-    parser.add_argument("--body", default="",
-                        help="Path to pr-body.txt (optional)")
     parser.add_argument("--linked-issues", default="",
                         help="Path to linked-issues.json (optional)")
     parser.add_argument("--output", default="classification.json",
@@ -508,7 +625,6 @@ def main() -> None:
     classify_from_files(
         pr_files_path=args.pr_files,
         diff_path=args.diff,
-        body_path=args.body,
         issues_path=args.linked_issues,
         output_path=args.output,
     )

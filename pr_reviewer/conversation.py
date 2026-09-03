@@ -34,6 +34,68 @@ full (default off, expensive) or collapsed into a single system-prompt
 transcript note (default on, mirrors today's single-shot behaviour). See
 ``Conversation.to_request_payload`` for the flag.
 
+=====================================================================
+VERDICT-TURN CONTRACT — bash/Python divergence map (#362)
+=====================================================================
+The action produces its review verdict on one of TWO code paths, which
+build the closing model request in different languages and MUST stay in
+lockstep on the shared invariants below. This block is the single
+authoritative description; ``scripts/model_call.sh`` and
+``scripts/sections/review.sh`` carry a one-line cross-reference back here.
+The 2.0 model-call consolidation (#368) is where the bash path is meant to
+be retired; until then, treat both as live.
+
+  Path A — corpus-only / bash single-shot review
+    ``build_model_request`` in ``scripts/model_call.sh`` (invoked from
+    ``scripts/sections/review.sh``). Used for the standard review call, the
+    fallback model, and the escalation call. No tools ever attach.
+
+  Path B — native_loop in-conversation verdict (#205)
+    ``Conversation.to_request_payload(verdict_turn=True,
+    keep_full_history_on_verdict=True)`` (built in
+    ``scripts/run_tool_harness.py``). The multi-turn tool history is carried
+    through and the corpus is re-injected as a trailing user turn. OpenAI
+    only — an Anthropic verdict turn after trailing tool_result (user-role)
+    blocks would create adjacent user turns (a 400). ``review.sh`` consumes
+    its output (``ai-response.primary.json``) and skips Path A when
+    ``native_loop_verdict_produced`` is true.
+
+SHARED contract — MUST match across both paths (drift = bug):
+  * No ``tools`` on the request. Path A never adds them; Path B drops them
+    because ``verdict_turn=True``.
+  * ``response_format`` for a given ``AI_RESPONSE_FORMAT``:
+      - ``off``          → field omitted
+      - ``json_object``  → ``{"type": "json_object"}``
+      - ``json_schema``  → the strict ``pr_review`` schema. This literal is
+        DUPLICATED: ``_OPENAI_VERDICT_JSON_SCHEMA`` here and the inline
+        ``rf_json`` string in ``model_call.sh``. They must be byte-identical
+        (pinned by ``tests/test_verdict_contract_equivalence.py``).
+  * Token-limit field name obeys ``AI_TOKENS_PARAM`` (``max_tokens`` vs
+    ``max_completion_tokens``); default cap ``AI_MAX_TOKENS`` = 8192.
+  * ``temperature`` is omitted iff ``AI_TEMPERATURE`` is empty.
+  * ``stream_options.include_usage`` is set iff streaming (OpenAI only).
+  * The full corpus (``review-corpus.truncated.md``) reaches the model.
+  * The reviewer ``SYSTEM_PROMPT`` is present (Path B resolves the same base
+    prompt via ``resolve_review_system_prompt``).
+
+INTENTIONALLY different (do NOT try to unify):
+  * System prompt. Path A sends ``SYSTEM_PROMPT`` verbatim. Path B appends
+    ``TOOL_USE_PREAMBLE`` (#263) so the loop and verdict share ONE system
+    and the cached prefix survives — a token-0 swap would blow the cache.
+  * Corpus placement. Path A concatenates the corpus into its single user
+    message (``$user + "\n\n" + $corpus``). Path B re-injects it as a
+    trailing user turn (``_VERDICT_CLOSING_INSTRUCTION + corpus``) after the
+    tool history.
+  * User instruction wording. Path A: ``build_user_message`` (deterministic
+    classification steering). Path B: ``_VERDICT_CLOSING_INSTRUCTION`` in
+    ``run_tool_harness.py``. Different text, same intent (STRICT JSON now).
+  * Prior tool evidence. Path A has none in the request (tools were flattened
+    into the corpus upstream). Path B carries the real assistant tool_call /
+    tool_result turns in-conversation.
+  * API coverage. Path A supports openai and anthropic; Path B's verdict is
+    openai-only. Anthropic has no ``response_format`` on either path (both
+    lean on the system prompt to request JSON).
+
 The budget helpers in this module (rough token estimate + graceful
 truncation of the oldest tool results) are advisory: the loop driver in
 3/7 owns the authoritative stop conditions. Keeping them here means the
@@ -45,7 +107,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 # Per the executor catalogue in scripts/run_tool_harness.py (the
 # normalize_tool_request repair logic and the per-tool arg shapes). Keep these
@@ -86,7 +148,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "description": (
             "Read a file from the workspace. Path-traversal and sensitive "
             "files (.env, .pem, credentials, id_rsa, …) are blocked. Output "
-            "is truncated to ~12 KB."
+            "is truncated to ~12 KB. For a large file, pass offset/limit to "
+            "read a line window (also the way to expand context around a "
+            "diff hunk) instead of blowing the cap."
         ),
         "parameters": {
             "type": "object",
@@ -94,6 +158,64 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "path": {
                     "type": "string",
                     "description": "Path relative to the workspace root.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Optional 1-based first line to read.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional max number of lines to read from offset.",
+                },
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "git_log",
+        "description": (
+            "Read-only recent commit history (oneline: hash date author "
+            "subject), optionally scoped to a path. No file content — use "
+            "git_blame for line-level authorship."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Optional path to scope history to.",
+                },
+                "max_count": {
+                    "type": "integer",
+                    "description": "Optional max commits (1–100, default 20).",
+                },
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "git_blame",
+        "description": (
+            "Read-only line-level authorship for a tracked file (who last "
+            "changed each line, and in which commit). Pass start/end to blame "
+            "a line range. Sensitive files are blocked like read_file."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path relative to the workspace root.",
+                },
+                "start": {
+                    "type": "integer",
+                    "description": "Optional 1-based first line of the range.",
+                },
+                "end": {
+                    "type": "integer",
+                    "description": "Optional last line of the range (with start).",
                 },
             },
             "required": ["path"],
@@ -206,6 +328,73 @@ VERDICT_USER_INSTRUCTION = (
     "Do not issue any tool calls."
 )
 
+# Placeholder emitted for a corpus section dropped by dedupe_verdict_corpus.
+# Callers count occurrences of this literal to log how many sections were
+# dropped, so keep it stable.
+VERDICT_DEDUP_NOTICE = (
+    "(unchanged — provided in full in the first message of this conversation)"
+)
+
+
+def dedupe_verdict_corpus(corpus: str, planning_context: str) -> str:
+    """Drop corpus sections already present verbatim in the planning context.
+
+    The native_loop verdict turn (#372) re-sends the full review corpus as a
+    trailing user message, but the loop's FIRST user message (the planning
+    context, built by ``build_planning_context`` in
+    ``scripts/run_tool_harness.py``) already carries several of that corpus's
+    sections verbatim. This removes only the byte-duplicate sections, replacing
+    each with a one-line placeholder, so the corpus content still reaches the
+    model across the conversation as a whole — the #362 verdict-turn contract
+    invariant "the full corpus reaches the model" is preserved (the model has
+    the dropped bytes in message 1).
+
+    Matching rule (deliberately conservative — a false drop silently loses
+    evidence, which is far worse than re-sending some bytes):
+
+      * Sections are split on level-1 ATX headers only (``"# Title"``), the
+        top-level section delimiter emitted by ``build_review_corpus`` in
+        ``scripts/sections/corpus.sh``. ``"## Source N"`` / ``"### ..."``
+        subheaders inside a section are NOT delimiters and never split it.
+      * A section is dropped ONLY if its full text, modulo trailing whitespace,
+        appears byte-identically inside ``planning_context``. Partial overlap
+        never counts: a truncated or paraphrased copy (e.g. the planner's
+        "PR Diff (head)" excerpt vs the corpus's full "PR Diff (truncated)", or
+        a section whose header/cap differs between the two builders) is NOT a
+        byte match and is therefore sent IN FULL.
+
+    Total and never raises: empty corpus, empty planning context, or a
+    headerless blob all round-trip unchanged (nothing to dedup against, or
+    nothing to match).
+    """
+    if not corpus or not planning_context:
+        return corpus
+    lines = corpus.split("\n")
+    # Level-1 headers only: a line beginning "# " (hash + space). "## "/"### "
+    # start with "#" then "#", so startswith("# ") excludes them.
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("# ")]
+    if not starts:
+        return corpus
+    out: list[str] = []
+    # Any preamble before the first header is not a section — keep it verbatim.
+    if starts[0] > 0:
+        out.extend(lines[: starts[0]])
+    bounds = starts + [len(lines)]
+    for idx in range(len(starts)):
+        seg = lines[bounds[idx] : bounds[idx + 1]]
+        stripped = "\n".join(seg).rstrip()
+        # Substring containment of the rstripped section tolerates trailing
+        # whitespace on the corpus side and extra content after it in the
+        # planning context, while still requiring every internal byte
+        # (header + fences + body) to match — partial overlap can't pass.
+        if stripped and stripped in planning_context:
+            title = seg[0][2:].strip()  # drop the leading "# "
+            out.append(f"## {title}")
+            out.append(VERDICT_DEDUP_NOTICE)
+        else:
+            out.extend(seg)
+    return "\n".join(out)
+
 
 # ---------------------------------------------------------------------------
 # Message normalisation
@@ -290,59 +479,6 @@ def truncate_text(text: str, max_bytes: int) -> tuple[str, bool]:
     # is valid UTF-8.
     out = clip.decode("utf-8", errors="replace")
     return out, True
-
-
-def normalize_assistant_tool_calls_openai(
-    raw_calls: Iterable[Any],
-) -> list[dict[str, Any]]:
-    """Tolerantly shape model-emitted tool calls into OpenAI's non-streaming form.
-
-    Per the #233 contract, ``function.arguments`` is a JSON-encoded **string**
-    end-to-end (OpenAI's non-streaming schema) — strict servers reject a
-    dict when the assistant message is echoed back on the next turn. The
-    streaming reassembler already hands us a string, so we preserve it
-    verbatim. A caller that already has the parsed form (e.g. a unit test
-    or a non-reassembler path) may pass a dict; we serialise it once at
-    this boundary and then never touch it again. Malformed fragments
-    (truncated streams) are passed through as-is so the loop driver can
-    decide whether to retry.
-    """
-    out: list[dict[str, Any]] = []
-    for raw in raw_calls:
-        if not isinstance(raw, dict):
-            continue
-        fn = raw.get("function") if isinstance(raw.get("function"), dict) else None
-        name = (fn or {}).get("name") or raw.get("name")
-        if not isinstance(name, str) or not name:
-            continue
-        call_id = raw.get("id")
-        if not isinstance(call_id, str) or not call_id:
-            continue
-        # Look at the canonical location first (OpenAI's wire format), then
-        # fall back to a top-level "arguments" for proxies that flatten the
-        # shape.
-        args = (fn or {}).get("arguments")
-        if args is None:
-            args = raw.get("arguments")
-        if isinstance(args, str):
-            arguments = args
-        elif args is None:
-            arguments = ""
-        else:
-            # Dict/list at the ingest boundary: serialise once and stop
-            # touching. From here on the value is opaque.
-            try:
-                arguments = json.dumps(args, ensure_ascii=False, sort_keys=True)
-            except (TypeError, ValueError):
-                arguments = str(args)
-        out.append(
-            {
-                "id": call_id,
-                "type": "function",
-                "function": {"name": name, "arguments": arguments},
-            }
-        )
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -538,6 +674,57 @@ class Conversation:
                 shrunk += 1
         return shrunk
 
+    def summarize_oldest_tool_results(
+        self, summarize_fn: Callable[[str], str], *, keep_newest: int = 2
+    ) -> int:
+        """Fold the oldest tool results into one model-generated digest.
+
+        When the conversation outgrows the loop's context budget, blunt
+        truncation (:meth:`truncate_oldest_tool_results`) drops the tail of
+        each old result — losing whatever evidence sat past the byte cap. This
+        instead compresses the older results (all but the newest
+        ``keep_newest``) into a single dense digest via ``summarize_fn``,
+        preserving the salient facts (versions, paths, URLs, findings) in far
+        fewer tokens.
+
+        Wire validity is preserved: every tool_result keeps its ``call_id`` so
+        the assistant_tool_calls ↔ tool_result pairing stays intact. The oldest
+        folded result's content becomes the digest; the rest become a short
+        placeholder pointing at it. The newest ``keep_newest`` results are left
+        verbatim — they're what the model is actively reasoning over. Already
+        folded results are skipped, so this is safe to call every round.
+
+        Returns the number of results folded (0 when there aren't enough old
+        results, all are already folded, or the summary came back empty — the
+        caller should fall back to truncation in that case).
+        """
+        indices = [i for i, e in enumerate(self.events) if e["kind"] == "tool_result"]
+        keep = max(keep_newest, 0)
+        if len(indices) <= keep:
+            return 0
+        old = indices[: len(indices) - keep] if keep else indices
+        foldable = [i for i in old if not self.events[i].get("summarized")]
+        if not foldable:
+            return 0
+        block = "\n\n".join(
+            f"[earlier result {n + 1}"
+            f"{' (error)' if self.events[i].get('is_error') else ''}]\n"
+            + self.events[i]["content"]
+            for n, i in enumerate(foldable)
+        )
+        digest = (summarize_fn(block) or "").strip()
+        if not digest:
+            return 0
+        head = foldable[0]
+        self.events[head]["content"] = (
+            "Condensed digest of earlier tool results:\n" + digest
+        )
+        self.events[head]["summarized"] = True
+        for i in foldable[1:]:
+            self.events[i]["content"] = "[folded into the condensed digest above]"
+            self.events[i]["summarized"] = True
+        return len(foldable)
+
     # ---- wire emission ---------------------------------------------------
 
     def _render_openai_messages(self) -> list[dict[str, Any]]:
@@ -557,25 +744,23 @@ class Conversation:
             elif kind == "assistant_text":
                 messages.append({"role": "assistant", "content": e["content"]})
             elif kind == "assistant_tool_calls":
-                calls = normalize_assistant_tool_calls_openai(
-                    [
-                        {
-                            "id": c["id"],
-                            "function": {
-                                "name": c["name"],
-                                "arguments": c["arguments"],
-                            },
-                        }
-                        for c in e["calls"]
-                    ]
-                )
-                if not calls:
-                    continue
+                # Events are already normalised to {"id", "name", "arguments"}
+                # by add_assistant_tool_calls; emit OpenAI's nested form directly.
                 messages.append(
                     {
                         "role": "assistant",
                         "content": None,
-                        "tool_calls": calls,
+                        "tool_calls": [
+                            {
+                                "id": c["id"],
+                                "type": "function",
+                                "function": {
+                                    "name": c["name"],
+                                    "arguments": c["arguments"],
+                                },
+                            }
+                            for c in e["calls"]
+                        ],
                     }
                 )
             elif kind == "tool_result":
@@ -709,6 +894,8 @@ class Conversation:
         verdict_turn: bool = False,
         keep_full_history_on_verdict: bool = False,
         response_format: str | None = None,
+        tokens_param: str = "max_tokens",
+        cache_prefix: bool = False,
     ) -> dict[str, Any]:
         """Render the conversation as a wire-ready request body.
 
@@ -729,6 +916,7 @@ class Conversation:
                 verdict_turn=verdict_turn,
                 keep_full_history_on_verdict=keep_full_history_on_verdict,
                 response_format=response_format,
+                cache_prefix=cache_prefix,
             )
         return self._to_openai_payload(
             model=model,
@@ -738,6 +926,7 @@ class Conversation:
             verdict_turn=verdict_turn,
             keep_full_history_on_verdict=keep_full_history_on_verdict,
             response_format=response_format,
+            tokens_param=tokens_param,
         )
 
     def _to_openai_payload(
@@ -750,6 +939,7 @@ class Conversation:
         verdict_turn: bool,
         keep_full_history_on_verdict: bool,
         response_format: str | None,
+        tokens_param: str = "max_tokens",
     ) -> dict[str, Any]:
         system = self.system
         messages = self._render_openai_messages()
@@ -771,7 +961,11 @@ class Conversation:
             if system
             else messages,
         }
-        payload["max_tokens"] = max_tokens
+        # Mirror the bash build_model_request: newer OpenAI models reject
+        # max_tokens and require max_completion_tokens (AI_TOKENS_PARAM). Only
+        # those two field names are honoured; anything else falls back safely.
+        field = tokens_param if tokens_param == "max_completion_tokens" else "max_tokens"
+        payload[field] = max_tokens
         if temperature is not None:
             payload["temperature"] = temperature
         if stream:
@@ -799,6 +993,7 @@ class Conversation:
         verdict_turn: bool,
         keep_full_history_on_verdict: bool,
         response_format: str | None,
+        cache_prefix: bool = False,
     ) -> dict[str, Any]:
         system = self.system
         messages = self._render_anthropic_messages()
@@ -826,6 +1021,21 @@ class Conversation:
         # on the system prompt to request JSON. response_format is silently
         # ignored to keep the call sites uniform between the two APIs.
         _ = response_format
+        # Anthropic prompt caching is opt-in (#263 Part 2): unlike OpenAI's
+        # automatic prefix cache, it caches nothing unless cache_control markers
+        # are present. Mark the stable prefix — the system block and the tools
+        # block (the two large turn-invariant pieces) — so the multi-turn loop
+        # reuses them. The growing messages tail stays uncached.
+        if cache_prefix:
+            if system:
+                payload["system"] = [
+                    {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+                ]
+            if payload.get("tools"):
+                payload["tools"][-1] = {
+                    **payload["tools"][-1],
+                    "cache_control": {"type": "ephemeral"},
+                }
         return payload
 
 

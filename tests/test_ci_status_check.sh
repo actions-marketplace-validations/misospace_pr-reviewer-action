@@ -14,31 +14,12 @@ fi
 
 PASS=0
 FAIL=0
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+_TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$_TEST_DIR/.." && pwd)"
 WAIT_SCRIPT="$SCRIPT_DIR/scripts/wait_for_ci.sh"
 ACTION_YML="$SCRIPT_DIR/action.yml"
-
-check() {
-  local desc="$1" result="$2" expected="$3"
-  if [[ "$result" == "$expected" ]]; then
-    echo "  PASS: $desc"
-    PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (got '$result', expected '$expected')"
-    FAIL=$((FAIL + 1))
-  fi
-}
-
-check_contains() {
-  local desc="$1" haystack="$2" needle="$3"
-  if [[ "$haystack" == *"$needle"* ]]; then
-    echo "  PASS: $desc"
-    PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (expected to contain '$needle')"
-    FAIL=$((FAIL + 1))
-  fi
-}
+# shellcheck source=_lib/assert.sh
+source "$_TEST_DIR/_lib/assert.sh"
 
 # ── Test 1: exit code 1 path for timeout+skip=true exists in script ──
 echo "=== Test: exit code 1 on timeout with skip=true ==="
@@ -165,8 +146,10 @@ check_contains "check-runs query does NOT filter by status=pending (uses all sta
   "$wait_content" 'check-runs?per_page=100'
 check_contains "counts non-completed check runs via jq select" \
   "$wait_content" '.status != "completed"'
-check_contains "stores check-runs response for reuse" \
-  "$wait_content" 'check_runs_response='
+check_contains "gates on the normalized external-checks seam" \
+  "$wait_content" 'platform_external_checks'
+check_contains "stores the normalized checks list for reuse (render + gating)" \
+  "$wait_content" 'ci_checks_json='
 
 # ── Test 14: Failed check-run detection before combined status update ──
 echo ""
@@ -175,8 +158,8 @@ check_contains "treats failure conclusions as failed" \
   "$wait_content" '"failure"'
 check_contains "treats timed_out conclusions as failed" \
   "$wait_content" '"timed_out"'
-check_contains "logs when failed check runs detected early" \
-  "$wait_content" 'failed check run'
+check_contains "logs when failed checks detected early" \
+  "$wait_content" 'failed check'
 
 # ── Test 15: own-run exclusion and step env wiring ──
 echo ""

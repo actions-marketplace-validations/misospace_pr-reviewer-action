@@ -10,17 +10,18 @@ import subprocess
 import sys
 from typing import Optional
 
+# Project root on sys.path for the shared USER_AGENT constant.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from pr_reviewer.budget import DeadlineBudget  # noqa: E402
+from pr_reviewer.platform import USER_AGENT  # noqa: E402
+
 
 def time_budget_deadline():
     """Return a monotonic deadline from IMAGE_DIGEST_BUDGET_SEC (0 disables)."""
-    raw = os.getenv("IMAGE_DIGEST_BUDGET_SEC", "60").strip()
-    try:
-        budget = int(raw)
-    except ValueError:
-        budget = 60
-    if budget <= 0:
-        return None
-    return time.monotonic() + budget
+    return DeadlineBudget.from_env("IMAGE_DIGEST_BUDGET_SEC", default=60).deadline
 
 
 def deadline_exceeded(deadline):
@@ -228,7 +229,7 @@ def fetch_github_compare(
             f"https://api.github.com/repos/{repo}/compare/{old_rev}...{new_rev}",
             headers={
                 "Accept": "application/vnd.github+json",
-                "User-Agent": "pr-reviewer-action",
+                "User-Agent": USER_AGENT,
             },
         )
         result["status"] = data.get("status")

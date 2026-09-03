@@ -17,29 +17,15 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PASS=0
 FAIL=0
-check() {
-  local desc="$1" result="$2" expected="$3"
-  if [[ "$result" == "$expected" ]]; then
-    echo "  PASS: $desc"; PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (got '$result', expected '$expected')"; FAIL=$((FAIL + 1))
-  fi
-}
-check_contains() {
-  local desc="$1" haystack="$2" needle="$3"
-  if [[ "$haystack" == *"$needle"* ]]; then
-    echo "  PASS: $desc"; PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (expected to contain '$needle')"; FAIL=$((FAIL + 1))
-  fi
-}
+# shellcheck source=_lib/assert.sh
+source "$SCRIPT_DIR/_lib/assert.sh"
 
 # Extract resolve_review_route from run_review.sh (same pattern as
 # test_context_budget.sh / test_classification_steering.sh).
 FUNCS="$(mktemp)"
 WORKDIR="$(mktemp -d)"
 trap 'rm -f "$FUNCS"; rm -rf "$WORKDIR"' EXIT
-python3 - "$ROOT_DIR/scripts/run_review.sh" "$FUNCS" <<'PY'
+python3 - "$ROOT_DIR/scripts/sections/classification.sh" "$FUNCS" <<'PY'
 import re, sys
 src = open(sys.argv[1]).read()
 m = re.search(r"^resolve_review_route\(\) \{\n(.*?)\n\}", src, re.S | re.M)
@@ -73,9 +59,9 @@ check "off mode is legacy" "$(route_for off auth_changes "" 1)" "legacy"
 check "default-ish empty mode handled upstream (off)" "$(route_for off app_code "" 1)" "legacy"
 
 echo ""
-echo "=== Test: auto + low risk → fast ==="
-check "app_code with no flags routes fast" "$(route_for auto app_code "" 1)" "fast"
-check "renovate digest routes fast" "$(route_for auto renovate_digest_only "" 1)" "fast"
+echo "=== Test: auto + low risk → primary ==="
+check "app_code with no flags routes primary" "$(route_for auto app_code "" 1)" "primary"
+check "renovate digest routes primary" "$(route_for auto renovate_digest_only "" 1)" "primary"
 
 echo ""
 echo "=== Test: auto + risky pr_kind → smart ==="
@@ -90,37 +76,60 @@ check "app_code with path_handling_changes flag routes smart" \
   "$(route_for auto app_code "other_flag,path_handling_changes" 1)" "smart"
 
 echo ""
-echo "=== Test: smart route without smart config stays fast ==="
-check "risky PR without smart model stays fast" "$(route_for auto auth_changes "" "")" "fast"
+echo "=== Test: route_signals excludes content-only matches (over-escalation fix) ==="
+route_for_signals() {
+  # $1 = pr_kind, $2 = risk_flags csv, $3 = route_signals csv, $4 = smart resolved
+  local rf sig
+  rf="$(printf '%s' "$2" | python3 -c 'import json,sys; s=sys.stdin.read().strip(); print(json.dumps(s.split(",") if s else []))')"
+  sig="$(printf '%s' "$3" | python3 -c 'import json,sys; s=sys.stdin.read().strip(); print(json.dumps(s.split(",") if s else []))')"
+  printf '{"pr_kind": "%s", "risk_flags": %s, "route_signals": %s}' "$1" "$rf" "$sig" > classification.json
+  REVIEW_ROUTING_MODE=auto SMART_MODEL_RESOLVED="$4" ESCALATE_ON_RISK_FLAGS="$DEFAULT_FLAGS" \
+    resolve_review_route
+  echo "$REVIEW_ROUTE"
+}
+# risk_flags carries path_handling_changes (content-only), but route_signals is
+# empty → must stay primary even though the flag is in the escalation list.
+check "content-only risk flag does NOT route smart" \
+  "$(route_for_signals path_handling_changes "path_handling_changes" "" 1)" "primary"
+# A filename-backed signal in route_signals still routes smart.
+check "filename-backed signal routes smart" \
+  "$(route_for_signals auth_changes "auth_changes" "auth_changes" 1)" "smart"
+# Linked-issue signal routes smart.
+check "linked signal routes smart" \
+  "$(route_for_signals app_code "linked_security_issue" "linked_security_issue" 1)" "smart"
+
+echo ""
+echo "=== Test: risky PR without smart config stays primary ==="
+check "risky PR without smart model stays primary" "$(route_for auto auth_changes "" "")" "primary"
 
 echo ""
 echo "=== Test: custom escalation list ==="
-check "custom list: kind not in list routes fast" \
-  "$(route_for auto auth_changes "" 1 "db_or_migration_changes")" "fast"
+check "custom list: kind not in list routes primary" \
+  "$(route_for auto auth_changes "" 1 "db_or_migration_changes")" "primary"
 check "custom list: matching kind routes smart" \
   "$(route_for auto db_or_migration_changes "" 1 "db_or_migration_changes")" "smart"
 
 echo ""
 echo "=== Test: wiring ==="
-RUN_REVIEW="$(cat "$ROOT_DIR/scripts/run_review.sh")"
-check_contains "fast config defaults to primary" "$RUN_REVIEW" 'FAST_MODEL="${AI_FAST_MODEL:-$AI_MODEL}"'
-check_contains "smart config defaults to fallback" "$RUN_REVIEW" 'SMART_MODEL="${AI_SMART_MODEL:-$AI_FALLBACK_MODEL}"'
-check "review_route output emitted" "$(grep -c '^echo "review_route=' "$ROOT_DIR/scripts/run_review.sh")" "1"
-check "precheck fingerprints routing mode" "$(grep -c 'routing_mode:' "$ROOT_DIR/scripts/check_review_needed.sh")" "1"
-check "precheck fingerprints escalate flags" "$(grep -c 'escalate_flags:' "$ROOT_DIR/scripts/check_review_needed.sh")" "1"
+RUN_REVIEW="$(cat "$ROOT_DIR/scripts/run_review.sh" "$ROOT_DIR"/scripts/sections/*.sh)"
+check_contains "primary route config defaults to ai_model" "$RUN_REVIEW" 'PRIMARY_MODEL="${AI_PRIMARY_MODEL:-$AI_MODEL}"'
+check_contains "smart resolves ONLY from ai_smart_model (not the fallback)" "$RUN_REVIEW" 'SMART_MODEL="${AI_SMART_MODEL}"'
+check "review_route output emitted" "$(grep -c '^echo "review_route=' "$ROOT_DIR/scripts/sections/review.sh")" "1"
+check "precheck fingerprints routing mode" "$(grep -c '"REVIEW_ROUTING_MODE",' "$ROOT_DIR/pr_reviewer/precheck.py")" "1"
+check "precheck fingerprints escalate flags" "$(grep -c '"ESCALATE_ON_RISK_FLAGS",' "$ROOT_DIR/pr_reviewer/precheck.py")" "1"
 ACTION="$(cat "$ROOT_DIR/action.yml")"
 check_contains "action.yml declares review_routing_mode" "$ACTION" "review_routing_mode:"
 check_contains "action.yml declares ai_smart_model" "$ACTION" "ai_smart_model:"
 check_contains "action.yml declares review_route output" "$ACTION" "review_route:"
-check "publish steps receive REVIEW_ROUTE" \
-  "$(grep -c 'REVIEW_ROUTE: \${{ steps.review.outputs.review_route }}' "$ROOT_DIR/action.yml")" "3"
+check "publish step receives REVIEW_ROUTE" \
+  "$(grep -c 'REVIEW_ROUTE: \${{ steps.review.outputs.review_route }}' "$ROOT_DIR/action.yml")" "1"
 check_contains "marker carries review_route" "$(cat "$ROOT_DIR/scripts/publish_helpers.sh")" "review_route"
 
 echo ""
 echo "=== Test: annotate_analysis_engine ==="
-# Extract annotate_analysis_engine the same way as resolve_review_route.
+# Extract annotate_analysis_engine from the review section module.
 AAE_FUNCS="$(mktemp)"
-python3 - "$ROOT_DIR/scripts/run_review.sh" "$AAE_FUNCS" <<'PY'
+python3 - "$ROOT_DIR/scripts/sections/review.sh" "$AAE_FUNCS" <<'PY'
 import re, sys
 src = open(sys.argv[1]).read()
 m = re.search(r"^annotate_analysis_engine\(\) \{\n(.*?)\n\}", src, re.S | re.M)
@@ -137,8 +146,8 @@ check "legacy primary stays unannotated" \
   "$(REVIEW_ROUTE=legacy annotate_analysis_engine "$BASE" primary)" "$BASE"
 check "routing-off default stays unannotated" \
   "$(REVIEW_ROUTE= annotate_analysis_engine "$BASE" primary)" "$BASE"
-check "fast route annotated" \
-  "$(REVIEW_ROUTE=fast annotate_analysis_engine "$BASE" primary)" "$BASE — fast route"
+check "primary route annotated" \
+  "$(REVIEW_ROUTE=primary annotate_analysis_engine "$BASE" primary)" "$BASE — primary route"
 check "smart route carries the risk reason" \
   "$(REVIEW_ROUTE=smart ROUTE_REASON="risk match: auth_changes" annotate_analysis_engine "$BASE" primary)" \
   "$BASE — routed smart (risk match: auth_changes)"
@@ -149,8 +158,8 @@ check "escalated carries trigger names" \
   "$BASE — escalated (fast_low_confidence)"
 # The step-summary usage-file branch greps the engine string for "fallback";
 # only the fallback origin may introduce that word.
-check "fast annotation does not claim fallback" \
-  "$(case "$(REVIEW_ROUTE=fast annotate_analysis_engine "$BASE" primary)" in *fallback*) echo yes;; *) echo no;; esac)" "no"
+check "primary annotation does not claim fallback" \
+  "$(case "$(REVIEW_ROUTE=primary annotate_analysis_engine "$BASE" primary)" in *fallback*) echo yes;; *) echo no;; esac)" "no"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

@@ -2,6 +2,7 @@
 """Execute evidence-provider commands and write structured results."""
 
 import json
+import logging
 import os
 import shlex
 import subprocess
@@ -10,21 +11,19 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-# Ensure the scripts directory is on sys.path so we can import shared helpers.
+# Ensure the scripts directory and project root are on sys.path so we can
+# import shared helpers (redact) and pr_reviewer modules.
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
+_PROJECT_ROOT = _SCRIPTS_DIR.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
+from pr_reviewer.env import env_int  # noqa: E402
 from redact import mask_and_truncate, mask_secrets  # noqa: E402
 
-
-def env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, str(default)).strip()
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return max(1, value)
+logger = logging.getLogger(__name__)
 
 
 def normalize_severity(value: object) -> str:
@@ -96,11 +95,18 @@ def parse_findings(payload: object) -> tuple[str, list[dict[str, str]]]:
     return highest, findings[:40]
 
 
-# Model API keys are stripped from provider subprocess environments: providers
-# talk to the repo, not the model, so they have no legitimate use for them,
-# and this keeps a misbehaving provider command from echoing them into
-# captured output. GH_TOKEN is intentionally kept — providers commonly use gh.
-_SCRUBBED_ENV_KEYS = ("AI_API_KEY", "AI_FALLBACK_API_KEY")
+# Model API keys and other injected credentials are stripped from provider
+# subprocess environments: providers talk to the repo, not the model, so they
+# have no legitimate use for them, and this keeps a misbehaving provider
+# command from echoing them into captured output. GH_TOKEN is intentionally
+# kept — providers commonly use gh.
+_SCRUBBED_ENV_KEYS = (
+    "AI_API_KEY",
+    "AI_FALLBACK_API_KEY",
+    "AI_PRIMARY_API_KEY",
+    "AI_SMART_API_KEY",
+    "LINEAR_API_KEY",
+)
 
 
 def provider_env() -> dict:
@@ -169,6 +175,19 @@ def run_provider(
         else:
             command_text = str(command)
             entry["command"] = command_text
+            # SECURITY: shell-string commands are executed via `bash -lc`, which
+            # interprets the string in a login shell — the full bash injection
+            # surface is available.  Prefer argv arrays (see SECURITY.md:
+            # "Prefer argv arrays … over shell strings … to avoid shell injection
+            # risks from `bash -lc` execution").  This branch is a trust
+            # boundary: the string is treated as trusted operator-supplied input,
+            # not as sanitised user content.
+            logger.warning(
+                "evidence provider %r: command is a shell string and will be "
+                "executed via `bash -lc`.  Prefer an argv list to avoid the "
+                "bash trust boundary (see SECURITY.md).",
+                entry["id"],
+            )
             completed = subprocess.run(
                 ["bash", "-lc", command_text],
                 stdout=subprocess.PIPE,
@@ -251,7 +270,14 @@ def write_outputs(summary: dict, markdown: str) -> None:
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    Path("evidence-providers.md").write_text(markdown.rstrip() + "\n", encoding="utf-8")
+    # Empty markdown (the "not configured" case) writes a truly empty file so
+    # corpus.sh's `[ -s evidence-providers.md ]` gate can omit the section
+    # header entirely, instead of the model reacting to a header with nothing
+    # under it (#399/#409). Real diagnostics (config errors, provider output)
+    # still get a trailing newline as before.
+    Path("evidence-providers.md").write_text(
+        markdown.rstrip() + "\n" if markdown.strip() else "", encoding="utf-8"
+    )
 
 
 def main() -> int:
@@ -267,7 +293,10 @@ def main() -> int:
     }
 
     if not config_path_raw:
-        write_outputs(summary, "No evidence providers configured.")
+        # Leave the markdown empty (not "not configured") — this is the normal,
+        # expected state for consumers with no evidence providers set up, not
+        # a diagnostic worth a corpus section. See #399/#409.
+        write_outputs(summary, "")
         return 0
 
     config_path = Path(config_path_raw)

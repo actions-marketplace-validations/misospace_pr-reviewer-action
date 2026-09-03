@@ -15,9 +15,31 @@ from pr_reviewer.tool_loop import (
     STOP_REQUEST_ERROR,
     STOP_WALL_CLOCK,
     LoopBudgets,
+    adaptive_loop_budgets,
     drive_tool_loop,
     extract_tool_calls,
 )
+
+
+class TestAdaptiveLoopBudgets:
+    """Loop depth is route-independent: 2× the configured rounds (capped at 8)
+    plus the configured tool-call budget, on every route. The route selects the
+    MODEL, never the tool budget — the primary model is fully capable and is no
+    longer shallow-capped (the loop self-limits when the model stops calling
+    tools)."""
+
+    def test_headroom_doubles_rounds_capped_at_8(self):
+        b = adaptive_loop_budgets(3, 4, 120.0)
+        assert b.max_rounds == 6  # 3 * 2
+        assert b.max_tool_calls == 4
+        assert adaptive_loop_budgets(6, 4, 120.0).max_rounds == 8  # capped
+
+    def test_full_configured_budget_is_granted(self):
+        # Was capped to 2 rounds / 3 calls on the "fast" route; the budget is
+        # route-independent now.
+        b = adaptive_loop_budgets(3, 8, 120.0)
+        assert b.max_rounds == 6
+        assert b.max_tool_calls == 8
 
 
 def openai_tool_call_response(calls, content=None):
@@ -292,6 +314,177 @@ def test_wall_clock_budget():
     assert conv.open_tool_call_ids() == set()
 
 
+def test_wall_clock_triggers_mid_flight():
+    """wall_clock_sec fires after a slow tool executor, not just between model
+    round-trips.  A 1 s budget with a 1.5 s sleepy executor means round 1
+    completes (the budget is checked at the TOP of each iteration, before the
+    executor runs), but when the loop comes back for round 2 the elapsed time
+    already exceeds the budget and the loop stops with STOP_WALL_CLOCK.
+
+    Rounds are set to 10 and tool-call budget to 100, so neither of those caps
+    is responsible for the stop — it must be the wall-clock limit.
+
+    This test uses the real monotonic clock and a real time.sleep so it catches
+    regressions where the wall-clock check is moved or skipped.  The sleep is
+    intentionally short (1.5 s total) to keep the suite fast.
+    """
+    import time as _time
+
+    conv = fresh_conversation()
+
+    round_counter = {"n": 0}
+
+    def post(payload):
+        round_counter["n"] += 1
+        n = round_counter["n"]
+        return openai_tool_call_response(
+            [(f"c{n}", "read_file", json.dumps({"path": f"file{n}.txt"}))]
+        )
+
+    def slow_execute(tool_name, args):
+        _time.sleep(1.5)  # outlasts the 1 s wall-clock budget
+        return {"tool": tool_name, "status": "ok", "result": {"content": "ok"}}
+
+    outcome = drive_tool_loop(
+        conv,
+        post,
+        slow_execute,
+        api_format="openai",
+        model="m",
+        budgets=LoopBudgets(wall_clock_sec=1.0, max_rounds=10, max_tool_calls=100),
+        # Default time_fn=time.monotonic — real clock.
+    )
+
+    # The wall-clock guard fires on the second pass through the while-condition,
+    # after the slow executor has consumed more than 1 s.
+    assert outcome.stop_reason == STOP_WALL_CLOCK, (
+        f"expected STOP_WALL_CLOCK, got {outcome.stop_reason!r}"
+    )
+    # Rounds was not the limiting factor.
+    assert outcome.rounds < 10, "should have stopped long before max_rounds"
+    # At least one tool call executed (round 1 completed before the check fired).
+    assert len(outcome.executed) >= 1
+    # No open call ids — every issued call got a result.
+    assert conv.open_tool_call_ids() == set()
+
+
+# ---------------------------------------------------------------------------
+# drive_tool_loop — between-round result compaction (#197 §2)
+# ---------------------------------------------------------------------------
+
+
+def _big_execute(nbytes):
+    """execute_fn returning a large result body to push the conversation over
+    the context budget."""
+    def execute(name, args):
+        return {"tool": name, "status": "ok", "result": {"content": "Z" * nbytes}}
+    return execute
+
+
+def test_summarize_fn_folds_oldest_results_when_over_budget():
+    conv = fresh_conversation()
+    post = scripted_post(
+        [
+            openai_tool_call_response(
+                [("c1", "read_file", '{"path": "a"}'),
+                 ("c2", "read_file", '{"path": "b"}')]
+            ),
+            openai_text_response("done"),
+        ]
+    )
+    seen = []
+
+    def summarize(block):
+        seen.append(block)
+        return "DIGEST: read a and b"
+
+    # Two ~600-token results blow a 800-token budget; folding one + the digest
+    # lands back under it, so the blunt-truncate backstop never fires.
+    outcome = drive_tool_loop(
+        conv,
+        post,
+        _big_execute(2400),
+        api_format="openai",
+        model="m",
+        budgets=LoopBudgets(
+            max_conversation_tokens=800,
+            max_rounds=8,
+            max_tool_calls=10,
+            summarize_keep_newest=1,
+        ),
+        summarize_fn=summarize,
+    )
+    assert outcome.stop_reason == STOP_MODEL_DONE
+    assert seen, "summarizer should have been invoked when over budget"
+    rendered = json.dumps(conv._render_openai_messages())
+    assert "DIGEST: read a and b" in rendered
+    assert conv.open_tool_call_ids() == set()
+
+
+def test_empty_digest_falls_back_to_truncation():
+    conv = fresh_conversation()
+    post = scripted_post(
+        [
+            openai_tool_call_response(
+                [("c1", "read_file", '{"path": "a"}'),
+                 ("c2", "read_file", '{"path": "b"}')]
+            ),
+            openai_text_response("done"),
+        ]
+    )
+
+    outcome = drive_tool_loop(
+        conv,
+        post,
+        _big_execute(6000),
+        api_format="openai",
+        model="m",
+        budgets=LoopBudgets(
+            max_conversation_tokens=800,
+            truncated_result_bytes=500,
+            max_rounds=8,
+            max_tool_calls=10,
+            summarize_keep_newest=1,
+        ),
+        summarize_fn=lambda block: "",  # summarizer yields nothing usable
+    )
+    assert outcome.stop_reason == STOP_MODEL_DONE
+    # Backstop ran: the oldest result was blunt-truncated to the byte cap.
+    oldest = next(e for e in conv.events if e["kind"] == "tool_result")
+    assert len(oldest["content"].encode("utf-8")) <= 500
+
+
+def test_no_summarize_fn_truncates_as_before():
+    conv = fresh_conversation()
+    post = scripted_post(
+        [
+            openai_tool_call_response(
+                [("c1", "read_file", '{"path": "a"}'),
+                 ("c2", "read_file", '{"path": "b"}')]
+            ),
+            openai_text_response("done"),
+        ]
+    )
+
+    outcome = drive_tool_loop(
+        conv,
+        post,
+        _big_execute(6000),
+        api_format="openai",
+        model="m",
+        budgets=LoopBudgets(
+            max_conversation_tokens=800,
+            truncated_result_bytes=500,
+            max_rounds=8,
+            max_tool_calls=10,
+        ),
+        # summarize_fn defaults to None — existing truncation behavior.
+    )
+    assert outcome.stop_reason == STOP_MODEL_DONE
+    oldest = next(e for e in conv.events if e["kind"] == "tool_result")
+    assert len(oldest["content"].encode("utf-8")) <= 500
+
+
 # ---------------------------------------------------------------------------
 # drive_tool_loop — degradation and repair
 # ---------------------------------------------------------------------------
@@ -473,3 +666,36 @@ def test_hostile_tool_result_is_fenced_before_next_round():
     assert "UNTRUSTED DATA" in tool_message["content"]
     assert hostile in tool_message["content"]
     assert tool_message["content"].index("UNTRUSTED DATA") < tool_message["content"].index(hostile)
+
+
+def test_round_calls_execute_concurrently_and_in_order():
+    """A round's calls run concurrently (a Barrier(3) would deadlock/timeout if
+    they ran sequentially), and results are still applied in original call order."""
+    import threading
+
+    conv = fresh_conversation()
+    post = scripted_post(
+        [
+            openai_tool_call_response(
+                [
+                    ("c1", "read_file", '{"path": "a"}'),
+                    ("c2", "read_file", '{"path": "b"}'),
+                    ("c3", "read_file", '{"path": "c"}'),
+                ]
+            ),
+            openai_text_response("done"),
+        ]
+    )
+    barrier = threading.Barrier(3, timeout=5)
+
+    def execute(tool, args):
+        barrier.wait()  # all three must be in-flight at once, else BrokenBarrierError
+        return {"tool": tool, "status": "ok", "result": {"path": args["path"]}}
+
+    outcome = drive_tool_loop(
+        conv, post, execute, api_format="openai", model="m",
+        budgets=LoopBudgets(max_tool_calls=3),
+    )
+    assert len(outcome.executed) == 3
+    assert [e.args["path"] for e in outcome.executed] == ["a", "b", "c"]
+    assert conv.open_tool_call_ids() == set()

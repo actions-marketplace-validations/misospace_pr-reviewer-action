@@ -18,20 +18,14 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PASS=0
 FAIL=0
-check() {
-  local desc="$1" result="$2" expected="$3"
-  if [[ "$result" == "$expected" ]]; then
-    echo "  PASS: $desc"; PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (got '$result', expected '$expected')"; FAIL=$((FAIL + 1))
-  fi
-}
+# shellcheck source=_lib/assert.sh
+source "$SCRIPT_DIR/_lib/assert.sh"
 
 FUNC="$(mktemp)"
 TMP="$(mktemp -d)"
 trap 'rm -f "$FUNC"; rm -rf "$TMP"' EXIT
 
-python3 - "$ROOT_DIR/scripts/run_review.sh" "$FUNC" <<'PY'
+python3 - "$ROOT_DIR/scripts/sections/review.sh" "$FUNC" <<'PY'
 import re, sys
 src = open(sys.argv[1]).read()
 m = re.search(r"^handle_model_failure\(\) \{\n(.*?)\n\}", src, re.S | re.M)

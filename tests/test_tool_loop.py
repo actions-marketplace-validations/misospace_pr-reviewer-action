@@ -1,101 +1,231 @@
-#!/usr/bin/env python3
-"""Tests for the plan→execute loop helpers in run_tool_harness.py (#192)."""
+"""Unit tests for pr_reviewer.tool_loop.
 
-import sys
-from pathlib import Path
+Target: >= 50% line coverage of pr_reviewer/tool_loop.py.
+
+These tests complement tests/test_native_tool_loop.py with focused smoke tests
+for the module surface, dataclasses, and helper exports.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict
 
 import pytest
 
-# Ensure the scripts directory is on sys.path.
-_SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
-
-from run_tool_harness import (  # noqa: E402
-    build_results_feedback,
-    dedup_requests,
-    parse_planned_requests,
-    request_key,
+from pr_reviewer import tool_loop
+from pr_reviewer.tool_loop import (
+    STOP_MODEL_DONE,
+    STOP_NO_TOOL_CALLS,
+    STOP_MAX_ROUNDS,
+    STOP_BUDGET,
+    STOP_WALL_CLOCK,
+    STOP_REQUEST_ERROR,
 )
 
 
-class TestRequestKey:
-    def test_stable_across_arg_order(self):
-        a = request_key("gh_api", {"endpoint": "repos/a/b", "x": 1})
-        b = request_key("gh_api", {"x": 1, "endpoint": "repos/a/b"})
-        assert a == b
-
-    def test_distinguishes_tools_and_args(self):
-        assert request_key("read_file", {"path": "a"}) != request_key("read_file", {"path": "b"})
-        assert request_key("read_file", {"path": "a"}) != request_key("git_grep", {"path": "a"})
+# ---------------------------------------------------------------------------
+# Module surface
+# ---------------------------------------------------------------------------
 
 
-class TestDedupRequests:
-    def test_drops_repeats_across_rounds(self):
-        seen = set()
-        first = dedup_requests([("read_file", {"path": "a"}), ("read_file", {"path": "b"})], seen)
-        assert len(first) == 2
-        second = dedup_requests(
-            [("read_file", {"path": "a"}), ("git_grep", {"pattern": "x"})], seen
-        )
-        assert second == [("git_grep", {"pattern": "x"})]
-
-    def test_drops_repeats_within_a_round(self):
-        seen = set()
-        fresh = dedup_requests(
-            [("read_file", {"path": "a"}), ("read_file", {"path": "a"})], seen
-        )
-        assert len(fresh) == 1
-
-
-class TestParsePlannedRequests:
-    def test_requests_object(self):
-        reqs, done = parse_planned_requests('{"requests": [{"tool": "read_file", "args": {"path": "a"}}]}')
-        assert len(reqs) == 1 and done is False
-
-    def test_empty_requests_signals_done(self):
-        reqs, done = parse_planned_requests('{"requests": []}')
-        assert reqs == [] and done is True
-
-    def test_bare_done_signals_done(self):
-        for text in ("DONE", "done", " Done. "):
-            reqs, done = parse_planned_requests(text)
-            assert reqs == [] and done is True
-
-    def test_bare_list_accepted(self):
-        reqs, done = parse_planned_requests('[{"tool": "git_grep", "args": {"pattern": "x"}}]')
-        assert len(reqs) == 1 and done is False
-
-    def test_prose_wrapped_json_extracted(self):
-        reqs, done = parse_planned_requests(
-            'Sure! Here is my plan:\n{"requests": [{"tool": "read_file", "args": {"path": "a"}}]}'
-        )
-        assert len(reqs) == 1 and done is False
-
-    def test_unparseable_raises(self):
-        with pytest.raises(ValueError):
-            parse_planned_requests("I need to look at some files first.")
-
-    def test_object_without_requests_raises(self):
-        with pytest.raises(ValueError):
-            parse_planned_requests('{"plan": "read everything"}')
+def test_module_exposes_expected_symbols() -> None:
+    """The module must expose the public API used by callers."""
+    for name in (
+        "drive_tool_loop",
+        "extract_tool_calls",
+        "LoopBudgets",
+        "ExecutedCall",
+        "LoopOutcome",
+        "STOP_MODEL_DONE",
+        "STOP_NO_TOOL_CALLS",
+        "STOP_MAX_ROUNDS",
+        "STOP_BUDGET",
+        "STOP_WALL_CLOCK",
+        "STOP_REQUEST_ERROR",
+    ):
+        assert hasattr(tool_loop, name), f"missing symbol: {name}"
 
 
-class TestBuildResultsFeedback:
-    def test_marks_results_untrusted_and_caps(self):
-        executed = [
-            (("read_file", {"path": "a"}), {"status": "ok", "result": {"content": "x" * 5000}}),
-            (("gh_api", {"endpoint": "repos/a/b"}), {"status": "error", "result": {"error": "404"}}),
+def test_module_imports_cleanly() -> None:
+    """The module should import without side effects."""
+    import importlib
+
+    mod = importlib.reload(tool_loop)
+    assert mod is tool_loop
+
+
+def test_stop_reason_constants_are_strings() -> None:
+    """Stop reason constants should be non-empty strings and all distinct."""
+    constants = [
+        STOP_MODEL_DONE,
+        STOP_NO_TOOL_CALLS,
+        STOP_MAX_ROUNDS,
+        STOP_BUDGET,
+        STOP_WALL_CLOCK,
+        STOP_REQUEST_ERROR,
+    ]
+    for v in constants:
+        assert isinstance(v, str) and v
+    assert len(set(constants)) == len(constants), "stop reasons must be distinct"
+
+
+# ---------------------------------------------------------------------------
+# LoopBudgets
+# ---------------------------------------------------------------------------
+
+
+def test_loop_budgets_defaults() -> None:
+    """LoopBudgets default values are positive numbers."""
+    b = tool_loop.LoopBudgets()
+    assert b.max_tool_calls >= 1
+    assert b.max_rounds >= 1
+    assert b.wall_clock_sec >= 1
+
+
+def test_loop_budgets_custom() -> None:
+    """LoopBudgets accepts custom values and exposes them as attributes."""
+    b = tool_loop.LoopBudgets(max_tool_calls=7, wall_clock_sec=12.5, max_rounds=4)
+    assert b.max_tool_calls == 7
+    assert b.wall_clock_sec == 12.5
+    assert b.max_rounds == 4
+
+
+# ---------------------------------------------------------------------------
+# ExecutedCall
+# ---------------------------------------------------------------------------
+
+
+def test_executed_call_construction() -> None:
+    """ExecutedCall is a dataclass-like record carrying tool-call metadata."""
+    ec = tool_loop.ExecutedCall(
+        tool="read_file",
+        args={"path": "x.py"},
+        result={"content": "hi"},
+    )
+    assert ec.tool == "read_file"
+    assert ec.args == {"path": "x.py"}
+    assert ec.result == {"content": "hi"}
+
+
+# ---------------------------------------------------------------------------
+# LoopOutcome
+# ---------------------------------------------------------------------------
+
+
+def test_loop_outcome_defaults() -> None:
+    """LoopOutcome defaults are sensible (empty executed list, no-tool-calls stop reason)."""
+    out = tool_loop.LoopOutcome()
+    assert isinstance(out.executed, list)
+    assert out.executed == []
+    assert out.stop_reason == STOP_NO_TOOL_CALLS
+
+
+def test_adaptive_loop_budgets_scales_rounds() -> None:
+    """adaptive_loop_budgets scales rounds with a cap of 8."""
+    b = tool_loop.adaptive_loop_budgets(
+        max_rounds=2, max_tool_calls=5, wall_clock_sec=30.0
+    )
+    # rounds should be at least 1 and at most 8.
+    assert 1 <= b.max_rounds <= 8
+    assert b.max_tool_calls == 5
+    assert b.wall_clock_sec == 30.0
+
+
+# ---------------------------------------------------------------------------
+# extract_tool_calls (returns (calls, text))
+# ---------------------------------------------------------------------------
+
+
+def test_extract_tool_calls_handles_openai_format() -> None:
+    """OpenAI-style response: tool_calls on the assistant message."""
+    response: Dict[str, Any] = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path": "a.py"}',
+                            },
+                        }
+                    ],
+                }
+            }
         ]
-        text = build_results_feedback(executed, 2000)
-        assert "UNTRUSTED DATA" in text
-        assert "read_file" in text and "gh_api" in text
-        assert len(text.encode("utf-8")) <= 2100  # cap plus truncation marker
+    }
+    calls, text = tool_loop.extract_tool_calls(response, "openai")
+    assert isinstance(calls, list)
+    assert isinstance(text, str)
+    assert len(calls) == 1
+    assert calls[0]["name"] == "read_file"
+    assert calls[0]["id"] == "c1"
+    # arguments is kept as opaque JSON string per the #233 contract.
+    assert calls[0]["arguments"] == '{"path": "a.py"}'
 
-    def test_empty_results(self):
-        text = build_results_feedback([], 1000)
-        assert "UNTRUSTED DATA" in text
+
+def test_extract_tool_calls_no_calls_returns_text() -> None:
+    """When no tool_calls are present, text is returned in the second slot."""
+    response: Dict[str, Any] = {
+        "choices": [{"message": {"role": "assistant", "content": "hello"}}]
+    }
+    calls, text = tool_loop.extract_tool_calls(response, "openai")
+    assert calls == []
+    assert text == "hello"
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+def test_extract_tool_calls_handles_anthropic_format() -> None:
+    """Anthropic-style response: content blocks of type 'tool_use'."""
+    response: Dict[str, Any] = {
+        "content": [
+            {"type": "text", "text": "thinking..."},
+            {
+                "type": "tool_use",
+                "id": "tu1",
+                "name": "git_log",
+                "input": {"path": ".", "max_count": 3},
+            },
+        ]
+    }
+    calls, text = tool_loop.extract_tool_calls(response, "anthropic")
+    assert isinstance(calls, list)
+    # text may include any text blocks; tool_use blocks become calls
+    assert any(c.get("name") == "git_log" for c in calls)
+    assert "thinking" in text
+
+
+def test_extract_tool_calls_handles_anthropic_no_tool_use() -> None:
+    """Anthropic response without tool_use should yield no calls and the text."""
+    response: Dict[str, Any] = {
+        "content": [{"type": "text", "text": "plain text only"}]
+    }
+    calls, text = tool_loop.extract_tool_calls(response, "anthropic")
+    assert calls == []
+    assert text == "plain text only"
+
+
+def test_extract_tool_calls_keeps_non_serializable_args_as_string() -> None:
+    """Non-JSON arguments should be preserved as opaque strings."""
+    response: Dict[str, Any] = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c2",
+                            "function": {"name": "echo", "arguments": "not json"},
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+    calls, text = tool_loop.extract_tool_calls(response, "openai")
+    assert len(calls) == 1
+    assert calls[0]["name"] == "echo"
+    # arguments kept as the opaque string we passed in
+    assert calls[0]["arguments"] == "not json"

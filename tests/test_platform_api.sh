@@ -11,19 +11,14 @@ if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
   exit 0
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+_TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$_TEST_DIR/.." && pwd)"
 SEAM="$SCRIPT_DIR/scripts/platform_api.sh"
 
 PASS=0
 FAIL=0
-check() {
-  local desc="$1" result="$2" expected="$3"
-  if [[ "$result" == "$expected" ]]; then
-    echo "  PASS: $desc"; PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (got '$result', expected '$expected')"; FAIL=$((FAIL + 1))
-  fi
-}
+# shellcheck source=_lib/assert.sh
+source "$_TEST_DIR/_lib/assert.sh"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -105,6 +100,11 @@ check "platform_review_native approve" \
 check "platform_review_native request changes" \
   "$(run_seam github "" 'platform_review_native o/r 7 REQUEST_CHANGES body.md')" \
   "gh pr review 7 --repo o/r --request-changes --body-file body.md"
+check "platform_review_native comment" \
+  "$(run_seam github "" 'platform_review_native o/r 7 COMMENT body.md')" \
+  "gh pr review 7 --repo o/r --comment --body-file body.md"
+RESULT="$(run_seam github "" 'platform_review_native o/r 7 BOGUS body.md')"
+check_contains "platform_review_native rejects unknown events" "$RESULT" "Unsupported native review event"
 check "platform_review_dismiss" \
   "$(run_seam github "" 'platform_review_dismiss o/r 7 55 superseded')" \
   "gh api repos/o/r/pulls/7/reviews/55/dismissals --method PUT -f message=superseded --jq .id"
@@ -117,9 +117,48 @@ check "platform_check_runs" \
 check "platform_commit_status" \
   "$(run_seam github "" 'platform_commit_status o/r abc123')" \
   "gh api repos/o/r/commits/abc123/status"
+
+# platform_external_checks — the single CI normalization seam (issue #373).
+# Override the two raw fetchers with fixed JSON so the merge/normalize/exclude
+# logic is asserted in isolation from the network.
+check "external_checks normalizes a completed check run to success" \
+  "$(run_seam github "" 'platform_check_runs(){ echo "{\"check_runs\":[{\"name\":\"build\",\"status\":\"completed\",\"conclusion\":\"success\"}]}"; }; platform_commit_status(){ echo "{}"; }; platform_external_checks o/r abc')" \
+  '[{"name":"build","state":"success"}]'
+check "external_checks excludes our own workflow run by GITHUB_RUN_ID" \
+  "$(run_seam github "" 'platform_check_runs(){ echo "{\"check_runs\":[{\"name\":\"ai-review\",\"status\":\"in_progress\",\"details_url\":\"https://x/runs/999/job/1\"},{\"name\":\"build\",\"status\":\"completed\",\"conclusion\":\"success\",\"details_url\":\"https://x/runs/555/job/2\"}]}"; }; platform_commit_status(){ echo "{}"; }; GITHUB_RUN_ID=999 platform_external_checks o/r abc')" \
+  '[{"name":"build","state":"success"}]'
+check "external_checks excludes our own commit-status context by name" \
+  "$(run_seam github "" 'platform_check_runs(){ echo "{\"check_runs\":[]}"; }; platform_commit_status(){ echo "{\"state\":\"success\",\"total_count\":2,\"statuses\":[{\"context\":\"pr-reviewer-action\",\"state\":\"pending\"},{\"context\":\"lint\",\"state\":\"success\"}]}"; }; CI_STATUS_CONTEXT=pr-reviewer-action platform_external_checks o/r abc')" \
+  '[{"name":"lint","state":"success"}]'
+check "external_checks maps a failed commit status to failure" \
+  "$(run_seam github "" 'platform_check_runs(){ echo "{\"check_runs\":[]}"; }; platform_commit_status(){ echo "{\"state\":\"failure\",\"total_count\":1,\"statuses\":[{\"context\":\"test\",\"state\":\"failure\"}]}"; }; CI_STATUS_CONTEXT=pr-reviewer-action platform_external_checks o/r abc')" \
+  '[{"name":"test","state":"failure"}]'
+check "external_checks falls back to the aggregate combined state (no per-status detail)" \
+  "$(run_seam github "" 'platform_check_runs(){ echo "{\"check_runs\":[]}"; }; platform_commit_status(){ echo "{\"state\":\"failure\",\"total_count\":2}"; }; platform_external_checks o/r abc')" \
+  '[{"name":"(combined)","state":"failure"}]'
+check "external_checks: own failed context does not gate when externals pass" \
+  "$(run_seam github "" 'platform_check_runs(){ echo "{\"check_runs\":[]}"; }; platform_commit_status(){ echo "{\"state\":\"failure\",\"total_count\":2,\"statuses\":[{\"context\":\"pr-reviewer-action\",\"state\":\"failure\"},{\"context\":\"lint\",\"state\":\"success\"}]}"; }; CI_STATUS_CONTEXT=pr-reviewer-action platform_external_checks o/r abc')" \
+  '[{"name":"lint","state":"success"}]'
+check "external_checks emits an empty array when nothing is external" \
+  "$(run_seam github "" 'platform_check_runs(){ echo "{\"check_runs\":[]}"; }; platform_commit_status(){ echo "{\"state\":\"pending\",\"total_count\":0}"; }; platform_external_checks o/r abc')" \
+  '[]'
 check "github_enrich_api passthrough" \
   "$(run_seam github "" 'github_enrich_api repos/up/stream/releases?per_page=8')" \
   "gh api repos/up/stream/releases?per_page=8"
+# Forge enrichment helpers dispatch to the backend CLI for any host.
+check "forgejo_enrich_release dispatches to backend cli" \
+  "$(run_seam github "" 'python3(){ echo "py $*"; }; forgejo_enrich_release codeberg.org o/r v1')" \
+  "py -m pr_reviewer.forgejo_backend enrich-release codeberg.org o/r v1"
+check "forgejo_enrich_compare dispatches to backend cli" \
+  "$(run_seam github "" 'python3(){ echo "py $*"; }; forgejo_enrich_compare codeberg.org o/r a...b')" \
+  "py -m pr_reviewer.forgejo_backend enrich-compare codeberg.org o/r a...b"
+
+check "forgejo backend falls back from GITHUB_TOKEN to GH_TOKEN" \
+  "$(FORGEJO_API_URL= GITHUB_TOKEN= GH_TOKEN=from-gh python3 - <<'PYEOF'
+import pr_reviewer.forgejo_backend as fb
+print(fb.FORGEJO_TOKEN)
+PYEOF
+)" "from-gh"
 
 echo ""
 echo "=== forgejo mode: loud failures, no silent fallthrough ==="
@@ -129,6 +168,30 @@ check "forgejo without FORGEJO_API_URL fails loudly" \
 RESULT="$(run_seam forgejo "" 'platform_graphql -f query=Q')"
 check "unimplemented forgejo op names itself" \
   "$(echo "$RESULT" | grep -c "not yet implemented")" "1"
+RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "forgejo $*"; }; platform_compare o/r aaa...bbb' "https://forgejo.example.com")"
+check "forgejo compare uses backend cli" "$RESULT" "forgejo compare o/r aaa...bbb"
+check "platform_authenticated_repo_permission is unknown on github" \
+  "$(run_seam github "" 'platform_authenticated_repo_permission o/r')" \
+  "unknown"
+RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "forgejo $*"; }; platform_authenticated_repo_permission o/r' "https://forgejo.example.com")"
+check "forgejo permission preflight uses backend cli" "$RESULT" "forgejo repo-permission o/r"
+# --jq passthrough: the forgejo path applies a trailing --jq to the backend's
+# JSON, mirroring `gh api --jq`, so one call site works on either platform.
+RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "{\"total_commits\":3}"; }; platform_compare o/r aaa...bbb --jq .total_commits' "https://forgejo.example.com")"
+check "forgejo compare --jq projects a present field" "$RESULT" "3"
+RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "{\"head\":{\"sha\":\"deadbeef\"}}"; }; platform_pr_get o/r 7 --jq .head.sha' "https://forgejo.example.com")"
+check "forgejo pr_get --jq projects a nested field" "$RESULT" "deadbeef"
+# Documented divergence: Forgejo's compare omits .url, so jq -r yields "null".
+RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "{\"total_commits\":3}"; }; platform_compare o/r aaa...bbb --jq .url' "https://forgejo.example.com")"
+check "forgejo compare --jq on an absent field yields null" "$RESULT" "null"
+RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "forgejo $*"; }; platform_pr_reviews o/r 7' "https://forgejo.example.com")"
+check "forgejo pr reviews uses backend cli" "$RESULT" "forgejo list-pr-reviews o/r 7"
+RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "forgejo $*"; }; platform_review_create_json o/r 7 req.json' "https://forgejo.example.com")"
+check "forgejo create review uses backend cli" "$RESULT" "forgejo create-review-json o/r 7 req.json"
+RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "forgejo $*"; }; platform_review_native o/r 7 APPROVE body.md' "https://forgejo.example.com")"
+check "forgejo native review uses backend cli" "$RESULT" "forgejo create-native-review o/r 7 APPROVE body.md"
+RESULT="$(run_seam forgejo "" '_forgejo_py(){ echo "forgejo $*"; }; platform_review_dismiss o/r 7 55 superseded' "https://forgejo.example.com")"
+check "forgejo dismiss review uses backend cli" "$RESULT" "forgejo dismiss-review o/r 7 55 superseded"
 RESULT="$(run_seam forgejo "" 'platform_check_runs o/r abc')"
 check "forgejo check_runs returns empty structure (exit 0)" \
   "$( (export PLATFORM=forgejo; unset _PLATFORM_API_SOURCED; source "$SEAM"; platform_check_runs o/r abc >/dev/null 2>&1 && echo 0 || echo 1) )" "0"

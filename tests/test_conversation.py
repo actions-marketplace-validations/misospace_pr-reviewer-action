@@ -13,9 +13,10 @@ sys.path.insert(0, str(_REPO_ROOT))
 from pr_reviewer.conversation import (  # noqa: E402
     APPROX_BYTES_PER_TOKEN,
     TOOL_SCHEMAS,
+    VERDICT_DEDUP_NOTICE,
     WEB_SEARCH_SCHEMA,
     Conversation,
-    normalize_assistant_tool_calls_openai,
+    dedupe_verdict_corpus,
     truncate_text,
 )
 
@@ -33,6 +34,8 @@ class TestToolSchemas:
             "read_file",
             "web_fetch",
             "git_grep",
+            "git_log",
+            "git_blame",
             "run_command",
         }
 
@@ -95,6 +98,75 @@ class TestWebSearchGating:
         assert "tools" not in payload
 
 
+class TestTokensParam:
+    """tokens_param mirrors the bash review path: newer OpenAI models reject
+    max_tokens and require max_completion_tokens (AI_TOKENS_PARAM)."""
+
+    def test_default_is_max_tokens(self):
+        payload = Conversation(system="s").to_request_payload("openai", "m", max_tokens=64)
+        assert payload["max_tokens"] == 64
+        assert "max_completion_tokens" not in payload
+
+    def test_openai_honors_max_completion_tokens(self):
+        payload = Conversation(system="s").to_request_payload(
+            "openai", "m", max_tokens=64, tokens_param="max_completion_tokens"
+        )
+        assert payload["max_completion_tokens"] == 64
+        assert "max_tokens" not in payload
+
+    def test_unknown_param_falls_back_to_max_tokens(self):
+        payload = Conversation(system="s").to_request_payload(
+            "openai", "m", max_tokens=64, tokens_param="bogus"
+        )
+        assert payload["max_tokens"] == 64
+
+    def test_anthropic_always_uses_max_tokens(self):
+        # The Anthropic API has no max_completion_tokens; the param is ignored.
+        payload = Conversation(system="s").to_request_payload(
+            "anthropic", "m", max_tokens=64, tokens_param="max_completion_tokens"
+        )
+        assert payload["max_tokens"] == 64
+        assert "max_completion_tokens" not in payload
+
+
+class TestAnthropicCachePrefix:
+    """Anthropic prompt caching is opt-in (#263 Part 2): cache_control markers
+    on the stable prefix (system + tools). Default off — unchanged wire shape."""
+
+    def test_default_system_is_plain_string(self):
+        payload = Conversation(system="s").to_request_payload("anthropic", "m", max_tokens=64)
+        assert payload["system"] == "s"
+        assert all("cache_control" not in t for t in payload["tools"])
+
+    def test_cache_prefix_marks_system_and_last_tool(self):
+        payload = Conversation(system="s").to_request_payload(
+            "anthropic", "m", max_tokens=64, cache_prefix=True
+        )
+        assert payload["system"] == [
+            {"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}
+        ]
+        # Exactly one tools breakpoint, on the last tool.
+        marked = [t for t in payload["tools"] if "cache_control" in t]
+        assert len(marked) == 1 and marked[0] is payload["tools"][-1]
+
+    def test_cache_prefix_is_noop_for_openai(self):
+        # OpenAI caches the prefix automatically; no markers, no shape change.
+        payload = Conversation(system="s").to_request_payload(
+            "openai", "m", max_tokens=64, cache_prefix=True
+        )
+        assert isinstance(payload["messages"][0]["content"], str)
+        assert all("cache_control" not in t for t in payload["tools"])
+
+    def test_cache_prefix_verdict_turn_marks_system_only(self):
+        # The verdict turn drops tools, so only the system block is marked.
+        payload = Conversation(system="s").to_request_payload(
+            "anthropic", "m", max_tokens=64, verdict_turn=True, cache_prefix=True
+        )
+        assert "tools" not in payload
+        assert isinstance(payload["system"], list)
+        assert payload["system"][0]["cache_control"] == {"type": "ephemeral"}
+
+
 class TestTruncateText:
     def test_no_truncation_under_limit(self):
         out, truncated = truncate_text("hello\nworld", 100)
@@ -148,8 +220,17 @@ class TestTruncateText:
         assert len(out.encode("utf-8")) <= 50
 
 
-class TestNormalizeAssistantToolCalls:
-    def test_passes_through_well_formed_calls(self):
+class TestAddAssistantToolCallsNormalization:
+    """The ingest-boundary coercion lives in add_assistant_tool_calls; the
+    OpenAI renderer emits the stored {"id", "name", "arguments"} form directly."""
+
+    @staticmethod
+    def _ingest(calls):
+        c = Conversation()
+        c.add_assistant_tool_calls(calls)
+        return c.events[-1]["calls"] if c.events else []
+
+    def test_accepts_openai_nested_form(self):
         calls = [
             {
                 "id": "call_1",
@@ -157,12 +238,11 @@ class TestNormalizeAssistantToolCalls:
                 "function": {"name": "read_file", "arguments": '{"path": "x"}'},
             }
         ]
-        out = normalize_assistant_tool_calls_openai(calls)
+        out = self._ingest(calls)
         assert len(out) == 1
         assert out[0]["id"] == "call_1"
-        assert out[0]["type"] == "function"
-        assert out[0]["function"]["name"] == "read_file"
-        assert out[0]["function"]["arguments"] == '{"path": "x"}'
+        assert out[0]["name"] == "read_file"
+        assert out[0]["arguments"] == '{"path": "x"}'
 
     def test_accepts_dict_arguments_at_ingest_boundary(self):
         # Dict arguments (e.g. from a non-reassembler caller) are serialised
@@ -170,8 +250,8 @@ class TestNormalizeAssistantToolCalls:
         # round-trip property matters most: a string input must come back
         # unchanged.
         calls = [{"id": "call_1", "name": "git_grep", "arguments": {"pattern": "x"}}]
-        out = normalize_assistant_tool_calls_openai(calls)
-        assert out[0]["function"]["arguments"] == '{"pattern": "x"}'
+        out = self._ingest(calls)
+        assert out[0]["arguments"] == '{"pattern": "x"}'
 
     def test_preserves_string_arguments_verbatim(self):
         # The reassembler hands us a string — preserve it byte-for-byte so
@@ -183,16 +263,16 @@ class TestNormalizeAssistantToolCalls:
                 "function": {"name": "x", "arguments": '{"pattern":'},
             }
         ]
-        out = normalize_assistant_tool_calls_openai(calls)
-        assert out[0]["function"]["arguments"] == '{"pattern":'
+        out = self._ingest(calls)
+        assert out[0]["arguments"] == '{"pattern":'
 
     def test_drops_calls_missing_id(self):
         calls = [{"function": {"name": "read_file", "arguments": "{}"}}]
-        assert normalize_assistant_tool_calls_openai(calls) == []
+        assert self._ingest(calls) == []
 
     def test_drops_calls_missing_name(self):
         calls = [{"id": "call_1", "function": {"arguments": "{}"}}]
-        assert normalize_assistant_tool_calls_openai(calls) == []
+        assert self._ingest(calls) == []
 
     def test_drops_non_dict_entries(self):
         calls = [
@@ -201,8 +281,24 @@ class TestNormalizeAssistantToolCalls:
             42,
             {"id": "call_1", "function": {"name": "x", "arguments": "{}"}},
         ]
-        out = normalize_assistant_tool_calls_openai(calls)
+        out = self._ingest(calls)
         assert len(out) == 1
+
+    def test_renders_openai_nested_form(self):
+        c = Conversation()
+        c.add_assistant_tool_calls(
+            [{"id": "call_1", "name": "read_file", "arguments": '{"path": "x"}'}]
+        )
+        msg = c._render_openai_messages()[-1]
+        assert msg["role"] == "assistant"
+        assert msg["content"] is None
+        assert msg["tool_calls"] == [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path": "x"}'},
+            }
+        ]
 
 
 class TestConversationIntrospection:
@@ -285,6 +381,67 @@ class TestConversationOverflow:
             e for e in c.events if e["kind"] == "tool_result" and e["call_id"] == "new"
         )
         assert new_event["content"] == "short"
+
+
+class TestConversationSummarize:
+    """summarize_oldest_tool_results: fold old results into one model digest
+    while keeping the newest verbatim and preserving wire validity (#197 §2)."""
+
+    def _conv_with_results(self, n):
+        c = Conversation()
+        c.add_assistant_tool_calls(
+            [{"id": f"c{i}", "name": "read_file", "arguments": "{}"} for i in range(n)]
+        )
+        for i in range(n):
+            c.add_tool_result(f"c{i}", f"result body {i} " + "z" * 100)
+        return c
+
+    def test_folds_old_results_keeps_newest_verbatim(self):
+        c = self._conv_with_results(4)
+        seen = {}
+
+        def summarize(block):
+            seen["block"] = block
+            return "- digest of earlier reads"
+
+        folded = c.summarize_oldest_tool_results(summarize, keep_newest=2)
+        assert folded == 2  # c0, c1 folded; c2, c3 kept
+        results = [e for e in c.events if e["kind"] == "tool_result"]
+        # Oldest carries the digest; the next folded one is a pointer.
+        assert results[0]["content"].startswith("Condensed digest of earlier")
+        assert "- digest of earlier reads" in results[0]["content"]
+        assert results[1]["content"] == "[folded into the condensed digest above]"
+        # Newest two are byte-for-byte intact.
+        assert results[2]["content"] == "result body 2 " + "z" * 100
+        assert results[3]["content"] == "result body 3 " + "z" * 100
+        # The summarizer saw every folded result's body.
+        assert "result body 0" in seen["block"] and "result body 1" in seen["block"]
+        # call_id ↔ result pairing preserved (wire validity).
+        assert c.open_tool_call_ids() == set()
+
+    def test_idempotent_skips_already_folded(self):
+        c = self._conv_with_results(4)
+        c.summarize_oldest_tool_results(lambda b: "digest one", keep_newest=2)
+        # A second pass with the same window has nothing new to fold.
+        calls = []
+        folded = c.summarize_oldest_tool_results(
+            lambda b: calls.append(b) or "digest two", keep_newest=2
+        )
+        assert folded == 0
+        assert calls == []  # summarizer not even invoked
+
+    def test_empty_digest_returns_zero_and_no_change(self):
+        c = self._conv_with_results(3)
+        before = [e["content"] for e in c.events if e["kind"] == "tool_result"]
+        folded = c.summarize_oldest_tool_results(lambda b: "   ", keep_newest=1)
+        assert folded == 0
+        after = [e["content"] for e in c.events if e["kind"] == "tool_result"]
+        assert before == after
+
+    def test_too_few_results_to_fold(self):
+        c = self._conv_with_results(2)
+        folded = c.summarize_oldest_tool_results(lambda b: "x", keep_newest=2)
+        assert folded == 0
 
 
 class TestOpenAIPayload:
@@ -667,6 +824,80 @@ class TestReassemblerShapeIngest:
         )
         events = [e for e in c.events if e["kind"] == "assistant_tool_calls"]
         assert events[0]["calls"][0]["name"] == "git_grep"
+
+
+class TestDedupeVerdictCorpus:
+    """dedupe_verdict_corpus (#372): drop only byte-identical corpus sections
+    that already appear verbatim in the planning context; keep everything else
+    in full so the #362 "full corpus reaches the model" invariant survives."""
+
+    def test_identical_section_is_dropped_with_placeholder(self):
+        section = "# Version Hints from Diff\n```text\nimg: app-1.2.3\n```"
+        planning = "# PR Classification\n{}\n\n" + section
+        corpus = (
+            "# PR Diff (truncated)\n```diff\n+full diff here\n```\n\n"
+            + section
+            + "\n"
+        )
+        out = dedupe_verdict_corpus(corpus, planning)
+        # The duplicate section collapses to a placeholder...
+        assert VERDICT_DEDUP_NOTICE in out
+        assert "## Version Hints from Diff" in out
+        assert "img: app-1.2.3" not in out
+        # ...while a section absent from the planning context is kept in full.
+        assert "+full diff here" in out
+
+    def test_truncated_partial_section_kept_in_full(self):
+        # The planner sends only a HEAD excerpt of the diff; the corpus carries
+        # the full diff. Partial overlap must NEVER count as a match.
+        planning = "# PR Diff (head)\n```diff\n+line one\n```"
+        corpus = "# PR Diff (truncated)\n```diff\n+line one\n+line two\n+line three\n```\n"
+        out = dedupe_verdict_corpus(corpus, planning)
+        assert out == corpus
+        assert VERDICT_DEDUP_NOTICE not in out
+
+    def test_zero_overlap_returns_input_unchanged(self):
+        corpus = "# A\nalpha\n\n# B\nbeta\n"
+        assert dedupe_verdict_corpus(corpus, "nothing in common here") == corpus
+
+    def test_empty_corpus_and_empty_planning(self):
+        assert dedupe_verdict_corpus("", "planning") == ""
+        assert dedupe_verdict_corpus("# A\nbody", "") == "# A\nbody"
+
+    def test_headerless_corpus_round_trips(self):
+        blob = "just some text\nwith no level-1 headers\n## not level 1\n"
+        assert dedupe_verdict_corpus(blob, blob) == blob
+
+    def test_subheaders_do_not_split_sections(self):
+        # "## Source N" inside a section must not be treated as a delimiter: the
+        # whole "# Linked Sources" section matches as one unit.
+        section = "# Linked Sources\n## Source 1\nURL: https://x\n### Fetched\nbody"
+        planning = "prefix\n\n" + section + "\n\nsuffix"
+        out = dedupe_verdict_corpus(section + "\n", planning)
+        assert out.count("## Source 1") == 0  # collapsed, not split out
+        assert VERDICT_DEDUP_NOTICE in out
+        assert out.startswith("## Linked Sources")
+
+    def test_section_order_preserved_for_kept_sections(self):
+        s_dup = "# Version Hints from Diff\n```text\nv1\n```"
+        corpus = (
+            "# First\nfirst body\n\n"
+            + s_dup
+            + "\n\n# Last\nlast body\n"
+        )
+        out = dedupe_verdict_corpus(corpus, "planning ... " + s_dup + " ... more")
+        # Kept sections keep their relative order; the middle one collapsed.
+        assert out.index("# First") < out.index("## Version Hints from Diff")
+        assert out.index("## Version Hints from Diff") < out.index("# Last")
+
+    def test_trailing_whitespace_tolerated(self):
+        # The corpus section has trailing blank lines the planning copy lacks;
+        # they must not defeat the match ("modulo trailing whitespace").
+        section = "# Evidence Providers\nbody line"
+        corpus = section + "\n\n\n"
+        planning = "x\n" + section + "\ny"
+        out = dedupe_verdict_corpus(corpus, planning)
+        assert VERDICT_DEDUP_NOTICE in out
 
 
 if __name__ == "__main__":

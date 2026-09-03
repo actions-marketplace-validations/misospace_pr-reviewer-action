@@ -23,17 +23,8 @@ PRECHECK_SCRIPT="$ROOT_DIR/scripts/check_review_needed.sh"
 
 PASS=0
 FAIL=0
-
-check() {
-  local desc="$1" result="$2" expected="$3"
-  if [[ "$result" == "$expected" ]]; then
-    echo "  PASS: $desc"
-    PASS=$((PASS + 1))
-  else
-    echo "  FAIL: $desc (got '$result', expected '$expected')"
-    FAIL=$((FAIL + 1))
-  fi
-}
+# shellcheck source=_lib/assert.sh
+source "$SCRIPT_DIR/_lib/assert.sh"
 
 # ── Setup ─────────────────────────────────────────────────────────────
 TMPDIR="$(mktemp -d)"
@@ -71,6 +62,30 @@ exit 0
 SHELLEOF
 chmod +x "$TMPDIR/bin/gh"
 
+# Scoped python3 shim for forgejo-mode tests: intercept only the forgejo
+# backend CLI (whose subcommands would otherwise hit the network) and delegate
+# every other python3 invocation to the real interpreter.
+REAL_PYTHON3="$(command -v python3)"
+export REAL_PYTHON3
+cat > "$TMPDIR/bin/python3" <<'SHELLEOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-m" && "${2:-}" == "pr_reviewer.forgejo_backend" ]]; then
+  case "${3:-}" in
+    list-comments|list-pr-reviews) printf '[]\n' ;;
+    get-pr-diff) cat /tmp/testfp_diff ;;
+    get-pr-metadata) cat /tmp/testfp_pr_object.json ;;
+    repo-permission)
+      printf '%s\n' "${TEST_FORGEJO_PERMISSION:-none}"
+      [[ "${TEST_FORGEJO_PERMISSION:-none}" != "none" ]]
+      ;;
+    *) echo "unexpected forgejo backend command: ${3:-}" >&2; exit 1 ;;
+  esac
+  exit $?
+fi
+exec "$REAL_PYTHON3" "$@"
+SHELLEOF
+chmod +x "$TMPDIR/bin/python3"
+
 cat > /tmp/testfp_pr_object.json <<'JSONEOF'
 {
   "number": 42,
@@ -90,6 +105,9 @@ run_precheck() {
   (
     cd "$WORKDIR" || exit 1
     PATH="$TMPDIR/bin:$PATH" \
+    PLATFORM="${PLATFORM:-}" \
+    FORGEJO_API_URL="${FORGEJO_API_URL:-}" \
+    GITHUB_SERVER_URL="${GITHUB_SERVER_URL:-}" \
     REPO="test/repo" \
     PR_NUMBER=42 \
     GITHUB_OUTPUT="$output_file" \
@@ -103,6 +121,10 @@ run_precheck() {
     STANDARDS_FILE="${STANDARDS_FILE:-}" \
     STANDARDS_FILE_CANDIDATES="${STANDARDS_FILE_CANDIDATES:-AGENTS.md,agents.md,CLAUDE.md}" \
     CONTEXT_LIMIT_MODE="${CONTEXT_LIMIT_MODE:-normal}" \
+    LINEAR_API_KEY_CONFIGURED="${LINEAR_API_KEY_CONFIGURED:-false}" \
+    LINEAR_ISSUE_PREFIXES="${LINEAR_ISSUE_PREFIXES:-}" \
+    LINEAR_ISSUE_TIMEOUT_SEC="${LINEAR_ISSUE_TIMEOUT_SEC:-20}" \
+    LINEAR_ENABLE_FOR_FORKS="${LINEAR_ENABLE_FOR_FORKS:-false}" \
     EVIDENCE_PROVIDERS_FILE="${EVIDENCE_PROVIDERS_FILE:-}" \
     EVIDENCE_PROVIDER_TIMEOUT_SEC="${EVIDENCE_PROVIDER_TIMEOUT_SEC:-30}" \
     EVIDENCE_PROVIDER_MAX_OUTPUT_BYTES="${EVIDENCE_PROVIDER_MAX_OUTPUT_BYTES:-20000}" \
@@ -124,6 +146,7 @@ run_precheck() {
     REREVIEW_LABEL="${REREVIEW_LABEL:-ai-review}" \
     GITHUB_EVENT_NAME="${GITHUB_EVENT_NAME:-}" \
     GITHUB_EVENT_PATH="${GITHUB_EVENT_PATH:-}" \
+    EVENT_HEAD_SHA="${EVENT_HEAD_SHA:-}" \
     COMMENT_MARKER="${COMMENT_MARKER:-<!-- ai-pr-reviewer -->}" \
     PUBLISH_MODE="${PUBLISH_MODE:-comment}" \
     bash "$PRECHECK_SCRIPT"
@@ -212,6 +235,15 @@ echo ""
 echo "=== Test 5: Changed tool mode triggers fresh review ==="
 ACTION_REF="v1.0.0" AI_MODEL="gpt-4" AI_API_FORMAT="openai" CONTEXT_LIMIT_MODE="normal" TOOL_MODE="plan_execute_once" SKIP_IF_DIFF_UNCHANGED=true RESULT="$(run_precheck)"
 check "should_review=true when tool_mode changed" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+
+# ── Test 5b: Enabling optional Linear context changes fingerprint ─────
+echo ""
+echo "=== Test 5b: Enabling Linear context triggers fresh review ==="
+LINEAR_API_KEY_CONFIGURED=true
+LINEAR_ISSUE_PREFIXES=LAB
+RESULT="$(run_precheck)"
+check "should_review=true when Linear context enabled" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+unset LINEAR_API_KEY_CONFIGURED LINEAR_ISSUE_PREFIXES
 
 # ── Test 6: skip_if_diff_unchanged=false → always review ─────────────
 echo ""
@@ -361,6 +393,154 @@ PULLS_FETCHES="$(grep -c 'api repos/test/repo/pulls/42$' /tmp/testfp_gh_calls.lo
 check "PR object fetched exactly once" "$PULLS_FETCHES" "1"
 DIFF_FETCHES="$(grep -c '^pr diff' /tmp/testfp_gh_calls.log || true)"
 check "diff fetched exactly once" "$DIFF_FETCHES" "1"
+
+# ── Test 15: fork PR (different head repo) → is_fork_pr=true ──────────
+echo ""
+echo "=== Test 15: cross-repo (fork) PR → is_fork_pr=true ==="
+cat > /tmp/testfp_pr_object.json <<'JSONEOF'
+{
+  "number": 42,
+  "head": {"sha": "aaaa111122223333aaaa111122223333aaaa1111", "ref": "feature", "repo": {"full_name": "attacker/repo"}},
+  "base": {"sha": "bbbb111122223333bbbb111122223333bbbb1111", "ref": "main", "repo": {"full_name": "test/repo"}}
+}
+JSONEOF
+set_empty_comments
+RESULT="$(run_precheck)"
+check "fork PR forwards is_fork_pr=true" "$(echo "$RESULT" | grep '^is_fork_pr=' | head -1 | cut -d= -f2)" "true"
+
+# ── Test 16: missing head.repo → fail closed (treated as fork) ───────
+echo ""
+echo "=== Test 16: missing head.repo metadata → is_fork_pr=true (fail closed) ==="
+cat > /tmp/testfp_pr_object.json <<'JSONEOF'
+{
+  "number": 42,
+  "head": {"sha": "aaaa111122223333aaaa111122223333aaaa1111", "ref": "feature"},
+  "base": {"sha": "bbbb111122223333bbbb111122223333bbbb1111", "ref": "main", "repo": {"full_name": "test/repo"}}
+}
+JSONEOF
+set_empty_comments
+RESULT="$(run_precheck)"
+check "missing head.repo fails closed to is_fork_pr=true" "$(echo "$RESULT" | grep '^is_fork_pr=' | head -1 | cut -d= -f2)" "true"
+
+# ── Test 17: degraded/empty PR object → fail closed ──────────────────
+echo ""
+echo "=== Test 17: empty PR object (degraded fetch) → is_fork_pr=true (fail closed) ==="
+cat > /tmp/testfp_pr_object.json <<'JSONEOF'
+{}
+JSONEOF
+set_empty_comments
+RESULT="$(run_precheck)"
+check "empty PR object fails closed to is_fork_pr=true" "$(echo "$RESULT" | grep '^is_fork_pr=' | head -1 | cut -d= -f2)" "true"
+
+# Restore the default same-repo PR object for any later additions.
+cat > /tmp/testfp_pr_object.json <<'JSONEOF'
+{
+  "number": 42,
+  "head": {"sha": "aaaa111122223333aaaa111122223333aaaa1111", "ref": "feature", "repo": {"full_name": "test/repo"}},
+  "base": {"sha": "bbbb111122223333bbbb111122223333bbbb1111", "ref": "main", "repo": {"full_name": "test/repo"}}
+}
+JSONEOF
+
+# ── Test 18: precheck emits resolved platform outputs (#367) ──────────
+echo ""
+echo "=== Test 18: platform resolution outputs on the review path ==="
+set_empty_comments
+unset PLATFORM FORGEJO_API_URL GITHUB_SERVER_URL 2>/dev/null || true
+RESULT="$(run_precheck)"
+check "resolved_platform=github by default" "$(echo "$RESULT" | grep '^resolved_platform=' | head -1 | cut -d= -f2)" "github"
+check "effective_forgejo_api_url empty on github" "$(echo "$RESULT" | grep '^effective_forgejo_api_url=' | head -1 | cut -d= -f2-)" ""
+
+# PLATFORM=github must win even when FORGEJO_API_URL is force-filled — the
+# exact seam that used to disagree between the shell path and forgejo_backend.
+PLATFORM=github FORGEJO_API_URL="https://forge.example.com" RESULT="$(run_precheck)"
+check "PLATFORM=github forces github despite FORGEJO_API_URL" "$(echo "$RESULT" | grep '^resolved_platform=' | head -1 | cut -d= -f2)" "github"
+check "effective_forgejo_api_url empty when forced github" "$(echo "$RESULT" | grep '^effective_forgejo_api_url=' | head -1 | cut -d= -f2-)" ""
+
+# Test 19: forgejo resolution is emitted even on the label-skip early exit
+# (no PR fetch / network) — resolution is pure env.
+echo ""
+echo "=== Test 19: forgejo resolution on the unrelated-label early exit ==="
+printf '%s' '{"action":"labeled","label":{"name":"bug"}}' > "$TMPDIR/event-other.json"
+RESULT="$(PLATFORM=auto FORGEJO_API_URL="https://forge.example.com" GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH="$TMPDIR/event-other.json" run_precheck)"
+check "unrelated-label path still emits should_review=false" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "false"
+check "auto+FORGEJO_API_URL resolves to forgejo" "$(echo "$RESULT" | grep '^resolved_platform=' | head -1 | cut -d= -f2)" "forgejo"
+check "effective_forgejo_api_url forwarded when forgejo" "$(echo "$RESULT" | grep '^effective_forgejo_api_url=' | head -1 | cut -d= -f2-)" "https://forge.example.com"
+
+# Test 20: a queued synchronize event for an old head is skipped before any
+# model spend — the current PR head has moved on.
+echo ""
+echo "=== Test 20: superseded event head skips the review ==="
+set_empty_comments
+RESULT="$(EVENT_HEAD_SHA="cccc111122223333cccc111122223333cccc1111" run_precheck)"
+check "superseded head skips review" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "false"
+check "superseded head has explicit skip reason" "$(echo "$RESULT" | grep '^skip_reason=' | head -1 | cut -d= -f2)" "superseded-head"
+check "superseded head still forwards the current head" "$(echo "$RESULT" | grep '^head_sha=' | head -1 | cut -d= -f2)" "aaaa111122223333aaaa111122223333aaaa1111"
+
+echo ""
+echo "=== Test 20b: matching event head still reviews ==="
+RESULT="$(EVENT_HEAD_SHA="aaaa111122223333aaaa111122223333aaaa1111" run_precheck)"
+check "matching event head reviews" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+
+# Tests 21-23: Forgejo permission preflight (issue #453). Every supported
+# publish mode needs repository write access, and Forgejo exposes the
+# authenticated user's effective permission — fail before model spend when
+# the token cannot publish. GitHub mode is not gated (permissions there are
+# unit-scoped and not inferable from the coarse repo permission).
+echo ""
+echo "=== Test 21: Forgejo read-only token fails before model use ==="
+set_empty_comments
+if PLATFORM=forgejo FORGEJO_API_URL="https://forge.example.com" TEST_FORGEJO_PERMISSION=read run_precheck >/tmp/testfp_forgejo_read.out 2>&1; then
+  check "read-only Forgejo token is rejected" "success" "failure"
+else
+  check "read-only Forgejo token is rejected" "failure" "failure"
+  check_contains "rejection is actionable" "$(cat /tmp/testfp_forgejo_read.out)" "write permission"
+fi
+
+echo ""
+echo "=== Test 22: Forgejo unknown permission fails closed ==="
+if PLATFORM=forgejo FORGEJO_API_URL="https://forge.example.com" TEST_FORGEJO_PERMISSION=none run_precheck >/tmp/testfp_forgejo_none.out 2>&1; then
+  check "unknown Forgejo permission is rejected" "success" "failure"
+else
+  check "unknown Forgejo permission is rejected" "failure" "failure"
+fi
+
+echo ""
+echo "=== Test 23: Forgejo write token reviews ==="
+RESULT="$(PLATFORM=forgejo FORGEJO_API_URL="https://forge.example.com" TEST_FORGEJO_PERMISSION=write run_precheck)"
+check "write-capable Forgejo token reviews" "$(echo "$RESULT" | grep '^should_review=' | head -1 | cut -d= -f2)" "true"
+
+# ── Test 24: diff-unchanged skip carries forward the previous verdict (#517) ──
+# The precheck short-circuits on an unchanged diff, but the last managed
+# review comment's marker already carries review_result — parse it and stamp
+# verdict/verdict_source so a downstream gate cannot flip red→green on re-run.
+# Seed the real current fingerprint; a metadata-only marker must not trigger
+# the diff-unchanged path by itself.
+echo ""
+echo "=== Test 24: diff-unchanged skip carries forward request_changes ==="
+set_empty_comments
+CARRY_FORWARD_FP="$(run_precheck | grep '^diff_fingerprint=' | head -1 | cut -d= -f2-)"
+set_comments "<!-- ai-pr-reviewer -->
+<!-- ai-pr-review-fingerprint:${CARRY_FORWARD_FP} -->
+<!-- ai-pr-reviewer: {\"review_result\": \"issues\"} -->"
+RESULT="$(run_precheck)"
+check "diff-unchanged skip carries request_changes" "$(echo "$RESULT" | grep '^verdict=' | head -1 | cut -d= -f2)" "request_changes"
+check "diff-unchanged skip marks verdict_source carry_forward" "$(echo "$RESULT" | grep '^verdict_source=' | head -1 | cut -d= -f2)" "carry_forward"
+
+echo ""
+echo "=== Test 25: diff-unchanged skip carries forward approve ==="
+set_comments "<!-- ai-pr-reviewer -->
+<!-- ai-pr-review-fingerprint:${CARRY_FORWARD_FP} -->
+<!-- ai-pr-reviewer: {\"review_result\": \"clean\"} -->"
+RESULT="$(run_precheck)"
+check "diff-unchanged skip carries approve" "$(echo "$RESULT" | grep '^verdict=' | head -1 | cut -d= -f2)" "approve"
+check "diff-unchanged skip marks verdict_source carry_forward" "$(echo "$RESULT" | grep '^verdict_source=' | head -1 | cut -d= -f2)" "carry_forward"
+
+echo ""
+echo "=== Test 26: diff-unchanged skip with no marker leaves verdict empty ==="
+set_empty_comments
+RESULT="$(run_precheck)"
+check "diff-unchanged skip without marker leaves verdict empty" "$(echo "$RESULT" | grep '^verdict=' | head -1 | cut -d= -f2)" ""
+check "diff-unchanged skip without marker leaves verdict_source empty" "$(echo "$RESULT" | grep '^verdict_source=' | head -1 | cut -d= -f2)" ""
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

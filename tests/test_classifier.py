@@ -94,7 +94,7 @@ class TestPRKindMultiLanguage:
         ) == "db_or_migration_changes"
 
     def test_auth_risk_flag_typescript(self):
-        flags = _detect_risk_flags([_make_file("src/auth.ts")], "", [])
+        flags, _ = _detect_risk_flags([_make_file("src/auth.ts")], "", [])
         assert "auth_changes" in flags
 
 
@@ -114,6 +114,18 @@ class TestPRKindDependencyUpgrade:
         files = [_make_file("Pipfile.lock")]
         kind = _classify_pr_kind(files, "")
         assert kind == "dependency_upgrade"
+
+    def test_workflow_semver_text_is_not_dependency_upgrade(self):
+        files = [_make_file(".github/workflows/manual-release.yml")]
+        diff = "Release version (for example 2.0.2 or v2.0.2)"
+        kind = _classify_pr_kind(files, diff)
+        assert kind == "app_code"
+
+    def test_source_version_constant_is_not_dependency_upgrade(self):
+        files = [_make_file("src/version.py")]
+        diff = '-VERSION = "1.2.3"\n+VERSION = "1.2.4"'
+        kind = _classify_pr_kind(files, diff)
+        assert kind == "app_code"
 
 
 class TestPRKindK8sManifest:
@@ -156,10 +168,28 @@ class TestPRKindPublicRouteChanges:
         "routes.py",
         "urls.py",
         "api/endpoints.py",
-        "router.py",
+        "api.go",
+        "controller.py",
     ])
     def test_route_file_patterns(self, fname):
         files = [_make_file(fname)]
+        kind = _classify_pr_kind(files, "")
+        assert kind == "public_route_changes"
+
+    def test_bare_route_ts_is_not_public_route(self):
+        # Next.js App Router mandates the name `route.ts` for every API
+        # handler, so the filename carries no routing-layer signal and must
+        # not match. See #531.
+        files = [
+            _make_file("src/app/api/groomer/route.ts"),
+            _make_file("src/app/api/status/route.ts"),
+        ]
+        kind = _classify_pr_kind(files, "")
+        assert kind != "public_route_changes"
+
+    def test_routes_ts_still_public_route(self):
+        # The plural `routes.<ext>` is a chosen name and still matches.
+        files = [_make_file("src/routes.ts")]
         kind = _classify_pr_kind(files, "")
         assert kind == "public_route_changes"
 
@@ -230,30 +260,132 @@ class TestPRKindDefault:
 class TestRiskFlags:
     def test_linked_security_issue(self):
         issues = [{"labels": [{"name": "security"}]}]
-        flags = _detect_risk_flags([], "", issues)
+        flags, _ = _detect_risk_flags([], "", issues)
         assert "linked_security_issue" in flags
 
     def test_linked_audit_issue(self):
         issues = [{"labels": [{"name": "audit"}]}]
-        flags = _detect_risk_flags([], "", issues)
+        flags, _ = _detect_risk_flags([], "", issues)
         assert "linked_audit_issue" in flags
 
     def test_linked_priority_p1(self):
         issues = [{"labels": [{"name": "priority/p1"}]}]
-        flags = _detect_risk_flags([], "", issues)
+        flags, _ = _detect_risk_flags([], "", issues)
         assert "linked_priority_p1" in flags
+
+    @pytest.mark.parametrize(
+        ("priority", "expected_flag"),
+        [(1, "linked_priority_p0"), (2, "linked_priority_p1")],
+    )
+    def test_linear_native_priority(self, priority, expected_flag):
+        issues = [{"source": "linear", "priority": priority, "labels": []}]
+        flags, _ = _detect_risk_flags([], "", issues)
+        assert expected_flag in flags
+
+    @pytest.mark.parametrize("priority", [0, 3, 4, None, True])
+    def test_linear_non_escalating_priorities(self, priority):
+        issues = [{"source": "linear", "priority": priority, "labels": []}]
+        flags, _ = _detect_risk_flags([], "", issues)
+        assert "linked_priority_p0" not in flags
+        assert "linked_priority_p1" not in flags
+
+    def test_native_priority_is_linear_only(self):
+        issues = [{"source": "github", "priority": 1, "labels": []}]
+        flags, _ = _detect_risk_flags([], "", issues)
+        assert "linked_priority_p0" not in flags
 
     def test_no_risk_flags(self):
         issues = [{"labels": [{"name": "bug"}]}]
-        flags = _detect_risk_flags([], "", issues)
+        flags, _ = _detect_risk_flags([], "", issues)
         assert not any(
             f.startswith("linked_") for f in flags
         ), f"Expected no linked risk flags, got {flags}"
 
     def test_file_serving_flag(self):
         files = [_make_file("static/handler.py")]
-        flags = _detect_risk_flags(files, "", [])
+        flags, _ = _detect_risk_flags(files, "", [])
         assert "file_serving_changes" in flags
+
+
+# ---------------------------------------------------------------------------
+# Risk flag file attribution tests
+# ---------------------------------------------------------------------------
+
+class TestRiskFlagsWithFiles:
+    """Tests for risk_flags_with_files — per-flag file attribution (issue #297)."""
+
+    def test_auth_flag_attributes_triggering_file(self):
+        # auth.py triggers auth_changes; the file should appear in attribution.
+        files = [_make_file("auth.py"), _make_file("utils.py")]
+        flags, attribution = _detect_risk_flags(files, "", [])
+        assert "auth_changes" in flags
+        assert "auth_changes" in attribution
+        assert "auth.py" in attribution["auth_changes"]
+        # utils.py did NOT trigger the flag
+        assert "utils.py" not in attribution["auth_changes"]
+
+    def test_secret_flag_attributes_multiple_files(self):
+        # Two secret-related files both appear in the attribution list.
+        files = [
+            _make_file("secrets.yaml"),
+            _make_file("vault_config.json"),
+            _make_file("main.py"),
+        ]
+        flags, attribution = _detect_risk_flags(files, "", [])
+        assert "secret_handling_changes" in flags
+        attributed = attribution.get("secret_handling_changes", [])
+        assert "secrets.yaml" in attributed
+        assert "vault_config.json" in attributed
+        assert "main.py" not in attributed
+
+    def test_path_handling_diff_only_has_empty_file_list(self):
+        # Flag fires only from diff content → attribution list is empty (no file names matched).
+        files = [_make_file("app.py")]
+        diff = "import pathlib\nresult = pathlib.Path(user_input)"
+        flags, attribution = _detect_risk_flags(files, diff, [])
+        assert "path_handling_changes" in flags
+        # app.py itself did not match any path-handling filename pattern
+        assert attribution.get("path_handling_changes", None) == []
+
+    def test_linked_flags_absent_from_attribution(self):
+        # Issue-linked flags have no file attribution and must not appear in mapping.
+        issues = [{"labels": [{"name": "security"}, {"name": "priority/p0"}]}]
+        flags, attribution = _detect_risk_flags([], "", issues)
+        assert "linked_security_issue" in flags
+        assert "linked_priority_p0" in flags
+        assert "linked_security_issue" not in attribution
+        assert "linked_priority_p0" not in attribution
+
+    def test_classify_pr_exposes_risk_flags_with_files(self):
+        # End-to-end: classify_pr should populate risk_flags_with_files on the result.
+        files = [_make_file("src/auth_service.py"), _make_file("app.py")]
+        result = classify_pr(files, diff_text="", linked_issues=[])
+        assert isinstance(result.risk_flags_with_files, dict)
+        assert "auth_changes" in result.risk_flags_with_files
+        assert "src/auth_service.py" in result.risk_flags_with_files["auth_changes"]
+        assert "app.py" not in result.risk_flags_with_files["auth_changes"]
+
+    def test_risk_flags_with_files_in_serialized_dict(self):
+        # risk_flags_with_files must survive to_dict() so run_review.sh can jq it.
+        files = [_make_file("static/serve.py")]
+        result = classify_pr(files)
+        d = result.to_dict()
+        assert "risk_flags_with_files" in d
+        assert isinstance(d["risk_flags_with_files"], dict)
+        assert "file_serving_changes" in d["risk_flags_with_files"]
+        assert "static/serve.py" in d["risk_flags_with_files"]["file_serving_changes"]
+
+    def test_no_file_based_flags_produces_empty_attribution(self):
+        # A PR with only linked-issue flags and no file-pattern hits has empty attribution.
+        files = [_make_file("README.md")]
+        issues = [{"labels": [{"name": "audit"}]}]
+        flags, attribution = _detect_risk_flags(files, "", issues)
+        assert "linked_audit_issue" in flags
+        # No file-based flags fired, so attribution only contains file-based entries
+        file_based_flags = {"file_serving_changes", "path_handling_changes",
+                            "auth_changes", "secret_handling_changes"}
+        for flag in attribution:
+            assert flag in file_based_flags
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +484,7 @@ class TestClassifyPR:
         d = result.to_dict()
         assert "pr_kind" in d
         assert "risk_flags" in d
+        assert "risk_flags_with_files" in d
         assert "changed_files_summary" in d
         assert "linked_issue_labels" in d
         assert "must_check" in d
@@ -380,7 +513,6 @@ class TestClassifyFromFile:
             classify_from_files(
                 pr_files_path=pr_files,
                 diff_path=diff_file,
-                body_path="",
                 issues_path=issues_file,
                 output_path=output_file,
             )
@@ -405,7 +537,6 @@ class TestClassifyFromFile:
             classify_from_files(
                 pr_files_path=pr_files,
                 diff_path=diff_file,
-                body_path="",
                 issues_path="",
                 output_path=output_file,
             )
@@ -437,3 +568,40 @@ class TestEdgeCases:
         result = classify_pr([], linked_issues=issues)
         # Labels should be deduplicated
         assert result.linked_issue_labels.count("priority/p1") <= 1
+
+
+class TestRouteSignals:
+    """route_signals drives smart routing and must exclude content-only matches
+    (the over-escalation fix)."""
+
+    def test_content_only_path_match_not_in_route_signals(self):
+        # A diff that merely mentions os.path in an ordinary file must not route.
+        result = classify_pr([_make_file("app.py")], diff_text="x = os.path.join(a, b)")
+        assert "path_handling_changes" in result.risk_flags       # still flagged for checks
+        assert result.route_signals == []                          # but not for routing
+
+    def test_real_auth_filename_in_route_signals(self):
+        result = classify_pr([_make_file("auth.py")], diff_text="")
+        assert "auth_changes" in result.route_signals
+
+    def test_filename_backed_file_serving_in_route_signals(self):
+        result = classify_pr([_make_file("static/handler.py")], diff_text="")
+        assert "file_serving_changes" in result.route_signals
+
+    def test_linked_security_issue_in_route_signals(self):
+        issues = [{"labels": [{"name": "security"}]}]
+        result = classify_pr([_make_file("app.py")], diff_text="", linked_issues=issues)
+        assert result.route_signals == ["linked_security_issue"]
+
+    @pytest.mark.parametrize(
+        ("priority", "expected_signal"),
+        [(1, "linked_priority_p0"), (2, "linked_priority_p1")],
+    )
+    def test_linear_native_priority_in_route_signals(self, priority, expected_signal):
+        issues = [{"source": "linear", "priority": priority, "labels": []}]
+        result = classify_pr([_make_file("app.py")], diff_text="", linked_issues=issues)
+        assert result.route_signals == [expected_signal]
+
+    def test_app_code_default_not_in_route_signals(self):
+        result = classify_pr([_make_file("app.py")], diff_text="print('hi')")
+        assert result.route_signals == []
